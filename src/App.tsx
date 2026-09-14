@@ -10,7 +10,12 @@ import { AiEngineSettingsModal } from './components/AiEngineSettingsModal';
 import { WhatsAppInstancesModal } from './components/WhatsAppInstancesModal';
 import { NewLeadModal } from './components/NewLeadModal';
 import { NewTenantModal } from './components/NewTenantModal';
-import { deskcommService } from './services/deskcommService';
+import { LiveKanban } from './components/LiveKanban';
+import type { LiveView } from './components/Sidebar';
+import { deskcommService, purgeLegacyMocks } from './services/deskcommService';
+import * as liveStore from './services/liveStore';
+import * as remote from './services/supabaseService';
+import { supabase } from './services/supabaseClient';
 import { Tenant, Lead, PipelineStage, UserRole, HandoffState } from './types';
 import { CheckCircle2, AlertTriangle, Bot, UserCheck } from 'lucide-react';
 
@@ -23,9 +28,7 @@ export default function App() {
   });
 
   const [userRole, setUserRole] = useState<UserRole>('super_admin');
-  const [currentView, setCurrentView] = useState<
-    'kanban' | 'inbox' | 'leads' | 'radar' | 'whatsapp' | 'ai_settings' | 'super_admin'
-  >('kanban');
+  const [currentView, setCurrentView] = useState<LiveView>('kanban');
 
   // Leads State for Active Tenant
   const [leads, setLeads] = useState<Lead[]>(() =>
@@ -54,15 +57,136 @@ export default function App() {
     }, 3500);
   };
 
-  // Reload leads when activeTenantId changes
+  // ==========================================================================
+  // BOOT: carrega tenants+leads+messages do Supabase, descarta mocks legados
+  // e abre assinaturas realtime que alimentam o liveStore.
+  // ==========================================================================
   useEffect(() => {
-    const freshLeads = deskcommService.getLeads(activeTenantId);
-    setLeads(freshLeads);
-    if (freshLeads.length > 0) {
-      setSelectedLeadId(freshLeads[0].id);
-    } else {
-      setSelectedLeadId(null);
-    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const ts = await remote.getTenants();
+        if (cancelled) return;
+        liveStore.setTenants(ts);
+        setTenants(ts);
+        if (ts[0]) setActiveTenantId(ts[0].id);
+
+        // Carrega leads de TODOS os tenants (pra troca ser instantânea)
+        const allLeadsByTenant = await Promise.all(
+          ts.map(async (t) => {
+            const ll = await remote.getLeads(t.id);
+            const enriched = await Promise.all(
+              ll.map(async (lead) => {
+                try {
+                  const msgs = await remote.getMessages(lead.id);
+                  return {
+                    ...lead,
+                    messages: msgs.map((m) => ({
+                      id: m.id,
+                      sender: m.sender,
+                      senderName: m.senderName,
+                      content: m.content,
+                      timestamp: m.timestamp,
+                      status: m.status,
+                    })),
+                  };
+                } catch {
+                  return lead;
+                }
+              })
+            );
+            return enriched;
+          })
+        );
+        if (cancelled) return;
+        const flat = allLeadsByTenant.flat();
+        liveStore.setLeads(flat);
+        setLeads(flat.filter((l) => l.tenantId === (ts[0]?.id || activeTenantId)));
+        if (flat[0]) setSelectedLeadId(flat[0].id);
+
+        // Purga mocks legados do localStorage. Garante a regra "1 lead real =
+        // 1 card no Kanban/Inbox/Radar/Pacientes".
+        purgeLegacyMocks();
+        console.log('[crm-hermes] bootstrap Supabase OK:', ts.length, 'tenants,', flat.length, 'leads');
+      } catch (err) {
+        console.error('[crm-hermes] bootstrap falhou, mantendo mocks legados:', err);
+        showToast('Aviso: rodando com dados locais (sem Supabase)', 'warning');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reage a mudanças no liveStore e mantém o estado React sincronizado.
+  useEffect(() => {
+    const u1 = liveStore.subscribeTenants(() => setTenants(liveStore.snapshot().tenants));
+    const u2 = liveStore.subscribeLeads(() => {
+      const all = liveStore.snapshot().leads;
+      setLeads(all.filter((l) => l.tenantId === activeTenantId));
+    });
+    return () => {
+      u1();
+      u2();
+    };
+  }, [activeTenantId]);
+
+  // Realtime do Supabase → liveStore. Filtra por tenant e atualiza leads.
+  useEffect(() => {
+    if (!activeTenantId) return;
+    const unsubLeads = remote.subscribeLeads(activeTenantId, (row, ev) => {
+      if (ev === 'DELETE') {
+        liveStore.removeLead(row.id);
+        return;
+      }
+      // Upsert: pega o row atual (recarrega messages quando é INSERT)
+      liveStore.upsertLead({
+        id: row.id,
+        tenantId: row.tenant_id,
+        name: row.name || 'Sem nome',
+        phone: row.phone,
+        formattedPhone: row.phone,
+        avatarUrl: '',
+        insuranceType: (row.insurance ?? 'particular') as 'particular' | 'convenio',
+        priority: row.priority,
+        stage: row.stage,
+        handoffState: row.handoff_state,
+        mainComplaint: row.clinical_summary ?? '',
+        detectedSymptoms: row.symptoms ?? [],
+        silenceHours: 0,
+        lastInteractionAt: row.last_interaction,
+        messages: [],
+        internalNotes: [],
+        createdAt: row.created_at,
+      });
+    });
+    const unsubMsgs = remote.subscribeMessages(activeTenantId, (msg) => {
+      const mapped: import('./types').LeadMessage = {
+        id: msg.id,
+        sender: msg.sender,
+        senderName: msg.sender_name,
+        content: msg.content,
+        timestamp: msg.created_at,
+        status: 'delivered',
+      };
+      liveStore.appendMessageToLead(msg.lead_id, mapped);
+      liveStore.updateLead(msg.lead_id, {
+        lastInteractionAt: msg.created_at,
+      });
+    });
+    return () => {
+      unsubLeads();
+      unsubMsgs();
+    };
+  }, [activeTenantId]);
+
+  // Recarrega leads quando muda tenant (já filtradas pelo subscribe liveStore
+  // acima, mas forçamos um snapshot inicial pra UX imediata).
+  useEffect(() => {
+    const initial = liveStore.snapshot().leads.filter((l) => l.tenantId === activeTenantId);
+    setLeads(initial);
+    if (initial[0]) setSelectedLeadId(initial[0].id);
   }, [activeTenantId]);
 
   const activeTenant =
@@ -192,11 +316,26 @@ export default function App() {
   };
 
   // Handler: Create New Lead
-  const handleCreateLead = (leadData: Partial<Lead>) => {
-    const newLead = deskcommService.createLead(activeTenantId, leadData);
-    setLeads((prev) => [newLead, ...prev]);
-    setSelectedLeadId(newLead.id);
-    showToast(`Lead "${newLead.name}" criado e triagem WhatsApp iniciada!`, 'success');
+  const handleCreateLead = async (leadData: Partial<Lead>) => {
+    try {
+      const newLead = await deskcommService.createLead(activeTenantId, leadData);
+      // O lead já foi upsertado no liveStore pelo service com o id real do
+      // Supabase; só refletimos no estado React para abrir o chat/kanban.
+      setLeads((prev) => {
+        const idx = prev.findIndex((l) => l.id === newLead.id);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy[idx] = newLead;
+          return copy;
+        }
+        return [newLead, ...prev];
+      });
+      setSelectedLeadId(newLead.id);
+      showToast(`Lead "${newLead.name}" criado e triagem WhatsApp iniciada!`, 'success');
+    } catch (e) {
+      console.error('[App] createLead falhou:', e);
+      showToast(`Falha ao criar lead: ${String(e)}`, 'error');
+    }
   };
 
   // Handler: Create New Tenant (Super Admin)
@@ -221,7 +360,11 @@ export default function App() {
   };
 
   const silentLeadsCount = leads.filter(
-    (l) => l.silenceHours >= 4 && l.stage !== 'consulta_agendada' && l.stage !== 'desistiu'
+    (l) =>
+      l.silenceHours >= 4 &&
+      l.stage !== 'consulta_agendada' &&
+      l.stage !== 'desistiu' &&
+      l.stage !== 'atendido_concluido'
   ).length;
 
   return (
@@ -374,6 +517,8 @@ export default function App() {
               onOpenNewTenantModal={() => setShowNewTenantModal(true)}
             />
           )}
+
+          {currentView === 'live_crm' && <LiveKanban />}
         </main>
       </div>
 

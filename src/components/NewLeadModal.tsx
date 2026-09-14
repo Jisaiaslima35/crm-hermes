@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { UserPlus, X, Stethoscope, Phone, ShieldAlert, FileText } from 'lucide-react';
 import { Lead, PipelineStage } from '../types';
+import { normalizePhone } from '../services/deskcommService';
 
 interface NewLeadModalProps {
   tenantName: string;
@@ -32,7 +33,7 @@ export const NewLeadModal: React.FC<NewLeadModalProps> = ({
 
     onSave({
       name: name.trim(),
-      phone: phone.replace(/\D/g, ''),
+      phone: normalizePhone(phone),
       formattedPhone: phone,
       insuranceType,
       insuranceName: insuranceType === 'convenio' ? insuranceName : undefined,

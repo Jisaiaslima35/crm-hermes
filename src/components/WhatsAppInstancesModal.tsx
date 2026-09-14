@@ -1,21 +1,19 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   QrCode,
   Wifi,
   Copy,
   Check,
   RefreshCw,
-  Power,
-  ShieldCheck,
-  Smartphone,
-  Server,
-  Activity,
   X,
   BatteryCharging,
   Clock,
+  Smartphone,
+  Server,
+  AlertTriangle,
 } from 'lucide-react';
 import { Tenant } from '../types';
-import { deskcommService } from '../services/deskcommService';
+import * as remote from '../services/supabaseService';
 
 interface WhatsAppInstancesModalProps {
   activeTenant: Tenant;
@@ -23,38 +21,204 @@ interface WhatsAppInstancesModalProps {
   onClose: () => void;
 }
 
+type QrStatus =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'waiting'; base64: string; pairingCode?: string }
+  | { kind: 'connected' }
+  | { kind: 'error'; message: string };
+
+const POLL_INTERVAL_MS = 3000;
+
 export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
   activeTenant,
   onUpdateTenant,
   onClose,
 }) => {
   const [copiedWebhook, setCopiedWebhook] = useState(false);
-  const [isReconnecting, setIsReconnecting] = useState(false);
-  const [simulatedQrActive, setSimulatedQrActive] = useState(false);
+  const [qrStatus, setQrStatus] = useState<QrStatus>({ kind: 'idle' });
+  const pollRef = useRef<number | null>(null);
 
   const instance = activeTenant.whatsappInstance;
+  const sessionName = instance.sessionName;
+
+  // Webhook canônico do CRM-Hermes para esta instância. Se o tenant não tiver
+  // configurado um, montamos a partir do sessionName pra não quebrar o fluxo
+  // de pareamento.
+  const computedWebhookUrl =
+    instance.webhookUrl && instance.webhookUrl.length > 0
+      ? instance.webhookUrl
+      : `https://crm-webhook.automacaojs.us/webhook/evolution/${sessionName}`;
+
+  const stopPolling = () => {
+    if (pollRef.current !== null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => stopPolling();
+  }, []);
 
   const handleCopyWebhook = () => {
-    navigator.clipboard.writeText(instance.webhookUrl);
+    navigator.clipboard.writeText(computedWebhookUrl);
     setCopiedWebhook(true);
     setTimeout(() => setCopiedWebhook(false), 2000);
   };
 
   const handleReconnect = async () => {
-    setIsReconnecting(true);
-    const updated = await deskcommService.reconnectWhatsAppInstance(activeTenant.id);
-    if (updated) {
-      onUpdateTenant(updated);
-    }
-    setIsReconnecting(false);
+    const statusResult = await remote.getInstanceStatus(sessionName);
+    const state = (statusResult as { state?: string } | null)?.state || 'unknown';
+    const updated: Tenant = {
+      ...activeTenant,
+      whatsappInstance: {
+        ...activeTenant.whatsappInstance,
+        status: state === 'open' ? 'connected' : 'reconnecting',
+        lastSync: new Date().toLocaleString('pt-BR'),
+      },
+    };
+    onUpdateTenant(updated);
   };
 
-  const handleSimulateScan = () => {
-    setSimulatedQrActive(true);
-    setTimeout(() => {
-      setSimulatedQrActive(false);
-      handleReconnect();
-    }, 1200);
+  const fetchQrCode = async () => {
+    stopPolling();
+    setQrStatus({ kind: 'loading' });
+
+    // 1) Tenta /instance/connect (instância já existe)
+    let base64: string | undefined;
+    let pairingCode: string | undefined;
+    const connectResult = await remote.getInstanceConnect(sessionName);
+    if (connectResult?.base64) {
+      base64 = connectResult.base64;
+      pairingCode = connectResult.pairingCode;
+    } else {
+      // 2) Fallback: cria a instância (POST /instance/create já devolve QR)
+      const created = await remote.createEvolutionInstance(sessionName, {
+        webhookUrl: computedWebhookUrl,
+      });
+      const qr = created?.qrcode || created;
+      base64 = qr?.base64 || created?.base64;
+      pairingCode = qr?.pairingCode || created?.pairingCode;
+    }
+
+    if (!base64) {
+      setQrStatus({
+        kind: 'error',
+        message:
+          'Evolution API não retornou QR Code. Verifique se a instância existe e a apikey está correta.',
+      });
+      return;
+    }
+    const src = base64.startsWith('data:image') ? base64 : `data:image/png;base64,${base64}`;
+    setQrStatus({ kind: 'waiting', base64: src, pairingCode });
+
+    // Inicia polling a cada 3s para detectar conexão
+    pollRef.current = window.setInterval(async () => {
+      try {
+        const st = await remote.getInstanceStatus(sessionName);
+        const state = (st as { state?: string } | null)?.state || 'unknown';
+        if (state === 'open') {
+          stopPolling();
+          setQrStatus({ kind: 'connected' });
+          const updated: Tenant = {
+            ...activeTenant,
+            whatsappInstance: {
+              ...activeTenant.whatsappInstance,
+              status: 'connected',
+              lastSync: new Date().toLocaleString('pt-BR'),
+            },
+          };
+          onUpdateTenant(updated);
+          // Fecha o modal após 1.5s pra dar feedback visual
+          window.setTimeout(() => onClose(), 1500);
+        }
+      } catch {
+        // silencia — continua tentando
+      }
+    }, POLL_INTERVAL_MS);
+  };
+
+  const handleCancelQr = () => {
+    stopPolling();
+    setQrStatus({ kind: 'idle' });
+  };
+
+  const renderQrPanel = () => {
+    if (qrStatus.kind === 'idle') {
+      return (
+        <div className="flex flex-col items-center justify-center text-center py-6 space-y-2">
+          <QrCode className="w-12 h-12 text-slate-500" />
+          <p className="text-xs text-slate-400 max-w-xs">
+            Clique em <strong className="text-emerald-300">"Novo Pareamento QR Code"</strong> para
+            gerar o QR de pareamento real via Evolution API.
+          </p>
+        </div>
+      );
+    }
+    if (qrStatus.kind === 'loading') {
+      return (
+        <div className="flex flex-col items-center justify-center text-center py-6 space-y-2">
+          <RefreshCw className="w-10 h-10 text-emerald-400 animate-spin" />
+          <p className="text-xs text-slate-400">Solicitando QR Code à Evolution API…</p>
+        </div>
+      );
+    }
+    if (qrStatus.kind === 'error') {
+      return (
+        <div className="flex flex-col items-center justify-center text-center py-6 space-y-2">
+          <AlertTriangle className="w-10 h-10 text-rose-400" />
+          <p className="text-xs text-rose-300 max-w-xs">{qrStatus.message}</p>
+          <button
+            onClick={fetchQrCode}
+            className="mt-1 px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold"
+          >
+            Tentar novamente
+          </button>
+        </div>
+      );
+    }
+    if (qrStatus.kind === 'connected') {
+      return (
+        <div className="flex flex-col items-center justify-center text-center py-6 space-y-2">
+          <div className="w-12 h-12 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
+            <Check className="w-6 h-6 text-emerald-300" />
+          </div>
+          <p className="text-sm font-bold text-emerald-300">WhatsApp conectado!</p>
+          <p className="text-[11px] text-slate-400">Fechando painel…</p>
+        </div>
+      );
+    }
+
+    // waiting: render base64 real
+    const base64 = qrStatus.base64;
+    return (
+      <div className="flex flex-col items-center gap-3">
+        <div className="relative bg-white p-2 rounded-xl shadow-lg">
+          <img
+            src={base64}
+            alt="QR Code WhatsApp"
+            className="w-44 h-44 block"
+          />
+          <span className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-400 rounded-full animate-ping" />
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-slate-400">
+          <RefreshCw className="w-3 h-3 animate-spin text-emerald-400" />
+          <span>Aguardando leitura do celular…</span>
+        </div>
+        {qrStatus.pairingCode && (
+          <code className="text-[10px] text-slate-500 font-mono">
+            pairing: {qrStatus.pairingCode}
+          </code>
+        )}
+        <button
+          onClick={handleCancelQr}
+          className="text-[11px] text-slate-500 hover:text-slate-300 underline"
+        >
+          Cancelar pareamento
+        </button>
+      </div>
+    );
   };
 
   return (
@@ -74,7 +238,7 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
                 Gerenciador de Instâncias WhatsApp
               </h2>
               <p className="text-[11px] text-slate-400">
-                Driver: <strong>Evolution API v2.1.2 (Baileys Engine)</strong> • {activeTenant.name}
+                Driver: <strong>Evolution API v2</strong> • {activeTenant.name}
               </p>
             </div>
           </div>
@@ -113,8 +277,20 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
-                <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  {instance.status === 'connected' ? 'ONLINE & SINCRONIZADO' : 'RECONECTANDO'}
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
+                    instance.status === 'connected'
+                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                      : instance.status === 'reconnecting'
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                      : 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                  }`}
+                >
+                  {instance.status === 'connected'
+                    ? 'ONLINE & SINCRONIZADO'
+                    : instance.status === 'reconnecting'
+                    ? 'RECONECTANDO'
+                    : 'DESCONECTADO'}
                 </span>
               </div>
             </div>
@@ -157,17 +333,18 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
                 type="button"
                 id="btn-reconnect-whatsapp"
                 onClick={handleReconnect}
-                disabled={isReconnecting}
                 className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
-                <span>{isReconnecting ? 'Sincronizando Sessão...' : 'Testar Conexão / Ping'}</span>
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Testar Conexão / Ping</span>
               </button>
 
               <button
                 type="button"
-                onClick={handleSimulateScan}
-                className="px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                id="btn-new-pairing"
+                onClick={fetchQrCode}
+                disabled={qrStatus.kind === 'loading' || qrStatus.kind === 'waiting'}
+                className="px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <QrCode className="w-3.5 h-3.5 text-emerald-400" />
                 <span>Novo Pareamento QR Code</span>
@@ -177,33 +354,7 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
 
           {/* QR Code Interactive Preview Section */}
           <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 flex flex-col md:flex-row items-center gap-5">
-            <div className="w-40 h-40 bg-white p-2 rounded-xl flex items-center justify-center relative shadow-lg shrink-0">
-              {simulatedQrActive ? (
-                <div className="absolute inset-0 bg-emerald-900/90 rounded-xl flex flex-col items-center justify-center text-white p-2 text-center animate-pulse">
-                  <Check className="w-8 h-8 text-emerald-300 mb-1" />
-                  <span className="text-xs font-bold">QR Lido com Sucesso!</span>
-                  <span className="text-[10px] text-emerald-200">Sincronizando chats...</span>
-                </div>
-              ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center border-2 border-dashed border-slate-300 rounded-lg p-1">
-                  {/* Styled simulated QR Code pattern */}
-                  <div className="grid grid-cols-6 gap-1 w-full h-full p-2">
-                    {Array.from({ length: 36 }).map((_, i) => (
-                      <div
-                        key={i}
-                        className={`rounded-xs ${
-                          (i % 2 === 0 && i % 3 === 0) || i === 0 || i === 5 || i === 30 || i === 35
-                            ? 'bg-slate-900'
-                            : (i * 7) % 5 === 0
-                            ? 'bg-slate-800'
-                            : 'bg-slate-200'
-                        }`}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
+            <div className="w-52 shrink-0">{renderQrPanel()}</div>
 
             <div className="space-y-2 text-xs">
               <h4 className="font-bold text-white text-sm">
@@ -211,18 +362,20 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
               </h4>
               <ol className="list-decimal list-inside text-slate-400 space-y-1 text-[11px] leading-relaxed">
                 <li>Abra o WhatsApp no aparelho celular da clínica.</li>
-                <li>Toque em <strong>Aparelhos Conectados</strong> &gt; <strong>Conectar um aparelho</strong>.</li>
+                <li>
+                  Toque em <strong>Aparelhos Conectados</strong> &gt;{' '}
+                  <strong>Conectar um aparelho</strong>.
+                </li>
                 <li>Aponte a câmera para o QR Code ao lado.</li>
-                <li>A sincronização de mensagens ocorrerá em segundo plano pela Evolution API.</li>
+                <li>
+                  A sincronização de mensagens ocorre via webhook na Evolution
+                  API ({`https://evo.automacaojs.us`}).
+                </li>
               </ol>
-
-              <button
-                onClick={handleSimulateScan}
-                className="mt-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-              >
-                <Activity className="w-3.5 h-3.5" />
-                <span>Simular Leitura do QR Code</span>
-              </button>
+              <p className="text-[10px] text-slate-500 italic pt-1">
+                Sessão monitorada em polling a cada {POLL_INTERVAL_MS / 1000}s — o painel fecha
+                automaticamente quando o estado vira <code>open</code>.
+              </p>
             </div>
           </div>
 
@@ -244,7 +397,7 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
               <input
                 type="text"
                 readOnly
-                value={instance.webhookUrl}
+                value={computedWebhookUrl}
                 className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-sky-300 font-mono select-all focus:outline-none"
               />
               <button
@@ -269,7 +422,9 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
 
             {/* Subscribed Events */}
             <div className="pt-2 border-t border-slate-800 flex flex-wrap gap-1.5 items-center">
-              <span className="text-[10px] text-slate-500 font-semibold uppercase">Eventos Ativos:</span>
+              <span className="text-[10px] text-slate-500 font-semibold uppercase">
+                Eventos Ativos:
+              </span>
               <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-slate-800 text-slate-300">
                 MESSAGES_UPSERT
               </span>

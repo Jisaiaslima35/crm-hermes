@@ -49,6 +49,14 @@ export const PIPELINE_STAGES: StageColumnInfo[] = [
     badgeText: 'text-slate-400 border-slate-700/60',
     borderHover: 'hover:border-slate-600/40',
   },
+  {
+    id: 'atendido_concluido',
+    title: '7. Atendidos / Concluídos',
+    subtitle: 'Consulta realizada e ciclo finalizado',
+    badgeBg: 'bg-emerald-900/40',
+    badgeText: 'text-emerald-300 border-emerald-700/60',
+    borderHover: 'hover:border-emerald-400/50',
+  },
 ];
 
 export const QUICK_TEMPLATES = [

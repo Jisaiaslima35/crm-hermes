@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   User,
   Phone,
@@ -14,9 +14,12 @@ import {
   UserCheck,
   Send,
   CheckCircle2,
+  X,
+  Save,
 } from 'lucide-react';
 import { Lead, PipelineStage } from '../types';
 import { PIPELINE_STAGES } from '../constants';
+import { deskcommService } from '../services/deskcommService';
 
 interface CustomerProfileProps {
   lead: Lead;
@@ -34,13 +37,69 @@ export const CustomerProfile: React.FC<CustomerProfileProps> = ({
 }) => {
   const [newNoteContent, setNewNoteContent] = useState('');
   const [newSymptom, setNewSymptom] = useState('');
+  const [complaintDraft, setComplaintDraft] = useState(lead.mainComplaint || '');
+  const [symptomsDraft, setSymptomsDraft] = useState<string[]>(
+    lead.detectedSymptoms || []
+  );
+  const [savingComplaint, setSavingComplaint] = useState(false);
+  const [savingSymptoms, setSavingSymptoms] = useState(false);
   const isHumanAssumed = lead.handoffState === 'humano_assumiu';
+
+  // Re-sincroniza os buffers quando o lead selecionado muda.
+  useEffect(() => {
+    setComplaintDraft(lead.mainComplaint || '');
+    setSymptomsDraft(lead.detectedSymptoms || []);
+  }, [lead.id, lead.mainComplaint, lead.detectedSymptoms]);
 
   const handleAddNoteSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newNoteContent.trim()) return;
     onAddNote(newNoteContent);
     setNewNoteContent('');
+  };
+
+  const persistComplaint = (next: string) => {
+    if (next === (lead.mainComplaint || '')) return;
+    setSavingComplaint(true);
+    deskcommService.updateLead({ ...lead, mainComplaint: next });
+    // Best-effort: o realtime do Supabase vai re-emitir e revalidar.
+    setTimeout(() => setSavingComplaint(false), 600);
+  };
+
+  const persistSymptoms = (next: string[]) => {
+    const prev = lead.detectedSymptoms || [];
+    if (
+      next.length === prev.length &&
+      next.every((s, i) => s === prev[i])
+    )
+      return;
+    setSavingSymptoms(true);
+    deskcommService.updateLead({ ...lead, detectedSymptoms: next });
+    setTimeout(() => setSavingSymptoms(false), 600);
+  };
+
+  const handleComplaintBlur = () => {
+    persistComplaint(complaintDraft.trim());
+  };
+
+  const handleAddSymptom = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    const trimmed = newSymptom.trim();
+    if (!trimmed) return;
+    if (symptomsDraft.includes(trimmed)) {
+      setNewSymptom('');
+      return;
+    }
+    const next = [...symptomsDraft, trimmed];
+    setSymptomsDraft(next);
+    setNewSymptom('');
+    persistSymptoms(next);
+  };
+
+  const handleRemoveSymptom = (idx: number) => {
+    const next = symptomsDraft.filter((_, i) => i !== idx);
+    setSymptomsDraft(next);
+    persistSymptoms(next);
   };
 
   return (
@@ -185,30 +244,82 @@ export const CustomerProfile: React.FC<CustomerProfileProps> = ({
           </div>
 
           <div>
-            <span className="text-[10px] text-slate-400 uppercase font-semibold block mb-0.5">
-              Queixa Principal
-            </span>
-            <p className="text-xs text-slate-200 bg-slate-900/80 p-2 rounded-lg border border-slate-800 leading-relaxed">
-              {lead.mainComplaint}
-            </p>
+            <div className="flex items-center justify-between mb-0.5">
+              <span className="text-[10px] text-slate-400 uppercase font-semibold">
+                Queixa Principal
+              </span>
+              {savingComplaint && (
+                <span className="text-[9px] text-emerald-400 flex items-center gap-1">
+                  <Save className="w-2.5 h-2.5" /> salvando…
+                </span>
+              )}
+            </div>
+            <textarea
+              id="textarea-lead-main-complaint"
+              rows={3}
+              value={complaintDraft}
+              onChange={(e) => setComplaintDraft(e.target.value)}
+              onBlur={handleComplaintBlur}
+              placeholder="Descreva a queixa principal do paciente (auto-salva ao sair do campo)…"
+              className="w-full text-xs text-slate-100 bg-slate-900/80 p-2 rounded-lg border border-slate-700 focus:border-sky-500 focus:outline-none resize-none leading-relaxed placeholder:text-slate-500"
+            />
           </div>
 
-          {/* Detected Symptoms Tags */}
+          {/* Detected Symptoms Tags (editáveis) */}
           <div>
-            <span className="text-[10px] text-slate-400 uppercase font-semibold block mb-1">
-              Sintomas & Achados Detectados
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {lead.detectedSymptoms.map((symptom, idx) => (
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] text-slate-400 uppercase font-semibold">
+                Sintomas & Achados Detectados
+              </span>
+              {savingSymptoms && (
+                <span className="text-[9px] text-emerald-400 flex items-center gap-1">
+                  <Save className="w-2.5 h-2.5" /> salvando…
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5 mb-1.5">
+              {symptomsDraft.length === 0 && (
+                <span className="text-[10px] text-slate-500 italic">
+                  Nenhum sintoma registrado ainda.
+                </span>
+              )}
+              {symptomsDraft.map((symptom, idx) => (
                 <span
-                  key={idx}
-                  className="px-2 py-1 rounded bg-sky-950/60 border border-sky-800/60 text-sky-300 text-[10px] font-medium flex items-center gap-1"
+                  key={`${symptom}-${idx}`}
+                  className="px-2 py-1 rounded bg-sky-950/60 border border-sky-800/60 text-sky-300 text-[10px] font-medium flex items-center gap-1 group"
                 >
                   <Tag className="w-2.5 h-2.5 text-sky-400" />
                   {symptom}
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveSymptom(idx)}
+                    className="ml-1 -mr-1 w-3 h-3 rounded-full bg-sky-900/60 hover:bg-rose-500/80 text-sky-300 hover:text-white flex items-center justify-center transition-colors"
+                    title="Remover sintoma"
+                  >
+                    <X className="w-2 h-2" />
+                  </button>
                 </span>
               ))}
             </div>
+            <form onSubmit={handleAddSymptom} className="flex items-center gap-1.5">
+              <input
+                id="input-new-symptom"
+                type="text"
+                value={newSymptom}
+                onChange={(e) => setNewSymptom(e.target.value)}
+                placeholder="Adicionar sintoma (ex: dispneia) e Enter…"
+                className="flex-1 bg-slate-900/80 border border-slate-700 focus:border-sky-500 focus:outline-none text-[11px] text-slate-100 placeholder:text-slate-500 rounded-md px-2 py-1"
+              />
+              <button
+                id="btn-add-symptom"
+                type="submit"
+                disabled={!newSymptom.trim()}
+                className="px-2 py-1 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-[10px] font-semibold rounded-md flex items-center gap-1 transition-colors"
+              >
+                <Plus className="w-3 h-3" />
+                <span>Adicionar</span>
+              </button>
+            </form>
           </div>
 
           {lead.preliminaryAssessment && (

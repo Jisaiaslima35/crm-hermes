@@ -4,7 +4,8 @@ export type PipelineStage =
   | 'consulta_agendada'
   | 'falar_pessoalmente'
   | 'sem_resposta'
-  | 'desistiu';
+  | 'desistiu'
+  | 'atendido_concluido';
 
 export type HandoffState = 'ia_ativa' | 'humano_assumiu';
 

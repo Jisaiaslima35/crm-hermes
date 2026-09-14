@@ -12,12 +12,23 @@ import {
   Activity,
   PlusCircle,
   Wifi,
+  Radio,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
 
+export type LiveView =
+  | 'kanban'
+  | 'inbox'
+  | 'leads'
+  | 'radar'
+  | 'whatsapp'
+  | 'ai_settings'
+  | 'super_admin'
+  | 'live_crm';
+
 interface SidebarProps {
-  currentView: 'kanban' | 'inbox' | 'leads' | 'radar' | 'whatsapp' | 'ai_settings' | 'super_admin';
-  setCurrentView: (view: 'kanban' | 'inbox' | 'leads' | 'radar' | 'whatsapp' | 'ai_settings' | 'super_admin') => void;
+  currentView: LiveView;
+  setCurrentView: (view: LiveView) => void;
   activeTenant: Tenant;
   userRole: UserRole;
   unreadCount: number;
@@ -207,6 +218,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
               {activeTenant.aiEngine.mode === 'hermes_vps' ? 'VPS' : 'BYOK'}
+            </span>
+          </button>
+
+          <button
+            id="nav-live-crm"
+            onClick={() => setCurrentView('live_crm')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+              currentView === 'live_crm'
+                ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40'
+                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <Radio className="w-4 h-4" />
+              <span>Live CRM (Supabase)</span>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+              LIVE
             </span>
           </button>
 
