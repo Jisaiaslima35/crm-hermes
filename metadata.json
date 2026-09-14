@@ -1,0 +1,6 @@
+{
+  "name": "Deskcomm Clinic CRM - AI Sales OS",
+  "description": "CRM Multi-Tenant para clínicas e consultórios médicos com triagem por IA para WhatsApp, protocolo de handoff humano, funil inteligente e instâncias Evolution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
