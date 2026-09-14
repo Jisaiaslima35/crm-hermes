@@ -24,10 +24,10 @@ const INITIAL_TENANTS: Tenant[] = [
     aiEngine: {
       mode: 'hermes_vps',
       hermesEndpoint: 'https://vps-hermes.clinicamatheus.med.br/api/v1',
-      hermesToken: 'hms_live_89f72b109e9aa4c1722e0',
+      hermesToken: '',
       byokProvider: 'anthropic',
       byokModel: 'claude-3-5-sonnet-20241022',
-      byokKey: 'sk-ant-api03-xxxx...xxxx',
+      byokKey: '',
       personaName: 'Dr. Matheus AI (Hermes OS)',
       doctorSpecialty: 'Cardiologia',
       tone: 'acolhedor',
@@ -65,10 +65,10 @@ const INITIAL_TENANTS: Tenant[] = [
     aiEngine: {
       mode: 'byok',
       hermesEndpoint: 'https://vps-hermes.odontovida.com.br/api/v1',
-      hermesToken: 'hms_live_odonto_3391ba',
+      hermesToken: '',
       byokProvider: 'openai',
       byokModel: 'gpt-4o-mini',
-      byokKey: 'sk-proj-7YxZ984...abcd',
+      byokKey: '',
       personaName: 'OdontoVida Assistente AI',
       doctorSpecialty: 'Odontologia & Implantes',
       tone: 'clinico',
@@ -904,30 +904,6 @@ class DeskcommService {
     leads.unshift(newLead);
     this.saveLeadsToStorage(leads);
     return newLead;
-  }
-
-  // Simulate AI smart response when patient sends message and IA is active
-  public generateAiResponse(tenant: Tenant, patientMessage: string): string {
-    const isCardio = tenant.specialty.toLowerCase().includes('cardio');
-    const msg = patientMessage.toLowerCase();
-
-    if (isCardio) {
-      if (msg.includes('dor') || msg.includes('peito') || msg.includes('pressão') || msg.includes('urgente')) {
-        return `Entendido. Casos com desconforto ou alteração pressórica demandam atenção clínica especial. O Dr. Matheus orienta agendamento prioritário. Temos disponibilidade para encaixe hoje mesmo ou amanhã cedo. Você tem preferência de horário?`;
-      }
-      if (msg.includes('plano') || msg.includes('convênio') || msg.includes('bradesco') || msg.includes('sulamerica') || msg.includes('amil')) {
-        return `Aceitamos os principais planos como Bradesco Saúde, SulAmérica e Amil One para consultas e exames complementares. Caso o seu seja outro, fornecemos nota fiscal para reembolso integral. Deseja verificar para este mês?`;
-      }
-      return `Perfeito! Entendi perfeitamente. Na Clínica Cardiológica Dr. Matheus realizamos triagem completa com retorno em até 15 dias e laudos no mesmo dia. Gostaria de agendar para o período da manhã ou da tarde?`;
-    } else {
-      if (msg.includes('dor') || msg.includes('dente') || msg.includes('canal') || msg.includes('emergencia')) {
-        return `Entendo sua dor. Dor dental aguda requer alívio imediato para evitar que a inflamação se agrave. A Dra. Camila possui protocolo de pronto-atendimento odontológico. Consegue comparecer hoje em nosso consultório no Cambuí?`;
-      }
-      if (msg.includes('clareamento') || msg.includes('aparelho') || msg.includes('alinhador') || msg.includes('implante')) {
-        return `Excelente escolha! Para implantes e alinhadores invisíveis realizamos escaneamento 3D gratuito na primeira consulta para simular o resultado do seu sorriso. Qual dia fica mais fácil para você vir à clínica?`;
-      }
-      return `Obrigado pela mensagem! A Dra. Camila Nogueira e nossa equipe OdontoVida terão prazer em atendê-lo. Você busca atendimento particular ou gostaria de usar convênio?`;
-    }
   }
 
   public async testAiConnection(config: AiEngineConfig): Promise<{ success: boolean; latencyMs: number; message: string }> {

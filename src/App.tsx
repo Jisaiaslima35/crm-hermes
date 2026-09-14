@@ -129,66 +129,25 @@ export default function App() {
     }
   };
 
-  // Handler: Simulate Patient Reply & Intelligent AI Answer Loop
-  const handleSimulatePatientReply = useCallback(
+  // Handler: Receive Incoming Patient Message (Webhook simulation without mock AI loops)
+  const handleReceivePatientMessage = useCallback(
     (leadId: string, message: string) => {
       const targetLead = leads.find((l) => l.id === leadId);
       if (!targetLead) return;
 
-      // 1. Deliver patient message
-      const withPatientMsg = deskcommService.sendWhatsAppMessage(
+      const updated = deskcommService.sendWhatsAppMessage(
         leadId,
         message,
         'patient',
         targetLead.name
       );
 
-      if (!withPatientMsg) return;
-
-      setLeads((prev) => prev.map((l) => (l.id === leadId ? withPatientMsg : l)));
-      showToast(`Mensagem recebida do paciente ${targetLead.name} via WhatsApp.`, 'info');
-
-      // 2. Check Handoff Status
-      if (withPatientMsg.handoffState === 'ia_ativa') {
-        // If message has urgent trigger, suggest moving to 'falar_pessoalmente'
-        const lower = message.toLowerCase();
-        const hasUrgentWords =
-          lower.includes('dor no peito') ||
-          lower.includes('falta de ar') ||
-          lower.includes('socorro') ||
-          lower.includes('emergencia');
-
-        setTimeout(() => {
-          const aiResponseText = deskcommService.generateAiResponse(activeTenant, message);
-          const withAiReply = deskcommService.sendWhatsAppMessage(
-            leadId,
-            aiResponseText,
-            'ai',
-            activeTenant.aiEngine.personaName
-          );
-
-          if (withAiReply) {
-            if (hasUrgentWords && withAiReply.stage !== 'falar_pessoalmente') {
-              withAiReply.stage = 'falar_pessoalmente';
-              withAiReply.priority = 'urgente';
-              deskcommService.updateLead(withAiReply);
-            }
-            setLeads((prev) => prev.map((l) => (l.id === leadId ? withAiReply : l)));
-            showToast(
-              `🤖 Persona IA (${activeTenant.aiEngine.personaName}) respondeu ao paciente.`,
-              'success'
-            );
-          }
-        }, 900);
-      } else {
-        // Human is in control: IA does NOT reply
-        showToast(
-          `⚠️ Paciente respondeu, mas a IA está pausada (Kill-switch ativo). O operador humano deve responder.`,
-          'warning'
-        );
+      if (updated) {
+        setLeads((prev) => prev.map((l) => (l.id === leadId ? updated : l)));
+        showToast(`Mensagem recebida de ${targetLead.name} via WhatsApp Webhook.`, 'info');
       }
     },
-    [leads, activeTenant]
+    [leads]
   );
 
   // Handler: Add Internal Note
@@ -333,7 +292,7 @@ export default function App() {
               onUpdateStage={handleMoveStage}
               onAddInternalNote={handleAddInternalNote}
               userRole={userRole}
-              onSimulatePatientReply={handleSimulatePatientReply}
+              onReceivePatientMessage={handleReceivePatientMessage}
             />
           )}
 

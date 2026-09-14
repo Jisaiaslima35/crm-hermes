@@ -31,7 +31,7 @@ interface ChatInboxProps {
   onUpdateStage: (leadId: string, stage: PipelineStage) => void;
   onAddInternalNote: (leadId: string, content: string) => void;
   userRole: UserRole;
-  onSimulatePatientReply: (leadId: string, message: string) => void;
+  onReceivePatientMessage: (leadId: string, message: string) => void;
 }
 
 export const ChatInbox: React.FC<ChatInboxProps> = ({
@@ -44,7 +44,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
   onUpdateStage,
   onAddInternalNote,
   userRole,
-  onSimulatePatientReply,
+  onReceivePatientMessage,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [inboxFilter, setInboxFilter] = useState<'all' | 'silence' | 'human' | 'ai'>('all');
@@ -321,10 +321,10 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                 id="btn-open-simulate-reply"
                 onClick={() => setShowSimulateModal(true)}
                 className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/40 flex items-center gap-1.5 transition-colors cursor-pointer"
-                title="Simular mensagem do paciente para testar a resposta da IA em tempo real"
+                title="Testar recebimento de mensagem do paciente via WhatsApp Webhook"
               >
                 <Zap className="w-3.5 h-3.5 text-sky-400" />
-                <span className="hidden sm:inline">Simular Paciente</span>
+                <span className="hidden sm:inline">Testar Msg Paciente</span>
               </button>
             </div>
           </div>
@@ -490,7 +490,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
         />
       )}
 
-      {/* Simulation Modal for Testing AI Responses */}
+      {/* Test Modal for Incoming WhatsApp Patient Message */}
       {showSimulateModal && selectedLead && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-5 space-y-4 animate-in fade-in-50 zoom-in-95">
@@ -498,7 +498,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
               <div className="flex items-center gap-2">
                 <Zap className="w-5 h-5 text-sky-400" />
                 <h3 className="font-bold text-sm text-white">
-                  Simulador de Resposta do Paciente
+                  Testar Recebimento de Mensagem (WhatsApp Webhook)
                 </h3>
               </div>
               <button
@@ -510,15 +510,14 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
             </div>
 
             <p className="text-xs text-slate-300">
-              Escolha uma mensagem simulada do paciente{' '}
-              <strong className="text-white">{selectedLead.name}</strong> para testar a
-              triagem autônoma do motor de IA:
+              Envie uma mensagem de teste como se o paciente{' '}
+              <strong className="text-white">{selectedLead.name}</strong> estivesse respondendo pelo WhatsApp para registrar no atendimento:
             </p>
 
             <div className="space-y-2">
               <button
                 onClick={() => {
-                  onSimulatePatientReply(
+                  onReceivePatientMessage(
                     selectedLead.id,
                     'Doutor, minha dor no peito aumentou e agora sinto falta de ar para subir escadas.'
                   );
@@ -531,7 +530,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
 
               <button
                 onClick={() => {
-                  onSimulatePatientReply(
+                  onReceivePatientMessage(
                     selectedLead.id,
                     'Vocês aceitam o convênio Bradesco Saúde Top Nacional para consulta?'
                   );
@@ -544,7 +543,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
 
               <button
                 onClick={() => {
-                  onSimulatePatientReply(
+                  onReceivePatientMessage(
                     selectedLead.id,
                     'Quinta-feira às 10h fica excelente para mim. Pode confirmar o agendamento!'
                   );
@@ -557,7 +556,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
 
               <button
                 onClick={() => {
-                  onSimulatePatientReply(
+                  onReceivePatientMessage(
                     selectedLead.id,
                     'Quanto fica a consulta particular e tem vaga para amanhã?'
                   );
@@ -585,7 +584,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                 <button
                   disabled={!customSimulateText.trim()}
                   onClick={() => {
-                    onSimulatePatientReply(selectedLead.id, customSimulateText.trim());
+                    onReceivePatientMessage(selectedLead.id, customSimulateText.trim());
                     setCustomSimulateText('');
                     setShowSimulateModal(false);
                   }}
