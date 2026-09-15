@@ -61,6 +61,12 @@ export interface Tenant {
   whatsappInstance: WhatsAppInstance;
   metrics: TenantMetrics;
   createdAt: string;
+  /**
+   * Interruptor Mestre de Plantão IA. true = IA responde normalmente.
+   * false = mensagem inbound é gravada mas IA NÃO responde (recepcionista
+   * assumiu turno, fora do expediente, etc). Default true.
+   */
+  aiAutoReplyEnabled: boolean;
 }
 
 export interface LeadMessage {

@@ -289,6 +289,35 @@ function AppInner() {
     }
   };
 
+  // Handler: 🌙 Toggle Plantão IA da clínica ativa
+  // Persiste em `tenants.ai_auto_reply_enabled` + atualiza state local.
+  // Webhook tem cache 60s; toggle já reflete no próximo inbound (com
+  // eventual atraso de 1 mensagem no pior caso).
+  const handleToggleAiAutoReply = useCallback(async () => {
+    if (!activeTenant) return;
+    const next = !activeTenant.aiAutoReplyEnabled;
+    const optimistic = tenants.map((t) =>
+      t.id === activeTenant.id ? { ...t, aiAutoReplyEnabled: next } : t
+    );
+    setTenants(optimistic);
+    try {
+      await remote.setTenantAiAutoReply(activeTenant.id, next);
+      showToast(
+        next
+          ? `🌙 Plantão IA religado para "${activeTenant.name}" — IA volta a responder`
+          : `🌙 Plantão IA desligado em "${activeTenant.name}" — mensagens serão gravadas, IA não responde`,
+        next ? 'success' : 'warning'
+      );
+    } catch (err) {
+      // rollback
+      setTenants(tenants);
+      showToast(
+        `Falha ao alternar Plantão IA: ${(err as Error).message}`,
+        'warning'
+      );
+    }
+  }, [activeTenant, tenants, showToast]);
+
   // Handler: Change Stage (Kanban Drag & Drop or Selector)
   const handleMoveStage = (leadId: string, newStage: PipelineStage) => {
     const updated = deskcommService.updateLeadStage(leadId, newStage);
@@ -513,6 +542,7 @@ function AppInner() {
           userEmail={user?.email}
           onOpenSidebar={() => setSidebarOpen(true)}
           showHamburger={isNarrow}
+          onToggleAiAutoReply={handleToggleAiAutoReply}
         />
 
         {/* View Switcher */}

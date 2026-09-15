@@ -99,7 +99,11 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Cache em memória: evolution_instance -> tenant_id (uuid)
 _TENANT_BY_INSTANCE: dict[str, str] = {}
-_TENANT_CFG_CACHE: dict[str, dict[str, Any]] = {}
+# Cache de config do tenant: (cfg_dict, fetched_at_monotonic_seconds).
+# TTL curto (60s) pra refletir rápido mudanças de `ai_auto_reply_enabled`
+# feitas via front sem reiniciar o webhook.
+_TENANT_CFG_CACHE: dict[str, tuple[dict[str, Any], float]] = {}
+_TENANT_CFG_CACHE_TTL_SECONDS = 60.0
 
 # Heurística de mudança de stage (palavras-chave em PT-BR, lowercase)
 _STAGE_KEYWORDS: dict[str, list[str]] = {
@@ -212,16 +216,26 @@ def _resolve_tenant_id(instance_name: str) -> Optional[str]:
 
 def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
     """Busca config da clínica (nome, especialidade, doctor_name, AI config)
-    pra montar prompt + rotear LLM."""
-    if tenant_id in _TENANT_CFG_CACHE:
-        return _TENANT_CFG_CACHE[tenant_id]
+    pra montar prompt + rotear LLM.
+
+    Cache em memória com TTL curto (60s) — reflete rápido o toggle
+    `ai_auto_reply_enabled` sem reiniciar o webhook.
+    """
+    now = time.monotonic()
+    cached = _TENANT_CFG_CACHE.get(tenant_id)
+    if cached is not None:
+        cfg, fetched_at = cached
+        if (now - fetched_at) < _TENANT_CFG_CACHE_TTL_SECONDS:
+            return cfg
+        # Cache expirado — recarrega abaixo
+
     res = (
         sb.table("tenants")
         .select(
             "name, specialty, doctor_name, city, "
             "ai_mode, system_prompt, persona_name, tone_of_voice, "
             "byok_provider, byok_api_key, byok_model, "
-            "hermes_gateway_url"
+            "hermes_gateway_url, ai_auto_reply_enabled"
         )
         .eq("id", tenant_id)
         .limit(1)
@@ -241,9 +255,19 @@ def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
         "byok_api_key": raw.get("byok_api_key") or "",
         "byok_model": raw.get("byok_model") or "",
         "hermes_gateway_url": (raw.get("hermes_gateway_url") or "").strip(),
+        # Interruptor Mestre de Plantão IA. Default True (IA responde) quando
+        # coluna ausente em tenants legados / cache pré-migração.
+        "ai_auto_reply_enabled": bool(
+            raw.get("ai_auto_reply_enabled", True)
+        ),
     }
-    _TENANT_CFG_CACHE[tenant_id] = cfg
+    _TENANT_CFG_CACHE[tenant_id] = (cfg, now)
     return cfg
+
+
+def _invalidate_tenant_cache(tenant_id: str) -> None:
+    """Dropa cache do tenant (uso no callback do toggle do front)."""
+    _TENANT_CFG_CACHE.pop(tenant_id, None)
 
 
 def _get_or_create_lead(
@@ -789,6 +813,22 @@ async def _dispatch_ai(
     """
     try:
         tenant_cfg = _get_tenant_config(tenant_id)
+        # ─────────────────────────────────────────────────────────────────
+        # 🌙 PLANTÃO IA — Interruptor Mestre (safety belt).
+        # Caller (evolution_webhook) já checa `ai_auto_reply_enabled` antes
+        # de enfileirar este background task e seta `should_dispatch_ai=False`.
+        # Este if aqui é só defesa em profundidade — se outro caminho
+        # invocar `_dispatch_ai` no futuro, ainda respeita o plantão.
+        # ─────────────────────────────────────────────────────────────────
+        if not tenant_cfg.get("ai_auto_reply_enabled", True):
+            logger.info(
+                "[%s] 🌙 plantão IA OFF (safety belt em _dispatch_ai) — "
+                "phone=%s lead=%s sem resposta",
+                instance,
+                lead.get("phone"),
+                lead.get("id"),
+            )
+            return
         history = await _fetch_recent_history(lead["id"], limit=20)
         system_prompt = _build_system_prompt(tenant_cfg, lead)
 
@@ -1018,11 +1058,28 @@ async def evolution_webhook(
     #    (supabaseService.createLead) e 'ai' é o legado de seeds antigas.
     handoff_state = (lead.get("handoff_state") or "ia_ativa").lower()
     ai_active = handoff_state in {"ai", "ia_ativa"}
+
+    # 🌙 PLANTÃO IA — se o tenant desligou, NÃO disparamos IA mesmo que
+    # a lead esteja em modo ia_ativa. Cache do tenant_cfg tem TTL 60s;
+    # toggle via front expira em <= 60s no pior caso. Mensagem segue
+    # gravada em `messages` (acima) e lead já foi atualizado.
+    tenant_cfg = _get_tenant_config(tenant_id)
+    plantao_off = not tenant_cfg.get("ai_auto_reply_enabled", True)
+    if plantao_off:
+        logger.info(
+            "[%s] 🌙 plantão IA OFF — phone=%s lead=%s "
+            "msg gravada, IA NÃO vai responder",
+            instance,
+            extracted["phone"],
+            lead.get("id"),
+        )
+
     should_dispatch_ai = (
         ok
         and not extracted["from_me"]
         and extracted["sender"] == "patient"
         and ai_active
+        and not plantao_off
     )
     if should_dispatch_ai:
         background.add_task(
@@ -1167,6 +1224,53 @@ async def composio_status(toolkit: str, user_id: str) -> dict[str, Any]:
         "connected_at": (active or {}).get("created_at"),
         "matched_total": len(matches),
         "total_items": upstream.get("total_items", 0),
+    }
+
+
+@app.put("/tenants/{tenant_id}/ai-auto-reply")
+async def set_tenant_ai_auto_reply(
+    tenant_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Liga/desliga o Plantão IA pra um tenant.
+
+    Body: {"enabled": true|false}
+
+    Persiste na coluna `ai_auto_reply_enabled` e invalida o cache em memória
+    pra que o próximo webhook já respeite o novo estado (sem esperar TTL).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+    if not isinstance(body, dict) or "enabled" not in body:
+        raise HTTPException(status_code=400, detail="missing 'enabled'")
+
+    enabled = bool(body["enabled"])
+
+    res = (
+        sb.table("tenants")
+        .update({"ai_auto_reply_enabled": enabled})
+        .eq("id", tenant_id)
+        .execute()
+    )
+    if getattr(res, "error", None):
+        raise HTTPException(
+            status_code=500,
+            detail=f"supabase: {res.error.message}",  # type: ignore[attr-defined]
+        )
+
+    _invalidate_tenant_cache(tenant_id)
+    logger.info(
+        "🌙 [tenant %s] ai_auto_reply_enabled = %s (cache invalidado)",
+        tenant_id,
+        enabled,
+    )
+
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "ai_auto_reply_enabled": enabled,
     }
 
 

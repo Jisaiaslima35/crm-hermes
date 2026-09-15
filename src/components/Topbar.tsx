@@ -9,6 +9,7 @@ import {
   Sliders,
   Plus,
   Menu,
+  Power,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
 
@@ -26,6 +27,8 @@ interface TopbarProps {
   userEmail?: string;
   onOpenSidebar?: () => void;
   showHamburger?: boolean;
+  /** Interruptor Mestre de Plantão IA (toggle). */
+  onToggleAiAutoReply?: () => void;
 }
 
 // ----------------------------------------------------------------------------
@@ -50,8 +53,10 @@ export const Topbar: React.FC<TopbarProps> = ({
   userEmail,
   onOpenSidebar,
   showHamburger,
+  onToggleAiAutoReply,
 }) => {
   const isSuperAdmin = userRole === 'super_admin';
+  const aiEnabled = activeTenant.aiAutoReplyEnabled;
 
   return (
     <header
@@ -243,6 +248,52 @@ export const Topbar: React.FC<TopbarProps> = ({
             </span>
             <span className="text-[10px] px-1 py-0.5 rounded bg-emerald-950/80 text-emerald-300 font-mono hidden lg:inline">
               {activeTenant.whatsappInstance.batteryLevel}%
+            </span>
+          </button>
+        )}
+
+        {/* 🌙 Interruptor Mestre de Plantão IA — visível pra TODOS os perfis
+            (admin e clínicas). Quando desligado, mensagens inbound são
+            gravadas mas IA NÃO responde. Tooltip explica pro usuário leigo. */}
+        {onToggleAiAutoReply && (
+          <button
+            id="btn-topbar-ai-plantao"
+            onClick={onToggleAiAutoReply}
+            className={`flex items-center gap-1.5 sm:gap-2 px-2 sm:px-2.5 py-1.5 rounded-lg border text-xs transition-all cursor-pointer shrink-0 ${
+              aiEnabled
+                ? 'bg-emerald-950/60 hover:bg-emerald-950/80 border-emerald-700/60 text-emerald-200'
+                : 'bg-rose-950/60 hover:bg-rose-950/80 border-rose-700/60 text-rose-200'
+            }`}
+            title={
+              aiEnabled
+                ? 'Plantão IA ATIVADO — a IA responde pacientes automaticamente. Clique para desligar.'
+                : 'Plantão IA DESATIVADO — mensagens são gravadas mas a IA não responde (recepcionista assumiu). Clique para religar.'
+            }
+            aria-pressed={!aiEnabled}
+          >
+            <span className="relative flex h-2.5 w-2.5 shrink-0">
+              <span
+                className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+                  aiEnabled ? 'bg-emerald-400' : 'bg-rose-500'
+                }`}
+              />
+            </span>
+            <Power
+              className={`w-3.5 h-3.5 shrink-0 hidden sm:inline ${
+                aiEnabled ? 'text-emerald-400' : 'text-rose-400'
+              }`}
+            />
+            <span className="font-semibold text-[11px] hidden sm:inline">
+              {aiEnabled ? 'IA Ativa' : 'Plantão'}
+            </span>
+            <span
+              className={`text-[10px] px-1 py-0.5 rounded font-mono hidden lg:inline ${
+                aiEnabled
+                  ? 'bg-emerald-900/70 text-emerald-300'
+                  : 'bg-rose-900/70 text-rose-300'
+              }`}
+            >
+              {aiEnabled ? 'ON' : 'OFF'}
             </span>
           </button>
         )}

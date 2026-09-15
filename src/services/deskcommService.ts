@@ -75,6 +75,7 @@ const INITIAL_TENANTS: Tenant[] = [
       avgResponseTimeSeconds: 0,
       aiAutonomousRate: 0,
     },
+    aiAutoReplyEnabled: true,
     createdAt: '',
   },
   {
@@ -115,6 +116,7 @@ const INITIAL_TENANTS: Tenant[] = [
       avgResponseTimeSeconds: 0,
       aiAutonomousRate: 0,
     },
+    aiAutoReplyEnabled: true,
     createdAt: '',
   },
 ];

@@ -52,6 +52,7 @@ export const NewTenantModal: React.FC<NewTenantModalProps> = ({ onSave, onClose 
         webhookUrl: `https://vps-hermes.cluster-saas.com/webhook/evolution/${tenantId}_prod_01`,
         lastSync: 'Recém criado',
       },
+      aiAutoReplyEnabled: true,
       metrics: {
         totalLeads: 0,
         scheduledThisMonth: 0,

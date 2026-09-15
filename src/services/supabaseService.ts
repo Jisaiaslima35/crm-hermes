@@ -29,6 +29,9 @@ export interface DbTenant {
   byok_provider?: string | null;
   byok_api_key?: string | null;
   byok_model?: string | null;
+  // Interruptor Mestre de Plantão IA (migration 20260915)
+  // Pode vir null/undefined em tenants pré-migração — default true no mapper.
+  ai_auto_reply_enabled?: boolean | null;
 }
 
 export interface DbLead {
@@ -109,6 +112,7 @@ function dbTenantToTenant(row: DbTenant): Tenant {
       aiAutonomousRate: 0,
     },
     createdAt: row.created_at,
+    aiAutoReplyEnabled: row.ai_auto_reply_enabled ?? true,
   };
 }
 
@@ -322,6 +326,21 @@ export async function upsertTenantMeta(input: {
     .from('tenants')
     .upsert(payload, { onConflict: 'id' });
   if (error) throw new Error(`upsertTenantMeta: ${error.message}`);
+}
+
+// Liga/Desliga o Plantão IA da clínica (coluna `ai_auto_reply_enabled`).
+// Retorna o estado persistido. O cache do webhook expira em <= 60s; pra
+// efeito imediato, o front também pode passar o tenant_id ao webhook.
+export async function setTenantAiAutoReply(
+  tenantId: string,
+  enabled: boolean
+): Promise<void> {
+  const { error } = await supabase
+    .from('tenants')
+    .update({ ai_auto_reply_enabled: enabled })
+    .eq('id', tenantId);
+  if (error)
+    throw new Error(`setTenantAiAutoReply: ${error.message}`);
 }
 
 // Notas internas ficam em `leads.internal_notes` (TEXT JSON).
