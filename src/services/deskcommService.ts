@@ -22,6 +22,14 @@ import * as remote from './supabaseService';
 const STORAGE_KEY_TENANTS = 'deskcomm_tenants_v1';
 const STORAGE_KEY_LEADS = 'deskcomm_leads_v1';
 
+// Endpoints base para validação de conexão BYOK via GET /models.
+// Espelha a tabela _BROADCAST_PROVIDERS do webhook (webhook_server.py).
+const BYOK_BASE_URLS: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  openrouter: 'https://openrouter.ai/api/v1',
+  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai',
+};
+
 // ---------------------------------------------------------------------------
 // Helpers de migração: na primeira inicialização, se liveStore está vazio mas
 // localStorage tem dados, eles viram seed temporário. Após o App.tsx bootar
@@ -182,7 +190,8 @@ class DeskcommService {
 
   public updateTenant(updatedTenant: Tenant): Tenant {
     liveStore.upsertTenant(updatedTenant);
-    // Persistência best-effort (Supabase só mantém subset das colunas)
+    // Persistência best-effort no Supabase (subset das colunas relevantes
+    // ao motor IA: config completa de persona, tom, system_prompt, BYOK).
     remote
       .upsertTenantMeta({
         id: updatedTenant.id,
@@ -192,6 +201,12 @@ class DeskcommService {
         city: updatedTenant.city,
         phone: updatedTenant.phone,
         ai_mode: updatedTenant.aiEngine.mode,
+        system_prompt: updatedTenant.aiEngine.systemPrompt,
+        persona_name: updatedTenant.aiEngine.personaName,
+        tone_of_voice: updatedTenant.aiEngine.tone,
+        byok_provider: updatedTenant.aiEngine.byokProvider,
+        byok_api_key: updatedTenant.aiEngine.byokKey,
+        byok_model: updatedTenant.aiEngine.byokModel,
       })
       .catch((e) => console.warn('[deskcommService] upsertTenant falhou:', e));
     return updatedTenant;
@@ -484,8 +499,13 @@ class DeskcommService {
 
   public async testAiConnection(
     config: AiEngineConfig
-  ): Promise<{ success: boolean; latencyMs: number; message: string }> {
-    await new Promise((r) => setTimeout(r, 800));
+  ): Promise<{
+    success: boolean;
+    latencyMs: number;
+    message: string;
+    models?: string[];
+  }> {
+    // Modo A (Hermes VPS): valida endpoint + testa health
     if (config.mode === 'hermes_vps') {
       if (!config.hermesEndpoint.startsWith('http')) {
         return {
@@ -494,13 +514,34 @@ class DeskcommService {
           message: 'URL do Endpoint Hermes inválida. Deve iniciar com https:// ou http://',
         };
       }
-      return {
-        success: true,
-        latencyMs: 142,
-        message:
-          'Conectado à VPS Hermes v2.4 com sucesso. Latência de 142ms. Modelo Llama-3-70B-Clinical ativo.',
-      };
+      const t0 = performance.now();
+      try {
+        const r = await fetch(config.hermesEndpoint.replace(/\/$/, '') + '/health', {
+          method: 'GET',
+        });
+        const latencyMs = Math.round(performance.now() - t0);
+        if (!r.ok) {
+          return {
+            success: false,
+            latencyMs,
+            message: `Falha na conexão: endpoint respondeu ${r.status}.`,
+          };
+        }
+        return {
+          success: true,
+          latencyMs,
+          message: `Conectado à VPS Hermes em ${latencyMs}ms.`,
+        };
+      } catch (e: any) {
+        return {
+          success: false,
+          latencyMs: 0,
+          message: `Falha na conexão: ${e?.message || 'endpoint inacessível'}.`,
+        };
+      }
     }
+
+    // Modo B (BYOK): GET {baseUrl}/models com Bearer API key
     if (!config.byokKey || config.byokKey.length < 8) {
       return {
         success: false,
@@ -508,11 +549,47 @@ class DeskcommService {
         message: 'API Key BYOK inválida ou muito curta.',
       };
     }
-    return {
-      success: true,
-      latencyMs: 280,
-      message: `Conexão validada com sucesso com a API da ${config.byokProvider.toUpperCase()} (${config.byokModel}). Quota de tokens disponível.`,
-    };
+    const baseUrl = BYOK_BASE_URLS[config.byokProvider];
+    if (!baseUrl) {
+      return {
+        success: false,
+        latencyMs: 0,
+        message: `Provedor BYOK '${config.byokProvider}' sem endpoint conhecido.`,
+      };
+    }
+    const t0 = performance.now();
+    try {
+      const r = await fetch(baseUrl + '/models', {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${config.byokKey}`,
+        },
+      });
+      const latencyMs = Math.round(performance.now() - t0);
+      if (!r.ok) {
+        return {
+          success: false,
+          latencyMs,
+          message: `Falha na conexão: chave inválida ou endpoint inacessível (HTTP ${r.status}).`,
+        };
+      }
+      const data = await r.json();
+      const models = Array.isArray(data?.data)
+        ? data.data.map((m: any) => String(m.id)).filter(Boolean)
+        : [];
+      return {
+        success: true,
+        latencyMs,
+        message: `Conexão validada. ${models.length} modelos encontrados.`,
+        models,
+      };
+    } catch (e: any) {
+      return {
+        success: false,
+        latencyMs: Math.round(performance.now() - t0),
+        message: `Falha na conexão: chave inválida ou endpoint inacessível (${e?.message || 'erro de rede'}).`,
+      };
+    }
   }
 
   public getGlobalMetrics() {

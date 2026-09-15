@@ -40,13 +40,25 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     message: string;
   } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  // Modelos descobertos via GET /v1/models após Testar Conexão.
+  // Quando vazio, o select usa a lista estática de BYOK_PROVIDERS.
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
 
   const handleTestConnection = async () => {
     setIsTesting(true);
     setTestResult(null);
+    setDiscoveredModels([]);
     try {
       const res = await deskcommService.testAiConnection(config);
       setTestResult(res);
+      if (res.success && res.models && res.models.length > 0) {
+        setDiscoveredModels(res.models);
+        // Se o modelo atual não está na lista descoberta, atualiza pro
+        // primeiro (evita salvar config com modelo inválido).
+        if (!res.models.includes(config.byokModel)) {
+          setConfig({ ...config, byokModel: res.models[0] });
+        }
+      }
     } catch (err: any) {
       setTestResult({
         success: false,
@@ -235,6 +247,11 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                 <div>
                   <label className="text-[11px] font-semibold text-slate-300 block mb-1">
                     Modelo Clínico
+                    {discoveredModels.length > 0 && (
+                      <span className="ml-2 text-[10px] text-emerald-400 font-normal">
+                        ({discoveredModels.length} descobertos)
+                      </span>
+                    )}
                   </label>
                   <select
                     id="select-byok-model"
@@ -242,7 +259,10 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                     onChange={(e) => setConfig({ ...config, byokModel: e.target.value })}
                     className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-purple-500"
                   >
-                    {selectedProviderData.models.map((m) => (
+                    {(discoveredModels.length > 0
+                      ? discoveredModels
+                      : selectedProviderData.models
+                    ).map((m) => (
                       <option key={m} value={m}>
                         {m}
                       </option>

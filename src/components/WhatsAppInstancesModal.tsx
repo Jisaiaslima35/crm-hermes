@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   QrCode,
-  Wifi,
   Copy,
   Check,
   RefreshCw,
@@ -11,9 +10,48 @@ import {
   Smartphone,
   Server,
   AlertTriangle,
+  Power,
+  Loader2,
 } from 'lucide-react';
 import { Tenant } from '../types';
 import * as remote from '../services/supabaseService';
+
+// Formata JID/telefone para o padrão BR legível: +55 84 99136-7962.
+// Aceita:
+//   "5584991367962@s.whatsapp.net" → +55 84 99136-7962
+//   "5584991367962"               → +55 84 99136-7962
+//   "+55 84 99136-7962"           → idem (pass-through seguro)
+function formatBrazilPhone(raw?: string | null): string {
+  if (!raw) return '—';
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 0) return '—';
+  // Extrai só os últimos 11 dígitos (DDD + 9 dígitos) se vier 55 + DDD + 9
+  let national = digits;
+  if (national.startsWith('55') && national.length >= 12) {
+    national = national.slice(2);
+  }
+  if (national.length === 11) {
+    return `+55 ${national.slice(0, 2)} ${national.slice(2, 7)}-${national.slice(7)}`;
+  }
+  if (national.length === 10) {
+    return `+55 ${national.slice(0, 2)} ${national.slice(2, 6)}-${national.slice(6)}`;
+  }
+  // fallback: mostra com prefixo + e separadores a cada 4-5
+  if (national.length >= 10) {
+    return `+${national}`;
+  }
+  return `+${national}`;
+}
+
+// Extrai o número de telefone (digits) preferindo ownerJid, depois number.
+function pickPhoneDigits(
+  details: { ownerJid?: string | null; number?: string | null } | null | undefined
+): string | null {
+  if (!details) return null;
+  if (details.ownerJid) return details.ownerJid;
+  if (details.number) return String(details.number);
+  return null;
+}
 
 interface WhatsAppInstancesModalProps {
   activeTenant: Tenant;
@@ -28,6 +66,12 @@ type QrStatus =
   | { kind: 'connected' }
   | { kind: 'error'; message: string };
 
+type SyncState =
+  | { kind: 'idle' }
+  | { kind: 'syncing' }
+  | { kind: 'ready' }
+  | { kind: 'error'; message: string };
+
 const POLL_INTERVAL_MS = 3000;
 
 export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
@@ -37,6 +81,11 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
 }) => {
   const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [qrStatus, setQrStatus] = useState<QrStatus>({ kind: 'idle' });
+  const [sync, setSync] = useState<SyncState>({ kind: 'idle' });
+  const [linkedPhone, setLinkedPhone] = useState<string | null>(
+    activeTenant.whatsappInstance.phoneNumber || null
+  );
+  const [logoutPending, setLogoutPending] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   const instance = activeTenant.whatsappInstance;
@@ -61,6 +110,87 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
     return () => stopPolling();
   }, []);
 
+  /**
+   * Sincronização REAL de status + número vinculado com a Evolution API v2.
+   *
+   * Estratégia:
+   *  1) GET /instance/connectionState/{instance} → estado (`open` / `close` / `connecting`).
+   *  2) GET /instance/fetchInstances?instanceName={instance} → dados do proprietário
+   *     (ownerJid / number) para preencher o card "Número Vinculado".
+   *
+   * Se `state === "open"`, marca o tenant local como connected (verde).
+   * Caso contrário, mantém o status atual (para evitar falsos "reconnecting").
+   */
+  const syncWithEvolution = async () => {
+    setSync({ kind: 'syncing' });
+    try {
+      const [statusPayload, details] = await Promise.all([
+        remote.getInstanceStatus(sessionName),
+        remote.getInstanceDetails(sessionName),
+      ]);
+
+      // Determina o estado de conexão: prioriza `connectionState.state`,
+      // caindo pro `fetchInstances[].connectionStatus`.
+      const stateRaw =
+        (statusPayload as { state?: string } | null)?.state ||
+        details?.connectionStatus ||
+        'unknown';
+      const isOpen = stateRaw === 'open';
+
+      // Número vinculado: extrai de ownerJid ou number.
+      const phoneDigits = pickPhoneDigits(details);
+      if (phoneDigits) setLinkedPhone(phoneDigits);
+
+      // Aplica atualização ao tenant SOMENTE se mudou o status (para não
+      // gerar lastSync novo a cada poll). Bateria/handshake ficam com placeholder
+      // porque a Evolution v2 não expõe telemetria do aparelho via REST padrão.
+      const newStatus: Tenant['whatsappInstance']['status'] = isOpen
+        ? 'connected'
+        : instance.status;
+
+      const newPhone = phoneDigits || instance.phoneNumber;
+
+      if (
+        isOpen !== (instance.status === 'connected') ||
+        newPhone !== instance.phoneNumber
+      ) {
+        const updated: Tenant = {
+          ...activeTenant,
+          whatsappInstance: {
+            ...activeTenant.whatsappInstance,
+            status: newStatus,
+            phoneNumber: formatBrazilPhone(newPhone),
+            lastSync: new Date().toLocaleString('pt-BR'),
+          },
+        };
+        onUpdateTenant(updated);
+      } else {
+        // mesmo status: só sincroniza o telefone caso tenhamos conseguido puxar
+        if (phoneDigits && phoneDigits !== instance.phoneNumber) {
+          const updated: Tenant = {
+            ...activeTenant,
+            whatsappInstance: {
+              ...activeTenant.whatsappInstance,
+              phoneNumber: formatBrazilPhone(phoneDigits),
+            },
+          };
+          onUpdateTenant(updated);
+        }
+      }
+
+      setSync({ kind: 'ready' });
+    } catch (err) {
+      setSync({ kind: 'error', message: String(err) });
+    }
+  };
+
+  // Sincroniza automaticamente ao abrir o modal — reflete o estado REAL
+  // mesmo se o card estava stale por cache local.
+  useEffect(() => {
+    void syncWithEvolution();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleCopyWebhook = () => {
     navigator.clipboard.writeText(computedWebhookUrl);
     setCopiedWebhook(true);
@@ -68,22 +198,97 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
   };
 
   const handleReconnect = async () => {
-    const statusResult = await remote.getInstanceStatus(sessionName);
-    const state = (statusResult as { state?: string } | null)?.state || 'unknown';
-    const updated: Tenant = {
-      ...activeTenant,
-      whatsappInstance: {
-        ...activeTenant.whatsappInstance,
-        status: state === 'open' ? 'connected' : 'reconnecting',
-        lastSync: new Date().toLocaleString('pt-BR'),
-      },
-    };
-    onUpdateTenant(updated);
+    // Reusa o sync completo: traz connectionState + número real.
+    await syncWithEvolution();
+  };
+
+  /**
+   * Desconecta (logout limpo) a instância na Evolution: DELETE /instance/logout/{instance}.
+   * Depois do logout, libera o botão "Novo Pareamento QR Code" para gerar
+   * um QR limpo sem risco de corromper a sessão no Baileys.
+   */
+  const handleLogout = async () => {
+    if (logoutPending) return;
+    const ok = window.confirm(
+      `Desconectar a sessão "${sessionName}" do WhatsApp?\n\n` +
+        'A atendente precisará escanear um novo QR Code no celular da clínica.'
+    );
+    if (!ok) return;
+    setLogoutPending(true);
+    try {
+      const result = await remote.logoutInstance(sessionName);
+      if (!result.ok) {
+        window.alert(
+          `Falha ao desconectar (HTTP ${result.status ?? '??'}). ` +
+            'Veja o console para detalhes.'
+        );
+        console.error('[WhatsAppInstancesModal] logout falhou', result);
+      } else {
+        // Limpa número vinculado e marca como desconectado localmente.
+        setLinkedPhone(null);
+        const updated: Tenant = {
+          ...activeTenant,
+          whatsappInstance: {
+            ...activeTenant.whatsappInstance,
+            status: 'disconnected',
+            phoneNumber: '',
+            lastSync: new Date().toLocaleString('pt-BR'),
+          },
+        };
+        onUpdateTenant(updated);
+        // Cancela QR pendente para forçar geração de um novo.
+        setQrStatus({ kind: 'idle' });
+      }
+    } finally {
+      setLogoutPending(false);
+    }
   };
 
   const fetchQrCode = async () => {
     stopPolling();
     setQrStatus({ kind: 'loading' });
+
+    // FLUXO SEGURO: se a Evolution ainda reporta a sessão como `open`
+    // (ex.: troca de número oficial sem trocar de chip), precisamos
+    // desconectar antes para o Baileys não corromper a sessão.
+    try {
+      const statusPayload = await remote.getInstanceStatus(sessionName);
+      const state = (statusPayload as { state?: string } | null)?.state;
+      if (state === 'open') {
+        const confirmed = window.confirm(
+          `A sessão "${sessionName}" ainda consta CONECTADA na Evolution.\n\n` +
+            'Para trocar de número com segurança, é necessário desconectar antes ' +
+            '(isso evita corrupção de sessão no Baileys). Continuar com logout + novo pareamento?'
+        );
+        if (!confirmed) {
+          setQrStatus({ kind: 'idle' });
+          return;
+        }
+        const logout = await remote.logoutInstance(sessionName);
+        if (!logout.ok) {
+          window.alert(
+            `Não consegui desconectar (HTTP ${logout.status ?? '??'}). Tente de novo.`
+          );
+          setQrStatus({ kind: 'idle' });
+          return;
+        }
+        // Limpa estado local para refletir o logout
+        setLinkedPhone(null);
+        const updated: Tenant = {
+          ...activeTenant,
+          whatsappInstance: {
+            ...activeTenant.whatsappInstance,
+            status: 'disconnected',
+            phoneNumber: '',
+          },
+        };
+        onUpdateTenant(updated);
+      }
+    } catch (err) {
+      console.warn('[WhatsAppInstancesModal] pré-check de status falhou', err);
+      // segue o fluxo mesmo assim — algumas versões da Evolution não têm
+      // /connectionState e o `/connect` resolve sozinho.
+    }
 
     // 1) Tenta /instance/connect (instância já existe)
     let base64: string | undefined;
@@ -277,6 +482,9 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
+                {sync.kind === 'syncing' && (
+                  <Loader2 className="w-3 h-3 animate-spin text-slate-400" />
+                )}
                 <span
                   className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
                     instance.status === 'connected'
@@ -287,7 +495,7 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
                   }`}
                 >
                   {instance.status === 'connected'
-                    ? 'ONLINE & SINCRONIZADO'
+                    ? 'CONECTADO'
                     : instance.status === 'reconnecting'
                     ? 'RECONECTANDO'
                     : 'DESCONECTADO'}
@@ -298,11 +506,16 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
             <div className="grid grid-cols-3 gap-2.5 pt-2 border-t border-slate-800 text-xs">
               <div className="bg-slate-900 p-2 rounded-lg border border-slate-800">
                 <div className="flex items-center gap-1 text-[10px] text-slate-400 mb-0.5">
-                  <Smartphone className="w-3 h-3 text-slate-400" />
+                  <Smartphone className="w-3 h-3 text-emerald-400" />
                   <span>Número Vinculado</span>
                 </div>
-                <span className="font-mono font-bold text-white text-xs">
-                  {instance.phoneNumber}
+                <span
+                  className={`font-mono font-bold text-xs ${
+                    linkedPhone ? 'text-white' : 'text-slate-500'
+                  }`}
+                  title={linkedPhone || 'sem número vinculado'}
+                >
+                  {linkedPhone ? formatBrazilPhone(linkedPhone) : 'aguardando pareamento…'}
                 </span>
               </div>
 
@@ -328,16 +541,41 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
             </div>
 
             {/* Quick Actions */}
-            <div className="flex items-center justify-between pt-1">
-              <button
-                type="button"
-                id="btn-reconnect-whatsapp"
-                onClick={handleReconnect}
-                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Testar Conexão / Ping</span>
-              </button>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  id="btn-reconnect-whatsapp"
+                  onClick={handleReconnect}
+                  disabled={sync.kind === 'syncing'}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${sync.kind === 'syncing' ? 'animate-spin' : ''}`}
+                  />
+                  <span>Testar Conexão / Ping</span>
+                </button>
+
+                <button
+                  type="button"
+                  id="btn-disconnect-whatsapp"
+                  onClick={handleLogout}
+                  disabled={logoutPending || instance.status !== 'connected'}
+                  title={
+                    instance.status === 'connected'
+                      ? 'Encerra a sessão atual (logout limpo na Evolution)'
+                      : 'Sessão já está desconectada'
+                  }
+                  className="px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {logoutPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Power className="w-3.5 h-3.5" />
+                  )}
+                  <span>Desconectar WhatsApp</span>
+                </button>
+              </div>
 
               <button
                 type="button"

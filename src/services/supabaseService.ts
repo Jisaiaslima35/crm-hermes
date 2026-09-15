@@ -22,6 +22,13 @@ export interface DbTenant {
   evolution_instance: string;
   evolution_status: 'connected' | 'disconnected' | 'reconnecting';
   created_at: string;
+  // Config do motor IA (migration 4625)
+  system_prompt?: string | null;
+  persona_name?: string | null;
+  tone_of_voice?: string | null;
+  byok_provider?: string | null;
+  byok_api_key?: string | null;
+  byok_model?: string | null;
 }
 
 export interface DbLead {
@@ -76,13 +83,13 @@ function dbTenantToTenant(row: DbTenant): Tenant {
       mode: row.ai_mode,
       hermesEndpoint: '',
       hermesToken: '',
-      byokProvider: 'gemini',
-      byokModel: '',
-      byokKey: '',
-      personaName: 'Persona',
+      byokProvider: (row.byok_provider as any) || 'gemini',
+      byokModel: row.byok_model || '',
+      byokKey: row.byok_api_key || '',
+      personaName: row.persona_name || 'Persona',
       doctorSpecialty: row.specialty,
-      tone: 'acolhedor',
-      systemPrompt: '',
+      tone: (row.tone_of_voice as any) || 'acolhedor',
+      systemPrompt: row.system_prompt || '',
       silenceThresholdHours: 24,
       autoFollowup: true,
     },
@@ -276,7 +283,7 @@ export async function patchLead(input: {
   if (error) throw new Error(`patchLead: ${error.message}`);
 }
 
-// Upsert de subset de colunas de tenant (apenas metadados que existem na tabela).
+// Upsert de subset de colunas de tenant (campos opcionais ignorados se ausentes).
 export async function upsertTenantMeta(input: {
   id: string;
   name: string;
@@ -285,21 +292,35 @@ export async function upsertTenantMeta(input: {
   city: string;
   phone: string;
   ai_mode: 'hermes_vps' | 'byok';
+  // Configuração completa do motor IA (migration msg 4625)
+  system_prompt?: string;
+  persona_name?: string;
+  tone_of_voice?: string;
+  byok_provider?: string;
+  byok_api_key?: string;
+  byok_model?: string;
 }): Promise<void> {
+  const payload: Record<string, unknown> = {
+    id: input.id,
+    name: input.name,
+    specialty: input.specialty,
+    doctor_name: input.doctor_name,
+    city: input.city,
+    phone: input.phone,
+    ai_mode: input.ai_mode,
+  };
+  // Só envia colunas novas se vierem preenchidas — assim o upsert
+  // continua compatível com chamadas que não passam BYOK.
+  if (input.system_prompt !== undefined) payload.system_prompt = input.system_prompt;
+  if (input.persona_name !== undefined) payload.persona_name = input.persona_name;
+  if (input.tone_of_voice !== undefined) payload.tone_of_voice = input.tone_of_voice;
+  if (input.byok_provider !== undefined) payload.byok_provider = input.byok_provider;
+  if (input.byok_api_key !== undefined) payload.byok_api_key = input.byok_api_key;
+  if (input.byok_model !== undefined) payload.byok_model = input.byok_model;
+
   const { error } = await supabase
     .from('tenants')
-    .upsert(
-      {
-        id: input.id,
-        name: input.name,
-        specialty: input.specialty,
-        doctor_name: input.doctor_name,
-        city: input.city,
-        phone: input.phone,
-        ai_mode: input.ai_mode,
-      },
-      { onConflict: 'id' }
-    );
+    .upsert(payload, { onConflict: 'id' });
   if (error) throw new Error(`upsertTenantMeta: ${error.message}`);
 }
 
@@ -432,6 +453,57 @@ export async function getInstanceStatus(instanceName: string) {
     return await res.json();
   } catch {
     return null;
+  }
+}
+
+// Detalhes completos de uma instância específica (Evolution v2).
+// Usa GET /instance/fetchInstances?instanceName=X — devolve um array com 1 item
+// contendo connectionStatus, ownerJid, number, profileName, integration etc.
+// Alguns deployments aceitam GET /instance/fetch/{instance} como fallback.
+export interface EvolutionInstanceDetails {
+  name: string;
+  connectionStatus: 'open' | 'close' | 'connecting' | string;
+  ownerJid?: string | null;
+  number?: string | null;
+  profileName?: string | null;
+  profilePicUrl?: string | null;
+  integration?: string;
+}
+
+export async function getInstanceDetails(
+  instanceName: string
+): Promise<EvolutionInstanceDetails | null> {
+  if (!evolutionBase || !evolutionKey) return null;
+  try {
+    const url = `${evolutionBase}/instance/fetchInstances?instanceName=${encodeURIComponent(instanceName)}`;
+    const res = await fetch(url, { headers: { apikey: evolutionKey } });
+    if (!res.ok) return null;
+    const list = (await res.json()) as EvolutionInstanceDetails[];
+    if (!Array.isArray(list) || list.length === 0) return null;
+    return list[0];
+  } catch {
+    return null;
+  }
+}
+
+// Logout limpo via Evolution v2: DELETE /instance/logout/{instance}.
+export async function logoutInstance(
+  instanceName: string
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  if (!evolutionBase || !evolutionKey) {
+    return { ok: false, error: 'Evolution API não configurada' };
+  }
+  try {
+    const res = await fetch(
+      `${evolutionBase}/instance/logout/${encodeURIComponent(instanceName)}`,
+      {
+        method: 'DELETE',
+        headers: { apikey: evolutionKey },
+      }
+    );
+    return { ok: res.ok, status: res.status };
+  } catch (err) {
+    return { ok: false, error: String(err) };
   }
 }
 

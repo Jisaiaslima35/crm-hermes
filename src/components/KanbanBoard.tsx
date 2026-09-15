@@ -182,9 +182,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
         </div>
       </div>
 
-      {/* Kanban Columns (Horizontal Scrollable) */}
-      <div className="flex-1 overflow-x-auto p-5">
-        <div className="flex gap-4 min-w-[1720px] h-full pb-2">
+      {/* Kanban Columns (Horizontal Scrollable com snap no mobile) */}
+      <div className="flex-1 overflow-x-auto p-3 md:p-5 snap-x snap-mandatory md:snap-none">
+        <div className="flex gap-3 md:gap-4 h-full pb-2 md:min-w-[1720px] min-w-full">
           {PIPELINE_STAGES.map((stage) => {
             const stageLeads = filteredLeads.filter((l) => l.stage === stage.id);
             const isHovered = draggedOverStage === stage.id;
@@ -196,7 +196,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                 onDragOver={(e) => handleDragOver(e, stage.id)}
                 onDragLeave={handleDragLeave}
                 onDrop={(e) => handleDrop(e, stage.id)}
-                className={`w-[275px] shrink-0 flex flex-col rounded-2xl bg-slate-900/50 border transition-all ${
+                className={`w-[88vw] md:w-[275px] shrink-0 snap-center md:snap-align-none flex flex-col rounded-2xl bg-slate-900/50 border transition-all ${
                   isHovered
                     ? 'border-sky-400/80 bg-sky-950/20 shadow-xl ring-2 ring-sky-500/20'
                     : 'border-slate-800/80'

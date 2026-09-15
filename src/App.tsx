@@ -11,23 +11,85 @@ import { WhatsAppInstancesModal } from './components/WhatsAppInstancesModal';
 import { NewLeadModal } from './components/NewLeadModal';
 import { NewTenantModal } from './components/NewTenantModal';
 import { LiveKanban } from './components/LiveKanban';
+import { AuthGuard } from './components/AuthGuard';
+import { IntegrationsPage } from './components/IntegrationsPage';
+import { IntegrationsCallback } from './components/IntegrationsCallback';
 import type { LiveView } from './components/Sidebar';
 import { deskcommService, purgeLegacyMocks } from './services/deskcommService';
 import * as liveStore from './services/liveStore';
 import * as remote from './services/supabaseService';
-import { supabase } from './services/supabaseClient';
+import { useAuth } from './hooks/useAuth';
 import { Tenant, Lead, PipelineStage, UserRole, HandoffState } from './types';
 import { CheckCircle2, AlertTriangle, Bot, UserCheck } from 'lucide-react';
 
+// ============================================================================
+// MOBILE BREAKPOINT — usado pra Sidebar virar drawer e Inbox alternar
+// lista/chat em telas < 768px. Só CSS/layout, zero impacto em regras de
+// negócio, Supabase, webhook ou auth.
+// ============================================================================
+const MOBILE_BREAKPOINT = 768;
+
+function useIsNarrow(): boolean {
+  const [isNarrow, setIsNarrow] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.innerWidth < MOBILE_BREAKPOINT;
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`);
+    const handler = (e: MediaQueryListEvent) => setIsNarrow(e.matches);
+    // estado inicial já correto; só escuta mudanças
+    mql.addEventListener('change', handler);
+    return () => mql.removeEventListener('change', handler);
+  }, []);
+  return isNarrow;
+}
+
 export default function App() {
+  // Rota de callback do OAuth Composio — Composio redireciona pra cá
+  // com `?status=success|failed&toolkit=googlecalendar`. Como a SPA é servida
+  // via `serve -s dist` (fallback pra index.html), basta detectarmos o pathname
+  // e renderizar a página dedicada em vez do shell.
+  if (
+    typeof window !== 'undefined' &&
+    window.location.pathname === '/integracoes/callback'
+  ) {
+    return <IntegrationsCallback />;
+  }
+  return (
+    <AuthGuard>
+      <AppInner />
+    </AuthGuard>
+  );
+}
+
+function AppInner() {
+  // Auth vem do JWT — preenche role/tenantId/permissions automaticamente.
+  // O super_admin (Isaías) pode forçar outro role via UI pra auditoria;
+  // a clínica vê só o que o role dela permite.
+  const {
+    user,
+    role: authRole,
+    tenantId: authTenantId,
+    clinicName,
+    signOut,
+  } = useAuth();
+  const [userRole, setUserRole] = useState<UserRole>(authRole);
+
+  // Se o JWT mudar (login/logout), sincroniza o role local.
+  useEffect(() => {
+    setUserRole(authRole);
+  }, [authRole]);
+
   // Global State
   const [tenants, setTenants] = useState<Tenant[]>(() => deskcommService.getTenants());
   const [activeTenantId, setActiveTenantId] = useState<string>(() => {
+    // Clínica: força tenant do JWT. Super admin: primeiro da lista.
+    if (authTenantId) return authTenantId;
     const list = deskcommService.getTenants();
     return list[0]?.id || 'tenant-cardio-matheus';
   });
 
-  const [userRole, setUserRole] = useState<UserRole>('super_admin');
   const [currentView, setCurrentView] = useState<LiveView>('kanban');
 
   // Leads State for Active Tenant
@@ -41,6 +103,18 @@ export default function App() {
   const [showWhatsappModal, setShowWhatsappModal] = useState(false);
   const [showNewLeadModal, setShowNewLeadModal] = useState(false);
   const [showNewTenantModal, setShowNewTenantModal] = useState(false);
+
+  // ==========================================================================
+  // Responsividade — Sidebar vira drawer em <768px; precisa estado de open
+  // e helper pra fechar quando o usuário navegar.
+  // ==========================================================================
+  const isNarrow = useIsNarrow();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const handleSelectView = useCallback((view: LiveView) => {
+    setCurrentView(view);
+    setSidebarOpen(false); // drawer mobile fecha ao trocar de seção
+  }, []);
 
   // Toast notification
   const [toast, setToast] = useState<{
@@ -68,12 +142,20 @@ export default function App() {
         const ts = await remote.getTenants();
         if (cancelled) return;
         liveStore.setTenants(ts);
-        setTenants(ts);
-        if (ts[0]) setActiveTenantId(ts[0].id);
 
-        // Carrega leads de TODOS os tenants (pra troca ser instantânea)
+        // RBAC: clínica só vê o próprio tenant. Super admin vê todos.
+        const visibleTenants =
+          userRole === 'super_admin'
+            ? ts
+            : ts.filter((t) => t.id === authTenantId);
+
+        setTenants(visibleTenants);
+        if (visibleTenants[0]) setActiveTenantId(visibleTenants[0].id);
+        else if (authTenantId) setActiveTenantId(authTenantId);
+
+        // Carrega leads só dos tenants visíveis
         const allLeadsByTenant = await Promise.all(
-          ts.map(async (t) => {
+          visibleTenants.map(async (t) => {
             const ll = await remote.getLeads(t.id);
             const enriched = await Promise.all(
               ll.map(async (lead) => {
@@ -101,13 +183,19 @@ export default function App() {
         if (cancelled) return;
         const flat = allLeadsByTenant.flat();
         liveStore.setLeads(flat);
-        setLeads(flat.filter((l) => l.tenantId === (ts[0]?.id || activeTenantId)));
+        setLeads(flat.filter((l) => l.tenantId === (visibleTenants[0]?.id || authTenantId || activeTenantId)));
         if (flat[0]) setSelectedLeadId(flat[0].id);
 
         // Purga mocks legados do localStorage. Garante a regra "1 lead real =
         // 1 card no Kanban/Inbox/Radar/Pacientes".
         purgeLegacyMocks();
-        console.log('[crm-hermes] bootstrap Supabase OK:', ts.length, 'tenants,', flat.length, 'leads');
+        console.log(
+          '[crm-hermes] bootstrap Supabase OK:',
+          visibleTenants.length,
+          'tenants visíveis,',
+          flat.length,
+          'leads (role=' + userRole + ', tenant=' + (authTenantId ?? '*') + ')'
+        );
       } catch (err) {
         console.error('[crm-hermes] bootstrap falhou, mantendo mocks legados:', err);
         showToast('Aviso: rodando com dados locais (sem Supabase)', 'warning');
@@ -117,7 +205,7 @@ export default function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [userRole, authTenantId]);
 
   // Reage a mudanças no liveStore e mantém o estado React sincronizado.
   useEffect(() => {
@@ -383,15 +471,29 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Sidebar */}
+      {/* Backdrop do Sidebar (só mobile, quando drawer aberto) */}
+      {isNarrow && sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm md:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Main Sidebar — drawer no mobile, fixa no md+ */}
       <Sidebar
         currentView={currentView}
-        setCurrentView={setCurrentView}
+        setCurrentView={handleSelectView}
         activeTenant={activeTenant}
         userRole={userRole}
         unreadCount={leads.filter((l) => l.stage === 'novo_contato').length}
         silentLeadsCount={silentLeadsCount}
-        onOpenNewLead={() => setShowNewLeadModal(true)}
+        onOpenNewLead={() => {
+          setShowNewLeadModal(true);
+          setSidebarOpen(false);
+        }}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
       />
 
       {/* Main Content Area */}
@@ -407,6 +509,10 @@ export default function App() {
           onOpenWhatsappModal={() => setShowWhatsappModal(true)}
           onOpenNewLead={() => setShowNewLeadModal(true)}
           onResetData={handleResetData}
+          onSignOut={signOut}
+          userEmail={user?.email}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          showHamburger={isNarrow}
         />
 
         {/* View Switcher */}
@@ -519,6 +625,10 @@ export default function App() {
           )}
 
           {currentView === 'live_crm' && <LiveKanban />}
+
+          {currentView === 'integrations' && (
+            <IntegrationsPage activeTenant={activeTenant} />
+          )}
         </main>
       </div>
 

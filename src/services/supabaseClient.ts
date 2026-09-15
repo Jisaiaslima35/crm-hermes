@@ -10,8 +10,12 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
+// `persistSession: true` permite que o AuthGuard mantenha a sessão entre
+// reloads do front (F5 não desloga o médico). `autoRefreshToken: true` é
+// importante pra renovar o access_token antes da expiração sem precisar
+// de novo login.
 export const supabase = createClient(supabaseUrl ?? '', supabaseAnonKey ?? '', {
-  auth: { persistSession: false, autoRefreshToken: false },
+  auth: { persistSession: true, autoRefreshToken: true, storageKey: 'crm-hermes-auth' },
 });
 
 export const supabaseConfig = {

@@ -13,6 +13,7 @@ import {
   PlusCircle,
   Wifi,
   Radio,
+  Plug,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
 
@@ -21,6 +22,7 @@ export type LiveView =
   | 'inbox'
   | 'leads'
   | 'radar'
+  | 'integrations'
   | 'whatsapp'
   | 'ai_settings'
   | 'super_admin'
@@ -34,8 +36,22 @@ interface SidebarProps {
   unreadCount: number;
   silentLeadsCount: number;
   onOpenNewLead: () => void;
+  isOpen: boolean;
+  onClose: () => void;
 }
 
+// ----------------------------------------------------------------------------
+// Sidebar — RBAC: visão enxuta para a clínica (clinic_admin), visão
+// completa para o super_admin. A "Conectividade & IA" técnica e o
+// "Live CRM (Supabase)" (debug) só aparecem pro super_admin.
+//
+// O card da clínica mostra o nome da persona (Dory, etc.) em vez da marca
+// genérica "Hermes VPS" — pra reforçar que aquilo é o assistente da
+// clínica, não da plataforma.
+//
+// MOBILE (md:hidden default): vira drawer lateral que entra/sai por
+// translate-x. No desktop (md:) ocupa a coluna fixa como sempre.
+// ----------------------------------------------------------------------------
 export const Sidebar: React.FC<SidebarProps> = ({
   currentView,
   setCurrentView,
@@ -44,11 +60,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
   unreadCount,
   silentLeadsCount,
   onOpenNewLead,
+  isOpen,
+  onClose,
 }) => {
+  const isSuperAdmin = userRole === 'super_admin';
+  const isClinic = userRole === 'clinic_admin' || userRole === 'attendant_doctor';
+
   return (
     <aside
       id="crm-sidebar"
-      className="w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col justify-between shrink-0 h-screen select-none"
+      className={`w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col justify-between shrink-0 h-screen select-none z-50
+        fixed md:static inset-y-0 left-0 transform transition-transform duration-200 ease-out
+        ${isOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`}
     >
       {/* Brand & Clinic Info */}
       <div className="flex flex-col">
@@ -65,7 +88,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   CLINIC
                 </span>
               </div>
-              <p className="text-[10px] text-slate-400 font-medium">AI Sales OS for WhatsApp</p>
+              <p className="text-[10px] text-slate-400 font-medium">
+                {isSuperAdmin ? 'AI Sales OS for WhatsApp' : 'Atendimento Clínico Inteligente'}
+              </p>
             </div>
           </div>
         </div>
@@ -84,7 +109,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="flex items-center gap-1.5 mt-1.5">
                 <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 <span className="text-[10px] text-emerald-400 font-medium">
-                  {activeTenant.aiEngine.mode === 'hermes_vps' ? 'Hermes VPS Ativo' : 'BYOK IA Ativa'}
+                  {isClinic
+                    ? `Assistente ${activeTenant.aiEngine.personaName} Ativa`
+                    : activeTenant.aiEngine.mode === 'hermes_vps'
+                    ? 'Hermes VPS Ativo'
+                    : 'BYOK IA Ativa'}
                 </span>
               </div>
             </div>
@@ -105,6 +134,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {/* Navigation Menu */}
         <nav className="px-3 space-y-1 mt-1">
+          {/* === VISÃO ENXUTA — visível pra TODOS os perfis === */}
           <div className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
             Operação WhatsApp
           </div>
@@ -180,67 +210,86 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span>Pacientes & Leads</span>
           </button>
 
-          <div className="pt-2 px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-            Conectividade & IA
-          </div>
-
           <button
-            id="nav-whatsapp"
-            onClick={() => setCurrentView('whatsapp')}
+            id="nav-integrations"
+            onClick={() => setCurrentView('integrations')}
             className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-              currentView === 'whatsapp'
-                ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
+              currentView === 'integrations'
+                ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30'
                 : 'text-slate-300 hover:bg-slate-800 hover:text-white'
             }`}
           >
             <div className="flex items-center gap-2.5">
-              <QrCode className="w-4 h-4" />
-              <span>Instâncias WhatsApp</span>
+              <Plug className="w-4 h-4" />
+              <span>Conexões</span>
             </div>
-            <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-semibold">
-              <Wifi className="w-3 h-3" />
-              Evolution
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+              Google · Outlook…
             </span>
           </button>
 
-          <button
-            id="nav-ai-settings"
-            onClick={() => setCurrentView('ai_settings')}
-            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-              currentView === 'ai_settings'
-                ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
-                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-            }`}
-          >
-            <div className="flex items-center gap-2.5">
-              <Cpu className="w-4 h-4" />
-              <span>Motor de IA Híbrido</span>
-            </div>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
-              {activeTenant.aiEngine.mode === 'hermes_vps' ? 'VPS' : 'BYOK'}
-            </span>
-          </button>
-
-          <button
-            id="nav-live-crm"
-            onClick={() => setCurrentView('live_crm')}
-            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-              currentView === 'live_crm'
-                ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40'
-                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-            }`}
-          >
-            <div className="flex items-center gap-2.5">
-              <Radio className="w-4 h-4" />
-              <span>Live CRM (Supabase)</span>
-            </div>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
-              LIVE
-            </span>
-          </button>
-
-          {userRole === 'super_admin' && (
+          {/* === VISÃO TÉCNICA — só pro super_admin === */}
+          {isSuperAdmin && (
             <>
+              <div className="pt-2 px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Conectividade & IA
+              </div>
+
+              <button
+                id="nav-whatsapp"
+                onClick={() => setCurrentView('whatsapp')}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                  currentView === 'whatsapp'
+                    ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
+                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <QrCode className="w-4 h-4" />
+                  <span>Instâncias WhatsApp</span>
+                </div>
+                <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-semibold">
+                  <Wifi className="w-3 h-3" />
+                  Evolution
+                </span>
+              </button>
+
+              <button
+                id="nav-ai-settings"
+                onClick={() => setCurrentView('ai_settings')}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                  currentView === 'ai_settings'
+                    ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
+                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Cpu className="w-4 h-4" />
+                  <span>Motor de IA Híbrido</span>
+                </div>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
+                  {activeTenant.aiEngine.mode === 'hermes_vps' ? 'VPS' : 'BYOK'}
+                </span>
+              </button>
+
+              <button
+                id="nav-live-crm"
+                onClick={() => setCurrentView('live_crm')}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                  currentView === 'live_crm'
+                    ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40'
+                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Radio className="w-4 h-4" />
+                  <span>Live CRM (Supabase)</span>
+                </div>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                  LIVE
+                </span>
+              </button>
+
               <div className="pt-2 px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-purple-400">
                 Gestão SaaS
               </div>
@@ -281,7 +330,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   ? 'Admin da Clínica'
                   : 'Atendente / Médico'}
               </p>
-              <p className="text-[10px] text-slate-500">RBAC Ativo</p>
+              <p className="text-[10px] text-slate-500">
+                {isClinic ? 'Visão da clínica' : 'RBAC Ativo'}
+              </p>
             </div>
           </div>
           <ShieldCheck className="w-4 h-4 text-slate-500" />
