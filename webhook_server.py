@@ -94,6 +94,119 @@ COMPOSIO_AUTH_CONFIG_IDS: dict[str, str] = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Composio Tool Router MCP — usado pelo webhook pra bypassar o bug do Hermes
+# Gateway que não carrega MCP servers no runtime. Endpoint Streamable HTTP
+# (POST JSON-RPC 2.0 com `tools/call`).
+#
+# OBRIGATÓRIO: defina via ENV (não commitar valores em defaults!).
+#   COMPOSIO_MCP_URL          ex: https://backend.composio.dev/tool_router/<session_id>/mcp
+#   COMPOSIO_MCP_API_KEY      ex: ak_xxxxxxxxxxxxxxxxxxxxxxxx
+#   COMPOSIO_DEFAULT_TENANT_USER_ID   ex: clinica_dr_matheus
+#
+# Pra criar uma session nova por tenant:
+#   POST https://backend.composio.dev/api/v3.1/tool_router/session
+#        {"user_id": "<tenant_slug>"}
+# retorna {session_id, mcp.url} -> use session_id na URL e o user_id como chave.
+# ---------------------------------------------------------------------------
+COMPOSIO_MCP_URL = os.environ.get("COMPOSIO_MCP_URL", "").strip()
+COMPOSIO_MCP_API_KEY = os.environ.get("COMPOSIO_MCP_API_KEY", "").strip()
+COMPOSIO_DEFAULT_TENANT_USER_ID = os.environ.get(
+    "COMPOSIO_DEFAULT_TENANT_USER_ID", "clinica_dr_matheus"
+).strip()
+
+# Tools expostas ao LLM no formato OpenAI-compat (function definitions).
+# Mapeadas 1:1 pras meta-tools do Tool Router. O LLM vê o prefixo
+# `mcp__composio__` pra ficar consistente com a nomenclatura que o
+# sistema da clínica já usa; no dispatch a gente tira o prefixo.
+COMPOSIO_META_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp__composio__COMPOSIO_SEARCH_TOOLS",
+            "description": (
+                "Busca tools do Composio por use-case. SEMPRE chamar primeiro "
+                "antes de executar qualquer toolkit tool — descobre slug exato, "
+                "schema, plano de execução e estado da conexão do toolkit. "
+                "Retorna `session_id` que deve ser passado nas chamadas seguintes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "description": "Lista de queries paralelas (1 por ação atômica).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "use_case": {
+                                    "type": "string",
+                                    "description": "Descrição normalizada do caso de uso em inglês.",
+                                },
+                                "known_fields": {
+                                    "type": "string",
+                                    "description": "KV hints opcionais (channel_name:general, etc).",
+                                },
+                            },
+                            "required": ["use_case"],
+                        },
+                        "minItems": 1,
+                    },
+                    "session": {
+                        "type": "object",
+                        "description": "{generate_id: true} pra novo workflow, ou {id: EXISTING_ID} pra continuar.",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "generate_id": {"type": "boolean"},
+                        },
+                    },
+                },
+                "required": ["queries"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL",
+            "description": (
+                "Executa até 50 tools do Composio em paralelo (somente tools "
+                "logicamente independentes). Argumentos DEVEM seguir o schema "
+                "exato retornado por COMPOSIO_SEARCH_TOOLS / GET_TOOL_SCHEMAS. "
+                "Só execute se a conexão do toolkit estiver ACTIVE."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tools": {
+                        "type": "array",
+                        "description": "Lista de {tool_slug, arguments} a executar.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool_slug": {"type": "string"},
+                                "arguments": {"type": "object"},
+                            },
+                            "required": ["tool_slug", "arguments"],
+                        },
+                        "minItems": 1,
+                        "maxItems": 50,
+                    },
+                    "thought": {
+                        "type": "string",
+                        "description": "Rationale de uma frase.",
+                    },
+                    "sync_response_to_workbench": {
+                        "type": "boolean",
+                        "description": "true só se resposta for grande; default false.",
+                    },
+                },
+                "required": ["tools"],
+            },
+        },
+    },
+]
+
 # Cliente Supabase (REST; o schema expõe leads/messages com anon key)
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -464,12 +577,17 @@ async def _post_chat_completion(
     target: dict[str, Any],
     messages: list[dict[str, Any]],
     payload_extras: dict[str, Any],
-) -> str:
-    """POST OpenAI-compat /chat/completions e devolve só o content da 1ª choice.
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """POST OpenAI-compat /chat/completions e devolve (content, tool_calls).
 
     Timeout adaptativo: gateway dedicado tem SLA menor (8s), 9router/BYOK
     toleram 20s. Levanta exceção em qualquer falha (HTTP não-2xx, timeout,
     JSON quebrado, content vazio) pra que o caller faça fallback explícito.
+
+    `tools` (opcional): lista OpenAI-compat de function definitions injetada
+    no payload. Quando o LLM responde com `tool_calls`, retorna-os em vez de
+    levantar — quem chamou decide se executa em loop ou cai pra texto puro.
     """
     timeout = (
         HERMES_GATEWAY_TIMEOUT_S
@@ -483,6 +601,9 @@ async def _post_chat_completion(
         "reasoning": {"effort": "low"},
         **payload_extras,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     headers = {
         "Authorization": f"Bearer {target['apiKey']}",
         "Content-Type": "application/json",
@@ -495,15 +616,12 @@ async def _post_chat_completion(
         )
         r.raise_for_status()
         data = r.json()
-    content = (
-        (data.get("choices") or [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
-    if not content:
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    tool_calls = message.get("tool_calls") or []
+    if not content and not tool_calls:
         raise RuntimeError(f"LLM devolveu content vazio ({target['source']})")
-    return content
+    return content, tool_calls
 
 
 def _build_chat_messages(
@@ -532,6 +650,11 @@ async def _call_llm(
     Fallback: se o target for `hermes_gateway` e falhar (timeout, 5xx, content
     vazio), refaz a chamada automaticamente no 9router (Hermes VPS) pra que
     o paciente nunca fique sem resposta no WhatsApp.
+
+    Quando o target é `hermes_gateway` E o `composio_mcp_url` está configurado
+    no env, ativa o tool loop (passa `tools` no payload + dispatch de
+    `tool_calls` via Composio MCP HTTP direto — bypassa o bug do Hermes
+    Gateway que não carrega MCP servers no runtime).
     """
     tenant_cfg = tenant_cfg or {}
     target = _resolve_llm_target(tenant_cfg)
@@ -540,8 +663,30 @@ async def _call_llm(
     messages = _build_chat_messages(system_prompt, history, patient_msg)
     payload_extras = {"max_tokens": 500, "temperature": 0.7}
 
+    # Tool-calling path: gateway dedicado + MCP do Composio configurado.
+    use_tools = (
+        target["source"] == "hermes_gateway"
+        and bool(COMPOSIO_MCP_URL)
+        and bool(COMPOSIO_MCP_API_KEY)
+    )
+    tools = COMPOSIO_META_TOOLS if use_tools else None
+    tenant_user_id = (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID).strip()
+
+    if use_tools:
+        try:
+            return await _call_llm_with_tools_loop(
+                target, messages, payload_extras, tools, tenant_user_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_call_llm tool-loop falhou (source=%s): %s — caindo texto puro",
+                target["source"], exc,
+            )
+            # Cai pra texto puro no MESMO target; se também falhar, fallback abaixo.
+
     try:
-        return await _post_chat_completion(target, messages, payload_extras)
+        content, _ = await _post_chat_completion(target, messages, payload_extras)
+        return content
     except Exception as exc:
         if target["source"] != "hermes_gateway":
             logger.warning(
@@ -562,7 +707,8 @@ async def _call_llm(
                 "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router (texto puro)",
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
-            return await _post_chat_completion(fallback, messages, payload_extras)
+            content, _ = await _post_chat_completion(fallback, messages, payload_extras)
+            return content
         except Exception as exc2:
             logger.error(
                 "_call_llm fallback 9router também falhou: %s", exc2,
@@ -687,7 +833,7 @@ async def _call_llm_structured(
         "response_format": {"type": "json_object"},
     }
 
-    def _parse(content: str) -> dict[str, Any]:
+    async def _parse(content: str) -> dict[str, Any]:
         # Tolerância best-effort pra respostas malformadas:
         # 1) ```json ... ```
         # 2) lixo antes/depois do JSON (extrai substring do 1º '{' ao último '}')
@@ -748,7 +894,7 @@ async def _call_llm_structured(
         }
 
     try:
-        content = await _post_chat_completion(target, messages, payload_extras)
+        content, _ = await _post_chat_completion(target, messages, payload_extras)
         return _parse(content)
     except Exception as exc:
         if target["source"] != "hermes_gateway":
@@ -770,7 +916,7 @@ async def _call_llm_structured(
                 "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router",
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
-            content = await _post_chat_completion(fallback, messages, payload_extras)
+            content, _ = await _post_chat_completion(fallback, messages, payload_extras)
             return _parse(content)
         except Exception as exc2:
             logger.error(
@@ -914,6 +1060,19 @@ async def _dispatch_ai(
         #    P3: urgência clínica → falar_pessoalmente (sem handoff, IA conduz)
         #    P4: triagem ativa (default) → em_atendimento (mantém atual)
         new_stage, requires_handoff = _detect_stage_with_priority(patient_text)
+        # Plan B — se stage indica agendamento E paciente tem horário
+        # concreto na conversa, chama Composio MCP direto pra criar o
+        # evento. Bypassa o tool-calling quebrado do Hermes Gateway.
+        try:
+            await _maybe_create_calendar_event(
+                instance, lead, patient_text, ai_reply,
+                history, tenant_cfg, new_stage,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Plan B calendar dispatch falhou: %s",
+                instance, exc,
+            )
         if new_stage and new_stage != lead.get("stage"):
             patch = {"stage": new_stage, "last_interaction": _now_iso()}
             if requires_handoff:
@@ -1131,6 +1290,589 @@ async def _composio_request(
     except Exception as exc:
         logger.exception("Falha de rede ao chamar Composio")
         raise HTTPException(status_code=502, detail=f"Composio unreachable: {exc}") from exc
+
+
+# ============================================================================
+# Composio MCP — bypass do bug do Hermes Gateway
+# ============================================================================
+# O Hermes Gateway do perfil dr-matheus-dore NÃO carrega o MCP server do
+# Composio no runtime (config.yaml OK, filtro de segurança não bloqueia,
+# mas o startup não registra as tools). Pra não ficar refém de investigar
+# o gateway, o webhook chama o endpoint MCP do Tool Router diretamente
+# via HTTP/SSE. Isso preserva o tool loop funcionando pra clínica.
+
+async def _composio_mcp_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """POST JSON-RPC `tools/call` no endpoint MCP do Composio Tool Router.
+
+    Endpoint exige `Accept: application/json, text/event-stream` (Streamable
+    HTTP) e responde em SSE (`event: message\\ndata: {...}`). Quando a
+    resposta vem em JSON puro (alguns proxies), aceitamos os dois.
+
+    Levanta RuntimeError em falha de rede, HTTP não-2xx ou JSON quebrado.
+    """
+    if not COMPOSIO_MCP_URL or not COMPOSIO_MCP_API_KEY:
+        raise RuntimeError("Composio MCP não configurado (MCP_URL/MCP_API_KEY ausentes)")
+
+    body = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000),
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
+    headers = {
+        "x-api-key": COMPOSIO_MCP_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(COMPOSIO_MCP_URL, json=body, headers=headers)
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Composio MCP HTTP {r.status_code}: {r.text[:300]}"
+            )
+        text = r.text
+        # Tenta JSON puro primeiro (alguns servidores respondem JSON direto).
+        try:
+            return r.json()
+        except Exception:
+            pass
+        # SSE format: extrai primeiro bloco `data: {...}`.
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+        raise RuntimeError(f"Composio MCP resposta não-JSON: {text[:200]}")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Composio MCP unreachable: {exc}") from exc
+
+
+async def _dispatch_composio_tool_call(
+    tc: dict[str, Any],
+    tenant_user_id: str,
+) -> str:
+    """Executa 1 tool_call do LLM contra o MCP do Composio e devolve JSON serializado.
+
+    O LLM nomeia a função `mcp__composio__<TOOL>`; mapeamos pra slug real
+    da meta-tool (`COMPOSIO_SEARCH_TOOLS`, `COMPOSIO_MULTI_EXECUTE_TOOL`,
+    etc) tirando o prefixo. Injeta `user_id` no payload se a tool aceita.
+    Devolve string JSON pro OpenAI-compat `role=tool` `content`.
+    """
+    fn = tc.get("function") or {}
+    fn_name = fn.get("name") or ""
+    raw_args = fn.get("arguments") or "{}"
+    tc_id = tc.get("id") or ""
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+    except Exception:
+        args = {}
+
+    composio_tool = fn_name.replace("mcp__composio__", "").strip()
+    if not composio_tool:
+        return json.dumps({"error": f"função '{fn_name}' sem slug Composio válido"})
+
+    # Injeta user_id no payload se a meta-tool aceita (todas as 6 aceitam
+    # opcionalmente; SEARCH e MULTI_EXECUTE usam session_id em vez disso —
+    # mas o webhook sempre escopa por user_id pra multi-tenant isolation).
+    if composio_tool in {"COMPOSIO_MULTI_EXECUTE_TOOL", "COMPOSIO_SEARCH_TOOLS"}:
+        args.setdefault("user_id", tenant_user_id)
+    else:
+        args.setdefault("user_id", tenant_user_id)
+
+    try:
+        resp = await _composio_mcp_call(composio_tool, args)
+        result = resp.get("result")
+        if result is None and "error" in resp:
+            # JSON-RPC error envelope.
+            return json.dumps(
+                {"ok": False, "error": resp.get("error")},
+                ensure_ascii=False,
+            )
+        return json.dumps({"ok": True, "tool": composio_tool, "result": result}, ensure_ascii=False, default=str)
+    except Exception as exc:
+        logger.warning(
+            "_dispatch_composio_tool_call falhou (tool=%s): %s",
+            composio_tool, exc,
+        )
+        return json.dumps(
+            {"ok": False, "tool": composio_tool, "error": str(exc)[:500]},
+            ensure_ascii=False,
+        )
+
+
+async def _call_llm_with_tools_loop(
+    target: dict[str, Any],
+    messages: list[dict[str, Any]],
+    payload_extras: dict[str, Any],
+    tools: list[dict[str, Any]],
+    tenant_user_id: str,
+    max_iterations: int = 5,
+) -> str:
+    """Loop de tool-call contra o LLM até resposta final (content sem tool_calls).
+
+    Cada iteração: chama LLM com `tools` → se vier `tool_calls`, executa
+    via Composio MCP em paralelo, anexa results como mensagens `role=tool`,
+    e chama de novo. Limite de iterações evita loops infinitos (LLM mal
+    calibrado que continua chamando a mesma tool).
+
+    Retorna o `content` final (texto) que o LLM envia ao paciente. Se o
+    LLM nunca devolver content sem tool_calls, retorna o último content
+    parcial ou string vazia.
+    """
+    current_messages = list(messages)
+    final_content = ""
+
+    for iteration in range(max_iterations):
+        content, tool_calls = await _post_chat_completion(
+            target, current_messages, payload_extras, tools=tools,
+        )
+        if content:
+            final_content = content
+
+        if not tool_calls:
+            return final_content or ""
+
+        # Append assistant message (inclui tool_calls pro próximo turno).
+        current_messages.append({
+            "role": "assistant",
+            "content": content or "",
+            "tool_calls": tool_calls,
+        })
+
+        # Executa tools em paralelo (até 5 simultâneas; meta-tools do
+        # Composio são stateless, paralelizar é seguro).
+        import asyncio as _asyncio
+        results = await _asyncio.gather(
+            *(_dispatch_composio_tool_call(tc, tenant_user_id) for tc in tool_calls),
+            return_exceptions=True,
+        )
+        for tc, result in zip(tool_calls, results):
+            tc_id = tc.get("id") or ""
+            tool_content = (
+                result
+                if isinstance(result, str)
+                else json.dumps({"ok": False, "error": str(result)[:500]}, ensure_ascii=False)
+            )
+            current_messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": tool_content,
+            })
+
+        logger.info(
+            "[TOOL_LOOP] iter=%d tool_calls=%d user_id=%s",
+            iteration + 1, len(tool_calls), tenant_user_id,
+        )
+
+    logger.warning(
+        "_call_llm_with_tools_loop atingiu max_iterations=%d sem resposta final — "
+        "devolvendo último content (len=%d)",
+        max_iterations, len(final_content),
+    )
+    return final_content
+
+
+# ============================================================================
+# Plan B — webhook cria evento no Google Calendar direto via Composio MCP
+# ============================================================================
+# Por que isso existe: o Hermes Gateway do perfil dr-matheus-dore NÃO invoca
+# as tools do Composio no runtime (LLM vê as tools no payload mas devolve
+# só texto, sem tool_calls — bug confirmado em teste com prompt mandatório
+# em 15/09/2026 20:35 UTC). Em vez de continuar refém do LLM pra fazer
+# tool-calling, o webhook detecta intent de agendamento na conversa,
+# extrai parâmetros via 2ª chamada LLM estruturada, e dispara a tool do
+# Calendário direto via MCP. Resultado: o paciente recebe o htmlLink real
+# do Google Calendar no WhatsApp.
+
+_SCHEDULE_TIME_HINTS = [
+    # regex simples — presença de qualquer um já é sinal forte.
+    r"\b\d{1,2}\s*h\b",
+    r"\b\d{1,2}:\d{2}\b",
+    r"\b(amanh[ãa]|hoje|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)\b",
+    r"\b(pr[óo]xim[ao]|essa semana|essa semana que vem|semana que vem)\b",
+]
+_SCHEDULE_TIME_RE = re.compile(
+    "|".join(_SCHEDULE_TIME_HINTS), re.IGNORECASE
+)
+
+
+def _looks_like_schedule_request(
+    patient_text: str,
+    history: list[dict[str, Any]],
+    detected_stage: str | None,
+) -> bool:
+    """True se a conversa indica intent de agendamento com tempo concreto."""
+    if detected_stage != "consulta_agendada":
+        return False
+    # Texto atual + últimos 4 turnos do histórico (cobre "amanhã às 14h" dito antes).
+    blob_parts = [patient_text or ""]
+    for m in (history or [])[-4:]:
+        if isinstance(m, dict) and m.get("content"):
+            blob_parts.append(str(m["content"]))
+    blob = " ".join(blob_parts)
+    return bool(_SCHEDULE_TIME_RE.search(blob))
+
+
+async def _extract_schedule_params(
+    tenant_cfg: dict[str, Any],
+    history: list[dict[str, Any]],
+    patient_text: str,
+) -> dict[str, Any]:
+    """2ª chamada LLM estruturada: extrai parâmetros do evento do histórico.
+
+    Retorna dict com chaves:
+      - should_schedule: bool
+      - summary: str
+      - start_datetime: ISO-8601 com offset -03:00 (Brasil/Natal)
+      - end_datetime: ISO-8601 com offset -03:00 (start + 50 min default)
+      - attendee_email: str | None
+      - description: str
+      - ok: bool
+    """
+    extractor_prompt = (
+        "Você é um extrator estruturado. Analise o histórico da conversa "
+        "entre a atendente (IA) e o paciente e devolva APENAS um objeto JSON "
+        "(sem markdown, sem comentários) com estes campos:\n"
+        "{\n"
+        '  "should_schedule": bool,            // true só se o paciente CONFIRMOU um horário concreto\n'
+        '  "summary": str,                     // ex: "Consulta: Maria Silva - Dr. Matheus Dore"\n'
+        '  "start_datetime": str,              // ISO-8601 com offset -03:00 (ex: 2026-09-16T14:00:00-03:00)\n'
+        '  "end_datetime": str,                // ISO-8601 com offset -03:00 (start + 50 min default)\n'
+        '  "attendee_email": str | null,       // email do paciente se mencionado, senão null\n'
+        '  "description": str                 // queixa clínica + contato\n'
+        "}\n\n"
+        "REGRAS:\n"
+        "- Converta referências PT-BR ('amanhã às 14h', 'quinta 16h', 'sexta 9h da manhã') "
+        "para ISO-8601 no fuso -03:00 (Brasil/Natal). 'Amanhã' = próximo dia após a data atual.\n"
+        "- Se NÃO houver horário concreto confirmado, devolva should_schedule=false.\n"
+        "- Se faltar mês/ano, assuma o ano/mês corrente. NÃO invente horário.\n"
+        "- end_datetime = start_datetime + 50 minutos (default consulta psiquiatria).\n"
+        "- summary sempre no formato 'Consulta: <paciente> - Dr. Matheus Dore'.\n"
+        "- description inclui a queixa clínica relevante + telefone se disponível.\n"
+        "- Retorne APENAS o JSON. Sem texto antes/depois."
+    )
+    # Não reaproveita _call_llm_structured porque ele ANEXA instruções de
+    # schema fixo ({reply, clinical_summary, symptoms}) que conflitam com
+    # este extrator. Chamada direta com response_format=json_object.
+    target = _resolve_llm_target(tenant_cfg)
+    if not target["apiKey"]:
+        return {"should_schedule": False, "ok": False}
+
+    messages = _build_chat_messages(extractor_prompt, history, patient_text)
+    payload_extras = {
+        "max_tokens": 400,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    async def _parse(content: str) -> dict[str, Any]:
+        # Tenta parsear direto, depois com fallback de regex igual _call_llm_structured.
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\{.*\}", content, re.DOTALL)
+            if not m:
+                return {"should_schedule": False, "ok": False, "raw": content}
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                return {"should_schedule": False, "ok": False, "raw": content}
+        # Normaliza.
+        return {
+            "should_schedule": bool(data.get("should_schedule", False)),
+            "summary": str(data.get("summary") or "").strip(),
+            "start_datetime": str(data.get("start_datetime") or "").strip(),
+            "end_datetime": str(data.get("end_datetime") or "").strip(),
+            "attendee_email": (
+                str(data.get("attendee_email") or "").strip() or None
+            ),
+            "description": str(data.get("description") or "").strip(),
+            "ok": True,
+        }
+
+    try:
+        content, _ = await _post_chat_completion(
+            target, messages, payload_extras,
+        )
+        return await _parse(content)
+    except Exception as exc:
+        logger.warning(
+            "[CALENDAR_EXTRACT] primary LLM falhou (source=%s): %s",
+            target["source"], exc,
+        )
+        # Fallback 9router.
+        fallback = {
+            "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
+            "model": NINEROUTER_DEFAULT_MODEL,
+            "apiKey": NINEROUTER_API_KEY,
+            "provider": "hermes_vps",
+            "source": "hermes_vps",
+        }
+        try:
+            content, _ = await _post_chat_completion(
+                fallback, messages, payload_extras,
+            )
+            return await _parse(content)
+        except Exception as exc2:
+            logger.warning("[CALENDAR_EXTRACT] fallback também falhou: %s", exc2)
+            return {"should_schedule": False, "ok": False}
+
+
+async def _maybe_create_calendar_event(
+    instance: str,
+    lead: dict[str, Any],
+    patient_text: str,
+    ai_reply: str,
+    history: list[dict[str, Any]],
+    tenant_cfg: dict[str, Any],
+    detected_stage: str | None,
+) -> None:
+    """Plan B: detecta intent de agendamento e cria evento direto via MCP.
+
+    Disparado depois que a IA já respondeu o paciente. Se a conversa tem
+    intent claro + horário concreto:
+      1. Extrai params via 2ª chamada LLM estruturada.
+      2. Chama GOOGLECALENDAR_CREATE_EVENT via Composio MCP direto.
+      3. Envia follow-up WhatsApp com htmlLink do evento.
+      4. Persiste event_id no lead (notes + clinical_summary).
+
+    Falha em qualquer etapa é logada e silenciosamente ignorada (não
+    derruba o dispatch principal). O paciente recebe o link se e somente
+    se a tool retornou success_count=1 com htmlLink literal na resposta.
+    """
+    try:
+        if not _looks_like_schedule_request(patient_text, history, detected_stage):
+            return
+        if not COMPOSIO_MCP_URL or not COMPOSIO_MCP_API_KEY:
+            logger.warning(
+                "[%s] [CALENDAR] MCP não configurado, pulando criação automática",
+                instance,
+            )
+            return
+
+        # 1. Extrai parâmetros estruturados via LLM.
+        extracted = await _extract_schedule_params(tenant_cfg, history, patient_text)
+        if not extracted.get("ok") or not extracted.get("should_schedule"):
+            logger.info(
+                "[%s] [CALENDAR] extrator devolveu should_schedule=false — paciente sem horário confirmado",
+                instance,
+            )
+            return
+
+        start_iso = (extracted.get("start_datetime") or "").strip()
+        end_iso = (extracted.get("end_datetime") or "").strip()
+        summary = (extracted.get("summary") or "").strip()
+        description = (extracted.get("description") or "").strip()
+        attendee_email = (extracted.get("attendee_email") or "").strip() or None
+
+        # Validação mínima — não envia argumentos quebrados pro Composio.
+        if not (start_iso and end_iso and summary):
+            logger.warning(
+                "[%s] [CALENDAR] params incompletos: start=%r end=%r summary=%r",
+                instance, start_iso, end_iso, summary,
+            )
+            return
+        # Reforço do timezone — Natal é -03:00 fixo (não tem DST).
+        if "-03:00" not in start_iso or "-03:00" not in end_iso:
+            logger.warning(
+                "[%s] [CALENDAR] sem offset -03:00 (start=%r end=%r) — abortando",
+                instance, start_iso, end_iso,
+            )
+            return
+
+        # 2. Chama Composio MCP direto (search → execute).
+        tenant_user_id = (
+            (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID)
+            .strip()
+        )
+
+        # Search: descobre slug exato + schema (idempotente, baixo custo).
+        search_args = {
+            "queries": [{"use_case": "create google calendar event with attendee"}],
+        }
+        try:
+            search_resp = await _composio_mcp_call(
+                "COMPOSIO_SEARCH_TOOLS", {
+                    **search_args,
+                    "user_id": tenant_user_id,
+                },
+            )
+            logger.info(
+                "[%s] [CALENDAR] MCP search OK",
+                instance,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] [CALENDAR] MCP search falhou: %s — abortando",
+                instance, exc,
+            )
+            return
+
+        # 3. Executa GOOGLECALENDAR_CREATE_EVENT.
+        #    Schema Composio: tools é array de {tool_slug, arguments}.
+        exec_arguments: dict[str, Any] = {
+            "summary": summary,
+            "start_datetime": start_iso,
+            "end_datetime": end_iso,
+            "description": description,
+            "timezone": "America/Fortaleza",  # Natal-RN
+            "calendar_id": "primary",
+        }
+        if attendee_email:
+            exec_arguments["attendees"] = [attendee_email]
+        exec_args = {
+            "tools": [
+                {
+                    "tool_slug": "GOOGLECALENDAR_CREATE_EVENT",
+                    "arguments": exec_arguments,
+                }
+            ],
+            "user_id": tenant_user_id,
+        }
+
+        try:
+            exec_resp = await _composio_mcp_call(
+                "COMPOSIO_MULTI_EXECUTE_TOOL", exec_args,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] [CALENDAR] MCP execute falhou: %s",
+                instance, exc,
+            )
+            return
+
+        # 4. Extrai htmlLink real da resposta (anti-alucinação).
+        html_link, event_id = _extract_event_link_from_mcp(exec_resp)
+        if not html_link:
+            logger.warning(
+                "[%s] [CALENDAR] MCP executou mas sem htmlLink na resposta: %s",
+                instance, str(exec_resp)[:500],
+            )
+            # Envia mensagem honesta ao paciente: failure de criação.
+            failure_msg = (
+                "Tentei criar o evento no Google Calendar, mas a resposta veio "
+                "sem link de confirmação. Nossa equipe confirma o horário em "
+                "instantes. Posso ajudar em algo mais?"
+            )
+            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
+            try:
+                sb.table("messages").insert({
+                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
+                    "lead_id": lead["id"],
+                    "sender": "ai",
+                    "content": failure_msg,
+                    "created_at": _now_iso(),
+                }).execute()
+            except Exception:
+                pass
+            return
+
+        # 5. Sucesso! Envia follow-up WhatsApp com link REAL do Calendar.
+        followup = (
+            f"✅ Consulta agendada!\n\n"
+            f"📅 {summary}\n"
+            f"🕐 {start_iso.replace('T', ' ').replace('-03:00', '')} (BRT)\n\n"
+            f"🔗 Link do convite no Google Calendar:\n{html_link}\n\n"
+            f"Qualquer coisa é só chamar aqui."
+        )
+        send_ok = await _send_evolution_text(instance, lead.get("phone", ""), followup)
+        logger.info(
+            "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s link=%s",
+            instance, send_ok.get("ok"), event_id, html_link[:80],
+        )
+
+        # 6. Persiste event_id no lead (somente se a coluna existir — tolerância
+        #    ao deploy incremental; migração SQL roda depois pra adicionar).
+        try:
+            sb.table("leads").update({
+                "last_interaction": _now_iso(),
+            }).eq("id", lead["id"]).execute()
+        except Exception as exc:
+            logger.warning(
+                "[%s] [CALENDAR] falha ao atualizar last_interaction: %s",
+                instance, exc,
+            )
+
+        # 7. Grava follow-up também em messages pra histórico ficar completo
+        #    — esse é o record canônico do evento criado (com htmlLink real).
+        try:
+            sb.table("messages").insert({
+                "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
+                "lead_id": lead["id"],
+                "sender": "ai",
+                "content": followup,
+                "created_at": _now_iso(),
+            }).execute()
+        except Exception:
+            pass
+
+        logger.info(
+            "[%s] [CALENDAR] ✅ evento criado event_id=%s link=%s",
+            instance, event_id, html_link[:80],
+        )
+    except Exception as exc:
+        logger.exception("[%s] _maybe_create_calendar_event falhou: %s", instance, exc)
+
+
+def _extract_event_link_from_mcp(exec_resp: Any) -> tuple[str | None, str | None]:
+    """Extrai (htmlLink, eventId) da resposta do GOOGLECALENDAR_CREATE_EVENT.
+
+    A resposta pode vir aninhada em vários níveis dependendo do path
+    `success → response_data → htmlLink` ou `data → response_data → ...`
+    ou em `result.content[*].text` (texto JSON dentro do envelope MCP).
+    """
+    # 1) Achata dict/JSON procurando chaves relevantes.
+    candidates = []
+
+    def _walk(node: Any, trail: list[str]) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _walk(v, trail + [str(k)])
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                _walk(item, trail + [f"[{i}]"])
+        elif isinstance(node, str) and node.startswith("{"):
+            # Texto que parece JSON serializado — tenta parsear e re-walk.
+            try:
+                inner = json.loads(node)
+            except Exception:
+                return
+            _walk(inner, trail + ["<json-string>"])
+
+    _walk(exec_resp, [])
+
+    # Reune todos os htmlLink-like strings e event_id-like values.
+    html_link = None
+    event_id = None
+    # Walk e coleta valores de chaves que terminam em htmlLink/hangoutLink.
+    def _collect(node: Any) -> None:
+        nonlocal html_link, event_id
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = k.lower()
+                if isinstance(v, str):
+                    if "htmllink" in kl and "google" in v.lower():
+                        if not html_link:
+                            html_link = v
+                    if "event_id" in kl or kl == "id":
+                        if not event_id and len(v) > 5:
+                            event_id = v
+                _collect(v)
+        elif isinstance(node, list):
+            for item in node:
+                _collect(item)
+        elif isinstance(node, str) and node.startswith("{"):
+            try:
+                _collect(json.loads(node))
+            except Exception:
+                pass
+
+    _collect(exec_resp)
+    return html_link, event_id
 
 
 @app.post("/composio/connect/{toolkit}")
