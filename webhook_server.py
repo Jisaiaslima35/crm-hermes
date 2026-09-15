@@ -410,7 +410,29 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         f"e tente fechar o agendamento.\n"
         f"4. Seja concisa (máximo 3-4 frases por mensagem). Não invente preços nem horários.\n"
         f"5. Se o paciente pedir para falar com humano, ofereça a opção.\n"
-        f"6. Sempre termine perguntando se pode ajudar em algo mais."
+        "6. Sempre termine perguntando se pode ajudar em algo mais.\n\n"
+        "🛑 REGRA MANDATÓRIA DE TOOL CALL (anti-alucinação — Composio Tool Router v3.1):\n"
+        "É PROIBIDO afirmar 'agendado', 'você receberá o link', 'marquei pra você' ou "
+        "qualquer variação que sinalize sucesso de agendamento SEM confirmação inequívoca "
+        "do tool router. A ferramenta `GOOGLECALENDAR_CREATE_EVENT` não aparece pré-registrada "
+        "no model-facing list do gateway — TODA chamada obrigatoriamente passa pelas "
+        "meta-tools do Composio Tool Router MCP, nesta ordem:\n"
+        "  (a) `mcp__composio__COMPOSIO_SEARCH_TOOLS` com `queries=[{\"use_case\": \"create a new "
+        "event on google calendar\"}]` para descobrir/confirmar o slug exato e os parâmetros esperados.\n"
+        "  (b) `mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL` com `tools=[{\"tool_slug\": "
+        "\"GOOGLECALENDAR_CREATE_EVENT\", \"arguments\": {...}}]`. Argumentos obrigatórios: "
+        "`summary` = 'Consulta: {{nome}} - Dr. Matheus Dore', `start_datetime` e `end_datetime` "
+        "ISO-8601 com offset -03:00 (end = start + 50 min), `description` com paciente/contato/triagem.\n"
+        "A chamada só é considerada SUCESSO se a resposta trouxer `success_count:1, "
+        "error_count:0` E evento criado identificado por `id` ou `htmlLink` real (campos `id`/"
+        "`htmlLink`/`response_data.htmlLink` da Tool Router).\n"
+        "Só depois desse sucesso inequívoco responda ao paciente incluindo `htmlLink` APENAS "
+        "se ele veio literalmente na resposta (caso contrário diga 'a equipe envia o link em seguida').\n"
+        "Se a tool falhar (timeout, NoActive, error_count≥1, schema inválido, sem id/htmlLink): "
+        "diga com honestidade que houve falha técnica e que a equipe confirmará — nunca "
+        "invente link nem horário como se tivesse criado o evento.\n\n"
+        "Isolamento multi-tenant: toda chamada é escopada por `user_id=clinica_dr_matheus` "
+        "(Composio Tool Router session `trs_ffSi5c5PETDX`). NÃO mencione user_id ao paciente."
     )
 
 
@@ -513,8 +535,8 @@ async def _call_llm(
         }
         try:
             logger.warning(
-                "_call_llm gateway caiu (%s), fallback 9router: %s",
-                target["baseUrl"], exc,
+                "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router (texto puro)",
+                target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
             return await _post_chat_completion(fallback, messages, payload_extras)
         except Exception as exc2:
@@ -642,14 +664,52 @@ async def _call_llm_structured(
     }
 
     def _parse(content: str) -> dict[str, Any]:
-        # Alguns providers devolvem o JSON dentro de ```json ... ``` mesmo
-        # com response_format; tolerância best-effort.
-        if content.startswith("```"):
-            content2 = re.sub(r"^```(?:json)?\s*", "", content)
+        # Tolerância best-effort pra respostas malformadas:
+        # 1) ```json ... ```
+        # 2) lixo antes/depois do JSON (extrai substring do 1º '{' ao último '}')
+        # 3) JSON puro
+        content2 = content
+        if content2.startswith("```"):
+            content2 = re.sub(r"^```(?:json)?\s*", "", content2)
             content2 = re.sub(r"\s*```\s*$", "", content2)
-        else:
-            content2 = content
-        parsed = json.loads(content2)
+        first = content2.find("{")
+        last = content2.rfind("}")
+        if first > 0 and last > first:
+            content2 = content2[first:last + 1]
+        try:
+            parsed = json.loads(content2)
+        except json.JSONDecodeError:
+            # Fallback extremo: extrai campos por regex. Cobre o caso em que o
+            # LLM pula o '{' inicial e/ou a primeira aspa (visto em produção
+            # com MiniMax-M3 + response_format=json_object).
+            parsed = {}
+            for field in ("reply", "clinical_summary"):
+                m = re.search(
+                    rf'"?{field}"?\s*:\s*"((?:[^"\\]|\\.)*)"',
+                    content2,
+                    re.DOTALL,
+                )
+                if m:
+                    # Decoda \n, \", \\ mas preserva UTF-8 (não usa unicode_escape
+                    # global pra não corromper caracteres acentuados).
+                    raw = m.group(1)
+                    try:
+                        raw = raw.encode("utf-8").decode("unicode_escape").encode("latin-1").decode("utf-8")
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
+                    parsed[field] = raw
+            sym = re.search(r'"?symptoms"?\s*:\s*\[([^\]]*)\]', content2, re.DOTALL)
+            if sym:
+                items = re.findall(r'"([^"]*)"', sym.group(1))
+                parsed["symptoms"] = [s.strip() for s in items if s.strip()]
+            else:
+                parsed["symptoms"] = []
+            if not parsed.get("reply"):
+                # Último recurso: trata o conteúdo inteiro como reply (LLM
+                # respondeu texto puro em vez de JSON).
+                parsed["reply"] = content.strip()
+                parsed.setdefault("clinical_summary", "")
+                parsed.setdefault("symptoms", [])
         reply = str(parsed.get("reply") or "").strip()
         clinical_summary = str(parsed.get("clinical_summary") or "").strip()
         raw_symptoms = parsed.get("symptoms") or []
@@ -683,8 +743,8 @@ async def _call_llm_structured(
         }
         try:
             logger.warning(
-                "_call_llm_structured gateway caiu (%s), fallback 9router: %s",
-                target["baseUrl"], exc,
+                "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router",
+                target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
             content = await _post_chat_completion(fallback, messages, payload_extras)
             return _parse(content)
