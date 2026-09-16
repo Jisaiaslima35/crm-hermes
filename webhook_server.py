@@ -218,6 +218,41 @@ _TENANT_BY_INSTANCE: dict[str, str] = {}
 _TENANT_CFG_CACHE: dict[str, tuple[dict[str, Any], float]] = {}
 _TENANT_CFG_CACHE_TTL_SECONDS = 60.0
 
+# Lock por lead_id pra serializar _dispatch_ai do mesmo lead.
+# Protege contra evento duplicado no Google Calendar (Plan B dispara 2x
+# se paciente mandar mensagens seguidas antes da 1ª terminar). Locks
+# independentes entre leads diferentes — só serializa o mesmo lead.
+_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+_DISPATCH_LOCKS_REGISTRY_LOCK = asyncio.Lock()
+_DISPATCH_LOCK_TIMEOUT_S = 30.0
+
+
+async def _acquire_dispatch_lock(lead_id: str) -> asyncio.Lock | None:
+    """Tenta adquirir lock do lead_id; retorna None em timeout."""
+    async with _DISPATCH_LOCKS_REGISTRY_LOCK:
+        lock = _DISPATCH_LOCKS.get(lead_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _DISPATCH_LOCKS[lead_id] = lock
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_DISPATCH_LOCK_TIMEOUT_S)
+        return lock
+    except asyncio.TimeoutError:
+        return None
+
+
+async def _release_dispatch_lock(lead_id: str, lock: asyncio.Lock) -> None:
+    """Libera o lock e limpa do registry se ninguém mais está segurando."""
+    if lock.locked():
+        lock.release()
+    async with _DISPATCH_LOCKS_REGISTRY_LOCK:
+        existing = _DISPATCH_LOCKS.get(lead_id)
+        # Se ninguém readquiriu o lock depois, remove do registry pra
+        # não vazar dict com chaves de leads antigos. Race benigna: se
+        # outro caller já re-criou, ele tem seu próprio lock agora.
+        if existing is lock and not lock.locked():
+            del _DISPATCH_LOCKS[lead_id]
+
 # Heurística de mudança de stage (palavras-chave em PT-BR, lowercase)
 _STAGE_KEYWORDS: dict[str, list[str]] = {
     "consulta_agendada": [
@@ -953,8 +988,34 @@ async def _dispatch_ai(
 
     Quando o provider suportar JSON estruturado, extrai também a queixa principal
     consolidada e os sintomas detectados, persistindo em leads.clinical_summary
-    e leads.symptoms. Falha na extração não derruba o envio da resposta.
+    e leads.symptoms. Falha na extração não derrubu o envio da resposta.
     """
+    # Concurrency lock por lead_id — protege contra evento duplicado no
+    # Google Calendar quando paciente manda 2+ mensagens seguidas antes da
+    # 1ª terminar (Plan B dispararia 2x). Se lock já está preso por outro
+    # dispatch do mesmo lead, manda "ainda processando" e retorna — sem
+    # rodar Plan B, sem mexer em stage.
+    lock = await _acquire_dispatch_lock(lead["id"])
+    if lock is None:
+        logger.info(
+            "[%s] _dispatch_ai lock timeout lead=%s — enviando 'ainda processando'",
+            instance, lead["id"],
+        )
+        try:
+            wait_msg = "Tô finalizando sua resposta aqui, já te mando em segundos! 🙂"
+            await _send_evolution_text(instance, lead["phone"], wait_msg)
+            sb.table("messages").insert({
+                "tenant_id": tenant_id,
+                "lead_id": lead["id"],
+                "sender": "ai",
+                "content": wait_msg,
+                "created_at": _now_iso(),
+            }).execute()
+        except Exception as exc:
+            logger.warning(
+                "[%s] falha ao enviar 'ainda processando': %s", instance, exc,
+            )
+        return
     try:
         tenant_cfg = _get_tenant_config(tenant_id)
         # ─────────────────────────────────────────────────────────────────
@@ -1108,6 +1169,10 @@ async def _dispatch_ai(
                 )
     except Exception as exc:
         logger.exception("[%s] _dispatch_ai falhou: %s", instance, exc)
+    finally:
+        # Libera o lock pra próximo dispatch do mesmo lead rodar.
+        # finally garante release mesmo em exception não-tratada.
+        await _release_dispatch_lock(lead["id"], lock)
 
 
 # ============================================================================
@@ -1637,6 +1702,35 @@ async def _extract_schedule_params(
             "ok": True,
             "source": "regex",
         }
+    # 1b. ACORDO IMPLÍCITO — paciente ACABOU de concordar com oferta recente
+    #     do bot. Cobre o caso "OK tá agendado" após "9h do dia 18": a regex
+    #     primária só varre a última msg do paciente, então se essa msg não
+    #     tem horário explícito, recaimos na oferta do bot.
+    #     Não chama LLM — extrai direto da oferta.
+    #     Adicionado 16/09/2026 (msg 4805 — Isaías reportou bot enrolando
+    #     sem agendar mesmo após o paciente confirmar).
+    agreed_result = _probe_agreed_offer(patient_text or "", history or [])
+    if agreed_result:
+        patient_name = tenant_cfg.get("patient_name") or "Paciente"
+        doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
+        logger.info(
+            "[CALENDAR] extrator via ACORDO IMPLÍCITO (paciente concordou "
+            "com oferta recente do bot) — start=%s",
+            agreed_result["start_datetime"],
+        )
+        return {
+            "should_schedule": True,
+            "summary": f"Consulta: {patient_name} - {doctor_name}",
+            "start_datetime": agreed_result["start_datetime"],
+            "end_datetime": agreed_result["end_datetime"],
+            "attendee_email": None,
+            "description": (
+                f"Agendamento via WhatsApp (paciente {patient_name}). "
+                "Confirmado por acordo implícito após oferta do assistente."
+            ),
+            "ok": True,
+            "source": "agreement",
+        }
     # 2. FALLBACK LLM (só se regex não achou). Pode falhar — não-bloqueante.
     extractor_prompt = (
         "Você é um extrator estruturado. Analise o histórico e devolva APENAS "
@@ -1710,6 +1804,70 @@ async def _extract_schedule_params(
     return {"should_schedule": False, "ok": False, "source": "none"}
 
 
+def _probe_agreed_offer(
+    patient_text: str,
+    history: list[dict[str, Any]],
+) -> dict[str, str] | None:
+    """Se o paciente ACABOU de concordar (palavra simples de aceite) com uma
+    oferta recente do bot, retorna ISO-8601 extraído DA OFERTA DO BOT via
+    `_extract_datetime_regex`.
+
+    Não chama LLM — usa regex na oferta do bot, mesmo padrão da tentativa
+    principal.
+
+    Cobertura adicionada em 16/09/2026 (msg 4805 — bot enrolava após paciente
+    confirmar oferta anterior). Caso típico:
+
+      Bot:    "...9h da manhã do dia 18 com o Dr. Matheus Dore — anotado aqui."
+      Pac.:   "OK tá agendado para o dia 18 tem como mandar o link"
+
+    Sem esse probe, a regex primária só olharia a msg "OK tá agendado..." e
+    não acharia data+hora explícita, caindo no LLM (que estava retornando
+    texto de chat em vez de JSON, ignorando `response_format`).
+
+    Retorna None se:
+      - paciente NÃO começa com palavra de aceite simples
+      - histórico não tem msg do bot anterior
+      - última msg do bot não tem horário concreto
+
+    Adicionado 16/09/2026: msg 4805 (Isaías reportou).
+    """
+    pt = (patient_text or "").strip().lower()
+    if not pt:
+        return None
+    # Mesmo set de palavras do gate 2 de _looks_like_schedule_request
+    # (lógica consistente). Aceita também "tá agendado" / "ta agendado"
+    # que é exatamente o que o Dr. Matheus falou na conversa-teste.
+    agreement_re = re.compile(
+        r"^\s*(sim|ok|perfeito|otimo|ótimo|isso|exato|exatamente|correto|"
+        r"👍|👌|✅|show|blz|beleza|fechado|combinado|"
+        r"t[áa]\b|ta\b|tá agendado|ta agendado|tá certo|ta certo|"
+        r"pode ser|pode marcar|manda|fechou|"
+        r"vou querer|isso mesmo|combinado então|"
+        r"sim,?\s|ok,?\s|perfeito,?\s|otimo,?\s|"
+        r"\bok\s+t[áa]\b|\bok\s+agendado\b)",
+        re.IGNORECASE,
+    )
+    if not agreement_re.match(pt):
+        return None
+
+    # Pega última msg do bot no histórico (mesma lógica de _looks_like).
+    last_bot = ""
+    for m in reversed(history or []):
+        if isinstance(m, dict) and m.get("sender") in ("assistant", "ai", "bot"):
+            last_bot = str(m.get("content") or "").strip()
+            break
+    if not last_bot:
+        return None
+
+    # Bot ofereceu horário concreto?
+    if not _SCHEDULE_TIME_RE.search(last_bot):
+        return None
+
+    # Extrai do bot — usa mesma regex determinística.
+    return _extract_datetime_regex(last_bot)
+
+
 def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
     """Extrai (data, hora) de PT-BR e devolve dict com start/end ISO-8601 -03:00.
 
@@ -1720,6 +1878,8 @@ def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
       - "quinta às 14h" / "quinta 14h"
       - "próxima segunda 14h30"
       - "às 14h de amanhã"
+      - "9 horas da manhã" / "9h da manhã"  (16/09)
+      - "dia 18" / "dia 18 que vem"  (16/09)
 
     Retorna None se não achar padrão claro.
     """
@@ -1783,17 +1943,64 @@ def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
                     days_ahead = 7
                 target_date = today_date + timedelta(days=days_ahead)
                 break
+    # "dia 18" / "dia 18 que vem" — dia do mês por extenso sem mês.
+    # Adicionado 16/09/2026 (msg 4805). Sem mês, inferência: "que vem" → próximo
+    # mês; sem "que vem" → mês atual se ainda não passou, próximo se já passou.
+    if not target_date:
+        m = re.search(r"\bdia\s+(\d{1,2})\b(?:\s+que\s+vem)?\b", blob_l)
+        if m:
+            d = int(m.group(1))
+            is_next = "que vem" in m.group(0)
+            try:
+                cand = date(now.year, now.month, d)
+                # Se já passou esse mês e não pediu "que vem", joga pro próximo.
+                if cand < today_date and not is_next:
+                    next_m = now.month + 1
+                    next_y = now.year + (1 if next_m > 12 else 0)
+                    next_m = ((next_m - 1) % 12) + 1
+                    cand = date(next_y, next_m, d)
+                elif is_next:
+                    # Forçou "que vem" → próximo mês independente do dia atual.
+                    if today_date.day <= d:
+                        next_m = now.month + 1
+                    else:
+                        next_m = now.month + 1
+                    next_y = now.year + (1 if next_m > 12 else 0)
+                    next_m = ((next_m - 1) % 12) + 1
+                    cand = date(next_y, next_m, d)
+                target_date = cand
+            except ValueError:
+                # Esse mês não tem esse dia (ex: dia 31 em fevereiro).
+                # Tenta próximo mês com rollover de ano.
+                next_m = now.month + 1
+                next_y = now.year + (1 if next_m > 12 else 0)
+                next_m = ((next_m - 1) % 12) + 1
+                try:
+                    target_date = date(next_y, next_m, d)
+                except ValueError:
+                    target_date = None
     if not target_date:
         return None
 
     # === 2. Resolver HORA ===
-    # "14h", "14h00", "14:00", "9 h", "às 14h"
+    # "14h", "14h00", "14:00", "9 h", "às 14h", "9 horas" / "9 horas da manhã"
     hour = None
     minute = 0
     m = re.search(r"(\d{1,2})\s*h\s*(\d{2})?\b", blob_l)
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
+    if hour is None:
+        # "9 horas" / "nove horas" / "9 horas da manhã"
+        m = re.search(r"\b(\d{1,2})\s+horas?\b", blob_l)
+        if m:
+            hour = int(m.group(1))
+            minute = 0
+            # "9 e meia" / "9 e meia da manhã" → minute = 30
+            if re.search(r"\d{1,2}\s+horas?\s+(?:e\s+meia|em\s+ponto)", blob_l):
+                minute = 30 if "meia" in blob_l else 0
+            # Adicionado 16/09/2026: "9 horas da manhã" / "9 horas da noite"
+            # → 9h é hora cheia (sem meia). Não muda nada — fica 9:00.
     if hour is None:
         m = re.search(r"\b(\d{1,2}):(\d{2})\b", blob_l)
         if m:
