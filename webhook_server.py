@@ -895,7 +895,7 @@ async def _call_llm_structured(
 
     try:
         content, _ = await _post_chat_completion(target, messages, payload_extras)
-        return _parse(content)
+        return await _parse(content)
     except Exception as exc:
         if target["source"] != "hermes_gateway":
             logger.warning(
@@ -917,7 +917,7 @@ async def _call_llm_structured(
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
             content, _ = await _post_chat_completion(fallback, messages, payload_extras)
-            return _parse(content)
+            return await _parse(content)
         except Exception as exc2:
             logger.error(
                 "_call_llm_structured fallback 9router também falhou: %s", exc2,
