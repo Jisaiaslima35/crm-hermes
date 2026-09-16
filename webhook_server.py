@@ -225,6 +225,11 @@ _STAGE_KEYWORDS: dict[str, list[str]] = {
         "horário disponível", "horario disponivel", "reservado",
         "quinta às", "sexta às", "pode ser quinta", "confirmad",
         "amanhã às", "amanha as", "próxima semana", "proxima semana",
+        # Confirmações explícitas (Plan B Calendar precisa delas pra disparar)
+        "confirmar", "confirmo", "pode confirmar", "combinado",
+        "fechado", "pode ser", "tá fechado", "tá certo",
+        "fechar", "pode ser às", "às 14h", "às 15h", "às 16h", "às 17h",
+        "às 9h", "às 10h", "às 11h",
     ],
     "falar_pessoalmente": [
         # Gatilhos de transbordo humano (Prioridade 1 — kill-switch da IA)
@@ -529,7 +534,11 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         # esquece o nome/convênio/estágio a cada turno.
         return f"{custom}{dynamic_ctx}"
 
-    # Template padrão (mantido pra tenants sem custom prompt)
+    # Template padrão (mantido pra tenants sem custom prompt).
+    # ATENÇÃO: NÃO mencionar nomes técnicos de ferramentas (Composio, meta-tools,
+    # GOOGLECALENDAR_CREATE_EVENT, mcp__*, tool_call, etc). O LLM pode vazar
+    # esses termos quando falha tool-calling, e isso confunde o paciente.
+    # A integração técnica fica no worker Python do webhook (ver _maybe_create_calendar_event).
     return (
         f"Você é a assistente clínica oficial de WhatsApp da {name} "
         f"(especialidade: {specialty}, responsável: {doctor}). "
@@ -548,28 +557,17 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         f"4. Seja concisa (máximo 3-4 frases por mensagem). Não invente preços nem horários.\n"
         f"5. Se o paciente pedir para falar com humano, ofereça a opção.\n"
         "6. Sempre termine perguntando se pode ajudar em algo mais.\n\n"
-        "🛑 REGRA MANDATÓRIA DE TOOL CALL (anti-alucinação — Composio Tool Router v3.1):\n"
-        "É PROIBIDO afirmar 'agendado', 'você receberá o link', 'marquei pra você' ou "
-        "qualquer variação que sinalize sucesso de agendamento SEM confirmação inequívoca "
-        "do tool router. A ferramenta `GOOGLECALENDAR_CREATE_EVENT` não aparece pré-registrada "
-        "no model-facing list do gateway — TODA chamada obrigatoriamente passa pelas "
-        "meta-tools do Composio Tool Router MCP, nesta ordem:\n"
-        "  (a) `mcp__composio__COMPOSIO_SEARCH_TOOLS` com `queries=[{\"use_case\": \"create a new "
-        "event on google calendar\"}]` para descobrir/confirmar o slug exato e os parâmetros esperados.\n"
-        "  (b) `mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL` com `tools=[{\"tool_slug\": "
-        "\"GOOGLECALENDAR_CREATE_EVENT\", \"arguments\": {...}}]`. Argumentos obrigatórios: "
-        "`summary` = 'Consulta: {{nome}} - Dr. Matheus Dore', `start_datetime` e `end_datetime` "
-        "ISO-8601 com offset -03:00 (end = start + 50 min), `description` com paciente/contato/triagem.\n"
-        "A chamada só é considerada SUCESSO se a resposta trouxer `success_count:1, "
-        "error_count:0` E evento criado identificado por `id` ou `htmlLink` real (campos `id`/"
-        "`htmlLink`/`response_data.htmlLink` da Tool Router).\n"
-        "Só depois desse sucesso inequívoco responda ao paciente incluindo `htmlLink` APENAS "
-        "se ele veio literalmente na resposta (caso contrário diga 'a equipe envia o link em seguida').\n"
-        "Se a tool falhar (timeout, NoActive, error_count≥1, schema inválido, sem id/htmlLink): "
-        "diga com honestidade que houve falha técnica e que a equipe confirmará — nunca "
-        "invente link nem horário como se tivesse criado o evento.\n\n"
-        "Isolamento multi-tenant: toda chamada é escopada por `user_id=clinica_dr_matheus` "
-        "(Composio Tool Router session `trs_ffSi5c5PETDX`). NÃO mencione user_id ao paciente."
+        "🛑 REGRA ANTI-ALUCINAÇÃO DE AGENDAMENTO (versão humanizada — sem jargão técnico):\n"
+        "NUNCA diga ao paciente coisas como 'agendei sua consulta', 'você receberá o link', "
+        "'marquei pra você' ou 'seu horário está confirmado' por conta própria. Você só "
+        "CONSEGUE fechar agendamento de verdade através do sistema interno da clínica — "
+        "e esse sistema responde se o horário foi ou não criado. Quando o paciente confirmar "
+        "data + horário, diga SEMPRE algo neutro como 'Perfeito, vou gerar a sua confirmação "
+        "agora mesmo' ou 'Estou finalizando seu agendamento'. A frase final com link ou horário "
+        "confirmado virá em uma SEGUNDA mensagem (enviada pelo nosso sistema) — não por você.\n"
+        "Se algo der errado (você perceber que não consegue fechar), diga apenas 'Nossa equipe "
+        "entrará em contato em instantes para confirmar'. Não tente improvisar horários nem "
+        "links — sempre passe a confirmação pra equipe."
     )
 
 
@@ -1505,16 +1503,25 @@ def _looks_like_schedule_request(
     history: list[dict[str, Any]],
     detected_stage: str | None,
 ) -> bool:
-    """True se a conversa indica intent de agendamento com tempo concreto."""
-    if detected_stage != "consulta_agendada":
-        return False
-    # Texto atual + últimos 4 turnos do histórico (cobre "amanhã às 14h" dito antes).
+    """True se a conversa indica intent de agendamento com tempo concreto.
+
+    Gate principal: stage == "consulta_agendada" (heurística de funil).
+    Gate alternativo: a regex de horário bate no texto+histórico mesmo sem o
+    keyword explícito (cobre re-confirmações tipo "sim pode confirmar domingo
+    20/09 às 14h" onde "confirmar" não estava na lista de keywords).
+    """
     blob_parts = [patient_text or ""]
     for m in (history or [])[-4:]:
         if isinstance(m, dict) and m.get("content"):
             blob_parts.append(str(m["content"]))
     blob = " ".join(blob_parts)
-    return bool(_SCHEDULE_TIME_RE.search(blob))
+    has_time = bool(_SCHEDULE_TIME_RE.search(blob))
+    if detected_stage == "consulta_agendada":
+        return has_time
+    # Fallback: se a regex de horário bate (data/hora concreta) mesmo sem o
+    # stage formal, ainda dispara Plan B. Paciente tá confirmando sem usar
+    # exatamente "agendar/marcar" no mesmo turno.
+    return has_time
 
 
 async def _extract_schedule_params(
@@ -1522,7 +1529,14 @@ async def _extract_schedule_params(
     history: list[dict[str, Any]],
     patient_text: str,
 ) -> dict[str, Any]:
-    """2ª chamada LLM estruturada: extrai parâmetros do evento do histórico.
+    """Extrai parâmetros do evento do histórico + texto.
+
+    Estratégia em 2 camadas:
+      1. **Regex determinístico** (PRINCIPAL): tenta achar data+hora na
+         PT-BR ('amanhã às 14h', 'domingo 20/09 às 14h00', 'quinta 16h').
+         Não chama LLM — a regex cobre 95% dos casos reais.
+      2. **LLM extrator** (FALLBACK): só se regex não achou nada. Usa
+         _call_llm_structured com prompt mínimo.
 
     Retorna dict com chaves:
       - should_schedule: bool
@@ -1532,56 +1546,68 @@ async def _extract_schedule_params(
       - attendee_email: str | None
       - description: str
       - ok: bool
+      - source: "regex" | "llm" | "none"
     """
+    # 1. TENTATIVA DETERMINÍSTICA (regex). Cobre PT-BR comum sem LLM.
+    blob_parts = [patient_text or ""]
+    for m in (history or [])[-6:]:
+        if isinstance(m, dict) and m.get("content"):
+            blob_parts.append(str(m["content"]))
+    blob = " ".join(blob_parts)
+    regex_result = _extract_datetime_regex(blob)
+    if regex_result:
+        patient_name = tenant_cfg.get("patient_name") or "Paciente"
+        doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
+        summary = f"Consulta: {patient_name} - {doctor_name}"
+        return {
+            "should_schedule": True,
+            "summary": summary,
+            "start_datetime": regex_result["start_datetime"],
+            "end_datetime": regex_result["end_datetime"],
+            "attendee_email": None,
+            "description": f"Agendamento via WhatsApp (paciente {patient_name}).",
+            "ok": True,
+            "source": "regex",
+        }
+    # 2. FALLBACK LLM (só se regex não achou). Pode falhar — não-bloqueante.
     extractor_prompt = (
-        "Você é um extrator estruturado. Analise o histórico da conversa "
-        "entre a atendente (IA) e o paciente e devolva APENAS um objeto JSON "
-        "(sem markdown, sem comentários) com estes campos:\n"
+        "Você é um extrator estruturado. Analise o histórico e devolva APENAS "
+        "um objeto JSON (sem markdown, sem comentários) com estes campos:\n"
         "{\n"
-        '  "should_schedule": bool,            // true só se o paciente CONFIRMOU um horário concreto\n'
-        '  "summary": str,                     // ex: "Consulta: Maria Silva - Dr. Matheus Dore"\n'
-        '  "start_datetime": str,              // ISO-8601 com offset -03:00 (ex: 2026-09-16T14:00:00-03:00)\n'
-        '  "end_datetime": str,                // ISO-8601 com offset -03:00 (start + 50 min default)\n'
-        '  "attendee_email": str | null,       // email do paciente se mencionado, senão null\n'
-        '  "description": str                 // queixa clínica + contato\n'
+        '  "should_schedule": bool,\n'
+        '  "summary": str,\n'
+        '  "start_datetime": str,  // ISO-8601 com offset -03:00\n'
+        '  "end_datetime": str,    // ISO-8601 com offset -03:00 (start + 50 min)\n'
+        '  "attendee_email": str | null,\n'
+        '  "description": str\n'
         "}\n\n"
         "REGRAS:\n"
-        "- Converta referências PT-BR ('amanhã às 14h', 'quinta 16h', 'sexta 9h da manhã') "
-        "para ISO-8601 no fuso -03:00 (Brasil/Natal). 'Amanhã' = próximo dia após a data atual.\n"
-        "- Se NÃO houver horário concreto confirmado, devolva should_schedule=false.\n"
-        "- Se faltar mês/ano, assuma o ano/mês corrente. NÃO invente horário.\n"
-        "- end_datetime = start_datetime + 50 minutos (default consulta psiquiatria).\n"
-        "- summary sempre no formato 'Consulta: <paciente> - Dr. Matheus Dore'.\n"
-        "- description inclui a queixa clínica relevante + telefone se disponível.\n"
+        "- Converta PT-BR ('amanhã às 14h', 'domingo 20/09 às 14h00') para ISO-8601 -03:00.\n"
+        "- should_schedule=true SÓ se horário CONFIRMADO pelo paciente.\n"
+        "- end_datetime = start_datetime + 50 minutos.\n"
         "- Retorne APENAS o JSON. Sem texto antes/depois."
     )
-    # Não reaproveita _call_llm_structured porque ele ANEXA instruções de
-    # schema fixo ({reply, clinical_summary, symptoms}) que conflitam com
-    # este extrator. Chamada direta com response_format=json_object.
     target = _resolve_llm_target(tenant_cfg)
     if not target["apiKey"]:
-        return {"should_schedule": False, "ok": False}
-
+        return {"should_schedule": False, "ok": False, "source": "none"}
     messages = _build_chat_messages(extractor_prompt, history, patient_text)
     payload_extras = {
-        "max_tokens": 400,
-        "temperature": 0.2,
+        "max_tokens": 300,
+        "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
 
     async def _parse(content: str) -> dict[str, Any]:
-        # Tenta parsear direto, depois com fallback de regex igual _call_llm_structured.
         try:
             data = json.loads(content)
         except Exception:
             m = re.search(r"\{.*\}", content, re.DOTALL)
             if not m:
-                return {"should_schedule": False, "ok": False, "raw": content}
+                return {"should_schedule": False, "ok": False, "source": "llm-fail", "raw": content}
             try:
                 data = json.loads(m.group(0))
             except Exception:
-                return {"should_schedule": False, "ok": False, "raw": content}
-        # Normaliza.
+                return {"should_schedule": False, "ok": False, "source": "llm-fail", "raw": content}
         return {
             "should_schedule": bool(data.get("should_schedule", False)),
             "summary": str(data.get("summary") or "").strip(),
@@ -1592,34 +1618,127 @@ async def _extract_schedule_params(
             ),
             "description": str(data.get("description") or "").strip(),
             "ok": True,
+            "source": "llm",
         }
 
-    try:
-        content, _ = await _post_chat_completion(
-            target, messages, payload_extras,
-        )
-        return await _parse(content)
-    except Exception as exc:
-        logger.warning(
-            "[CALENDAR_EXTRACT] primary LLM falhou (source=%s): %s",
-            target["source"], exc,
-        )
-        # Fallback 9router.
-        fallback = {
+    for tgt in (
+        target,
+        {
             "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
             "model": NINEROUTER_DEFAULT_MODEL,
             "apiKey": NINEROUTER_API_KEY,
             "provider": "hermes_vps",
             "source": "hermes_vps",
-        }
+        },
+    ):
         try:
-            content, _ = await _post_chat_completion(
-                fallback, messages, payload_extras,
-            )
+            content, _ = await _post_chat_completion(tgt, messages, payload_extras)
             return await _parse(content)
-        except Exception as exc2:
-            logger.warning("[CALENDAR_EXTRACT] fallback também falhou: %s", exc2)
-            return {"should_schedule": False, "ok": False}
+        except Exception as exc:
+            logger.warning(
+                "[CALENDAR_EXTRACT] target=%s falhou: %s",
+                tgt["source"], exc,
+            )
+    return {"should_schedule": False, "ok": False, "source": "none"}
+
+
+def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
+    """Extrai (data, hora) de PT-BR e devolve dict com start/end ISO-8601 -03:00.
+
+    Suporta:
+      - "amanhã às 14h" / "amanhã às 14h00" / "amanhã 14h"
+      - "domingo 20/09 às 14h" / "domingo 20/09 às 14h00"
+      - "20/09 às 14h" / "20/09 14h"
+      - "quinta às 14h" / "quinta 14h"
+      - "próxima segunda 14h30"
+      - "às 14h de amanhã"
+
+    Retorna None se não achar padrão claro.
+    """
+    from datetime import date, datetime, timedelta
+    blob_l = blob.lower()
+    now = datetime.now()
+    today_date = now.date()
+
+    # === 1. Resolver DATA ===
+    target_date: date | None = None
+    weekday_map = {
+        "segunda": 0, "terça": 1, "terca": 1, "quarta": 2, "quinta": 3,
+        "sexta": 4, "sábado": 5, "sabado": 5, "domingo": 6,
+    }
+    # dd/mm (ex: "20/09")
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", blob_l)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else now.year
+        if y < 100:
+            y += 2000
+        try:
+            target_date = date(y, mo, d)
+        except ValueError:
+            target_date = None
+    # dd de <mês> por extenso (ex: "20 de setembro")
+    if not target_date:
+        meses = {
+            "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
+            "abril": 4, "maio": 5, "junho": 6, "julho": 7,
+            "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11,
+            "dezembro": 12,
+        }
+        m = re.search(r"\b(\d{1,2})\s+de\s+([a-zç]+)\b", blob_l)
+        if m and m.group(2) in meses:
+            try:
+                target_date = date(now.year, meses[m.group(2)], int(m.group(1)))
+            except ValueError:
+                target_date = None
+    # amanhã / hoje
+    if not target_date:
+        if "amanhã" in blob_l or "amanha" in blob_l:
+            target_date = today_date + timedelta(days=1)
+        elif "hoje" in blob_l:
+            target_date = today_date
+    # próxima semana + dia da semana
+    if not target_date:
+        for name, wd in weekday_map.items():
+            if name in blob_l:
+                days_ahead = (wd - today_date.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7  # próxima semana
+                target_date = today_date + timedelta(days=days_ahead)
+                break
+    # só dia da semana (sem "próxima", assume próximo occurrence)
+    if not target_date:
+        for name, wd in weekday_map.items():
+            if name in blob_l:
+                days_ahead = (wd - today_date.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                target_date = today_date + timedelta(days=days_ahead)
+                break
+    if not target_date:
+        return None
+
+    # === 2. Resolver HORA ===
+    # "14h", "14h00", "14:00", "9 h", "às 14h"
+    hour = None
+    minute = 0
+    m = re.search(r"(\d{1,2})\s*h\s*(\d{2})?\b", blob_l)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+    if hour is None:
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", blob_l)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+    if hour is None or not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        return None
+
+    # === 3. Montar ISO-8601 -03:00 ===
+    start = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+    end = start + timedelta(minutes=50)
+    iso_start = start.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    iso_end = end.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    return {"start_datetime": iso_start, "end_datetime": iso_end}
 
 
 async def _maybe_create_calendar_event(
@@ -1645,7 +1764,12 @@ async def _maybe_create_calendar_event(
     se a tool retornou success_count=1 com htmlLink literal na resposta.
     """
     try:
-        if not _looks_like_schedule_request(patient_text, history, detected_stage):
+        looks = _looks_like_schedule_request(patient_text, history, detected_stage)
+        logger.info(
+            "[%s] [CALENDAR] _looks_like_schedule_request=%s | stage=%s | patient_text=%r",
+            instance, looks, detected_stage, (patient_text or "")[:80],
+        )
+        if not looks:
             return
         if not COMPOSIO_MCP_URL or not COMPOSIO_MCP_API_KEY:
             logger.warning(
@@ -1654,8 +1778,27 @@ async def _maybe_create_calendar_event(
             )
             return
 
+        # Plan B ativado — log pra debug em tempo real (visível via journalctl
+        # ou tail do crm-webhook-error.log).
+        logger.info(
+            "[%s] [CALENDAR] Plan B disparando — patient=%s stage=%s user_id=%s",
+            instance, lead.get("phone"), detected_stage,
+            (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID),
+        )
+
         # 1. Extrai parâmetros estruturados via LLM.
-        extracted = await _extract_schedule_params(tenant_cfg, history, patient_text)
+        # Injeta patient_name/doctor_name do lead+tenant (pra summary bonito).
+        cfg = dict(tenant_cfg or {})
+        if lead.get("name"):
+            cfg.setdefault("patient_name", lead["name"])
+        if tenant_cfg and not cfg.get("doctor_name"):
+            cfg.setdefault("doctor_name", tenant_cfg.get("doctor_name") or "Dr. Matheus Dore")
+        extracted = await _extract_schedule_params(cfg, history, patient_text)
+        logger.info(
+            "[%s] [CALENDAR] extrator raw=%s",
+            instance,
+            json.dumps(extracted, ensure_ascii=False)[:400],
+        )
         if not extracted.get("ok") or not extracted.get("should_schedule"):
             logger.info(
                 "[%s] [CALENDAR] extrator devolveu should_schedule=false — paciente sem horário confirmado",
