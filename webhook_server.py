@@ -1487,11 +1487,16 @@ async def _call_llm_with_tools_loop(
 # do Google Calendar no WhatsApp.
 
 _SCHEDULE_TIME_HINTS = [
-    # regex simples — presença de qualquer um já é sinal forte.
-    r"\b\d{1,2}\s*h\b",
+    # horário explícito ("14h", "14h00", "9h30", "14:00")
+    r"\b\d{1,2}\s*h\s*\d{0,2}\b",
     r"\b\d{1,2}:\d{2}\b",
-    r"\b(amanh[ãa]|hoje|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)\b",
-    r"\b(pr[óo]xim[ao]|essa semana|essa semana que vem|semana que vem)\b",
+    # "às 14h", "as 14 horas"
+    r"\b[àa]s\s+\d{1,2}\s*h",
+    # data numérica (dd/mm)
+    r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+    # weekday + hora na mesma msg (ex: "segunda 14h", "quinta às 9h30")
+    r"\b(amanh[ãa]|hoje|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)\b\s+(?:[àa]s\s+)?\d{1,2}\s*h",
+    r"\b(?:[àa]s\s+)?\d{1,2}\s*h\s+(?:de\s+)?(?:amanh[ãa]|hoje|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)",
 ]
 _SCHEDULE_TIME_RE = re.compile(
     "|".join(_SCHEDULE_TIME_HINTS), re.IGNORECASE
@@ -1503,25 +1508,89 @@ def _looks_like_schedule_request(
     history: list[dict[str, Any]],
     detected_stage: str | None,
 ) -> bool:
-    """True se a conversa indica intent de agendamento com tempo concreto.
+    """True se a conversa indica CONFIRMAÇÃO MÚTUA de agendamento com tempo concreto.
 
-    Gate principal: stage == "consulta_agendada" (heurística de funil).
-    Gate alternativo: a regex de horário bate no texto+histórico mesmo sem o
-    keyword explícito (cobre re-confirmações tipo "sim pode confirmar domingo
-    20/09 às 14h" onde "confirmar" não estava na lista de keywords).
+    Regra de negócio crítica (15/09/2026): Plan B SÓ dispara quando o paciente
+    ACEITOU explicitamente um horário concreto. Não basta o histórico ter
+    mencionado horário — tem que ter aceite do paciente na ÚLTIMA mensagem
+    dele (ou aceite simples após o bot ter confirmado o horário).
+
+    Gate em 3 camadas:
+      1. **Última msg do paciente tem horário + keyword confirmativa** ("pode
+         ser segunda 10h30", "combinado 14h", "fechado amanhã às 9h").
+      2. **Última msg do bot confirmou horário E última msg do paciente é
+         concordância simples** ("ok", "sim", "perfeito", "👍", "isso").
+      3. **Stage == consulta_agendada + última msg do paciente tem horário
+         concreto** (fallback se keywords não casam mas contexto é claro).
+
+    NÃO dispara quando:
+      - Paciente está SUGERINDO horário novo no meio de oferta anterior
+        ("e segunda às 10h30?" — sem aceite da oferta vigente).
+      - Paciente está PERGUNTANDO disponibilidade sem fechar
+        ("tem horário na quinta?").
+      - Bot está oferecendo alternativas e paciente ainda não respondeu
+        ("posso verificar outras datas?" → paciente não respondeu ainda).
     """
-    blob_parts = [patient_text or ""]
-    for m in (history or [])[-4:]:
-        if isinstance(m, dict) and m.get("content"):
-            blob_parts.append(str(m["content"]))
-    blob = " ".join(blob_parts)
-    has_time = bool(_SCHEDULE_TIME_RE.search(blob))
-    if detected_stage == "consulta_agendada":
-        return has_time
-    # Fallback: se a regex de horário bate (data/hora concreta) mesmo sem o
-    # stage formal, ainda dispara Plan B. Paciente tá confirmando sem usar
-    # exatamente "agendar/marcar" no mesmo turno.
-    return has_time
+    last_patient = (patient_text or "").strip()
+    last_bot = ""
+    if history:
+        # Pega a última mensagem do bot (sender != "patient")
+        for m in reversed(history or []):
+            if isinstance(m, dict) and m.get("sender") in ("assistant", "ai", "bot"):
+                last_bot = str(m.get("content") or "").strip()
+                break
+
+    # 1. Última msg do paciente tem horário + keyword confirmativa?
+    has_time_in_last = bool(_SCHEDULE_TIME_RE.search(last_patient))
+    has_confirmation_in_last = bool(re.search(
+        r"\b(pode ser|combinado|fechado|fechar|confirmo|confirmar|"
+        r"tá (certo|fechado|bom)|ta (certo|fechado|bom)|"
+        r"perfeito|ótimo|otimo|isso é|isso é|"
+        r"pode marcar|agendar|agenda|"
+        r"sim,? (pode|ser|fechar|confirmar))\b",
+        last_patient, re.IGNORECASE,
+    ))
+    if has_time_in_last and has_confirmation_in_last:
+        return True
+
+    # 2. Bot confirmou horário E paciente concordou?
+    # "Bot ofereceu horário" pode ser tanto confirmação explícita ("fechado
+    # segunda 10h30") quanto oferta/pergunta ("posso separar segunda às 10h30?",
+    # "que tal amanhã às 14h?"). Se paciente responde com aceite simples,
+    # vale.
+    if last_bot and _SCHEDULE_TIME_RE.search(last_bot):
+        bot_offered_schedule = bool(re.search(
+            r"\b(confirmo|fechado|combinado|agendado|anotado|"
+            r"(seu|esse|este) horário|horário (marcado|separado|reservado)|"
+            r"perfeito,? vou|ok,? vou|certo,? vou|"
+            r"que tal|posso (separar|agendar|marcar)|"
+            r"(segunda|terça|quarta|quinta|sexta|sábado|domingo|amanh[ãa]) [àa]s|"
+            r"\d{1,2}\s*h\b)\b",
+            last_bot, re.IGNORECASE,
+        ))
+        patient_agrees = bool(re.match(
+            r"^\s*(sim|ok|perfeito|ótimo|otimo|isso|exato|exatamente|correto|"
+            r"👍|👌|✅|show|blz|beleza|fechado|combinado|isso mesmo|tá|ta|"
+            r"pode ser|pode marcar|manda|fechou|fechado então|"
+            r"combinado então|combinado,? pode|"
+            r"vou querer|quero|sim,? por favor|sim,? quero)\b",
+            last_patient.strip(), re.IGNORECASE,
+        ))
+        if bot_offered_schedule and patient_agrees:
+            return True
+
+    # 3. Fallback: stage correto + horário na última msg
+    if detected_stage == "consulta_agendada" and has_time_in_last:
+        # mesmo sem keyword explícita, se stage já é consulta_agendada e a
+        # última msg do paciente tem horário, aceita (cobre "amanhã 14h00" sem
+        # "pode ser").
+        return True
+
+    # 4. Fallback raro: regex bate mesmo sem stage (re-confirmação cruzada)
+    if has_time_in_last and has_confirmation_in_last:
+        return True
+
+    return False
 
 
 async def _extract_schedule_params(
@@ -1549,12 +1618,11 @@ async def _extract_schedule_params(
       - source: "regex" | "llm" | "none"
     """
     # 1. TENTATIVA DETERMINÍSTICA (regex). Cobre PT-BR comum sem LLM.
-    blob_parts = [patient_text or ""]
-    for m in (history or [])[-6:]:
-        if isinstance(m, dict) and m.get("content"):
-            blob_parts.append(str(m["content"]))
-    blob = " ".join(blob_parts)
-    regex_result = _extract_datetime_regex(blob)
+    # CRÍTICO (15/09): extrai APENAS da ÚLTIMA msg do paciente — o blob do
+    # histórico pode ter horário de OFERTA ANTERIOR da IA (ex: "amanhã às 14h"
+    # sugerido lá no início), e o paciente pode ter mudado de ideia depois
+    # ("na verdade segunda às 10h30"). Pegar do blob daria horário errado.
+    regex_result = _extract_datetime_regex(patient_text or "")
     if regex_result:
         patient_name = tenant_cfg.get("patient_name") or "Paciente"
         doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
