@@ -23,8 +23,11 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+TZ_CLINICA = ZoneInfo("America/Fortaleza")
 
 import httpx
 from dotenv import load_dotenv
@@ -288,10 +291,21 @@ _STAGE_KEYWORDS: dict[str, list[str]] = {
 def _detect_stage(text: str) -> Optional[str]:
     """Heurística simples: palavra-chave na mensagem do paciente → muda stage."""
     t = text.lower()
+    # Se paciente está pedindo pra desmarcar ou remarcar, NÃO ativa consulta_agendada
+    is_cancel_or_reschedule = bool(re.search(
+        r"\b(desmarcar|remarcar|cancelar|reagendar|desmarca|remarca|cancela|reagenda|reajenda)\b",
+        t,
+    ))
     for stage, kws in _STAGE_KEYWORDS.items():
+        if stage == "consulta_agendada" and is_cancel_or_reschedule:
+            continue
         for kw in kws:
-            if kw in t:
-                return stage
+            if " " in kw:
+                if kw in t:
+                    return stage
+            else:
+                if re.search(r"\b" + re.escape(kw) + r"\b", t):
+                    return stage
     return None
 
 
@@ -1122,8 +1136,9 @@ async def _dispatch_ai(
         # Plan B — se stage indica agendamento E paciente tem horário
         # concreto na conversa, chama Composio MCP direto pra criar o
         # evento. Bypassa o tool-calling quebrado do Hermes Gateway.
+        calendar_created = False
         try:
-            await _maybe_create_calendar_event(
+            calendar_created = await _maybe_create_calendar_event(
                 instance, lead, patient_text, ai_reply,
                 history, tenant_cfg, new_stage,
             )
@@ -1132,6 +1147,12 @@ async def _dispatch_ai(
                 "[%s] Plan B calendar dispatch falhou: %s",
                 instance, exc,
             )
+
+        # Regra determinística: se o evento no Google Calendar foi criado com sucesso,
+        # o status do lead DEVE virar "consulta_agendada" por definição.
+        if calendar_created:
+            new_stage = "consulta_agendada"
+
         if new_stage and new_stage != lead.get("stage"):
             patch = {"stage": new_stage, "last_interaction": _now_iso()}
             if requires_handoff:
@@ -1153,6 +1174,7 @@ async def _dispatch_ai(
                 new_stage,
                 requires_handoff,
             )
+            lead["stage"] = new_stage
         elif requires_handoff:
             # Caso raro: stage já é falar_pessoalmente mas handoff ainda
             # não estava marcado. Garante kill-switch.
@@ -1219,6 +1241,29 @@ async def evolution_webhook(
     background: BackgroundTasks,
     apikey: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    # 0. Validação de segurança: autenticação da Evolution API
+    expected_secret = (
+        os.environ.get("EVOLUTION_WEBHOOK_SECRET")
+        or os.environ.get("VITE_EVOLUTION_GLOBAL_KEY")
+        or EVOLUTION_API_KEY
+        or ""
+    ).strip()
+    received_token = (
+        apikey
+        or request.headers.get("apikey")
+        or request.headers.get("x-api-key")
+        or request.query_params.get("apikey")
+        or ""
+    ).strip()
+    if expected_secret:
+        if not received_token or received_token != expected_secret:
+            logger.warning(
+                "[%s] Webhook rejeitado: apikey inválido ou ausente (recebido: %r)",
+                instance,
+                received_token,
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     body_bytes = await request.body()
     try:
         payload = json.loads(body_bytes) if body_bytes else {}
@@ -1552,11 +1597,11 @@ async def _call_llm_with_tools_loop(
 # do Google Calendar no WhatsApp.
 
 _SCHEDULE_TIME_HINTS = [
-    # horário explícito ("14h", "14h00", "9h30", "14:00")
-    r"\b\d{1,2}\s*h\s*\d{0,2}\b",
-    r"\b\d{1,2}:\d{2}\b",
-    # "às 14h", "as 14 horas"
-    r"\b[àa]s\s+\d{1,2}\s*h",
+    # horário explícito ("14h", "14h00", "9h30", "14:00", "14hs", "14hrs", "14h30min", "as 09:00")
+    r"\b\d{1,2}\s*h(?:oras?|rs?|s)?\s*\d{0,2}(?:min)?\b",
+    r"\b\d{1,2}:\d{2}(?:\s*h(?:oras?|rs?|s)?)?\b",
+    # "às 14h", "as 14 horas", "as 09:00"
+    r"\b[àa]s\s+\d{1,2}(?:\s*h|\s*:\s*\d{2}|\s+horas?)",
     # data numérica (dd/mm)
     r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
     # weekday + hora na mesma msg (ex: "segunda 14h", "quinta às 9h30")
@@ -1575,84 +1620,56 @@ def _looks_like_schedule_request(
 ) -> bool:
     """True se a conversa indica CONFIRMAÇÃO MÚTUA de agendamento com tempo concreto.
 
-    Regra de negócio crítica (15/09/2026): Plan B SÓ dispara quando o paciente
-    ACEITOU explicitamente um horário concreto. Não basta o histórico ter
-    mencionado horário — tem que ter aceite do paciente na ÚLTIMA mensagem
-    dele (ou aceite simples após o bot ter confirmado o horário).
-
-    Gate em 3 camadas:
-      1. **Última msg do paciente tem horário + keyword confirmativa** ("pode
-         ser segunda 10h30", "combinado 14h", "fechado amanhã às 9h").
-      2. **Última msg do bot confirmou horário E última msg do paciente é
-         concordância simples** ("ok", "sim", "perfeito", "👍", "isso").
-      3. **Stage == consulta_agendada + última msg do paciente tem horário
-         concreto** (fallback se keywords não casam mas contexto é claro).
-
-    NÃO dispara quando:
-      - Paciente está SUGERINDO horário novo no meio de oferta anterior
-        ("e segunda às 10h30?" — sem aceite da oferta vigente).
-      - Paciente está PERGUNTANDO disponibilidade sem fechar
-        ("tem horário na quinta?").
-      - Bot está oferecendo alternativas e paciente ainda não respondeu
-        ("posso verificar outras datas?" → paciente não respondeu ainda).
+    Cobre:
+      1. Paciente forneceu DATA e HORA concretas (ex: "data: 22/09 as 09:00", "amanhã 14h").
+      2. Contexto de data dividida: paciente confirmou ou escolheu HORA ("ok, 10:30")
+         após o bot ter mencionado a data ("23/09").
+      3. Concordância simples ("sim", "ok", "perfeito") após o bot ter oferecido data/horário.
+      4. Stage == consulta_agendada com data/hora presente.
     """
     last_patient = (patient_text or "").strip()
     last_bot = ""
     if history:
-        # Pega a última mensagem do bot (sender != "patient")
         for m in reversed(history or []):
             if isinstance(m, dict) and m.get("sender") in ("assistant", "ai", "bot"):
                 last_bot = str(m.get("content") or "").strip()
                 break
 
-    # 1. Última msg do paciente tem horário + keyword confirmativa?
-    has_time_in_last = bool(_SCHEDULE_TIME_RE.search(last_patient))
+    # 1. Se a mensagem do paciente tem DATA e HORA explícitas (ex: "data: 22/09 as 09:00")
+    p_date = _extract_date_from_text(last_patient)
+    p_time = _extract_time_from_text(last_patient)
+    if p_date and p_time:
+        return True
+
+    # Tem horário na mensagem do paciente?
+    has_time_in_last = p_time is not None or bool(_SCHEDULE_TIME_RE.search(last_patient))
+
+    # Confirmação / aceite na última msg do paciente
     has_confirmation_in_last = bool(re.search(
-        r"\b(pode ser|combinado|fechado|fechar|confirmo|confirmar|"
+        r"\b(ok|sim|perfeito|ótimo|otimo|isso|exato|exatamente|correto|"
+        r"👍|👌|✅|show|blz|beleza|fechado|combinado|isso mesmo|t[áa]|ta|"
+        r"pode ser|pode marcar|manda|fechou|fechado então|"
+        r"combinado então|combinado,? pode|vou querer|quero|"
+        r"sim,? por favor|sim,? quero|confirmo|confirmar|fechar|"
         r"tá (certo|fechado|bom)|ta (certo|fechado|bom)|"
-        r"perfeito|ótimo|otimo|isso é|isso é|"
-        r"pode marcar|agendar|agenda|"
-        r"sim,? (pode|ser|fechar|confirmar))\b",
+        r"pode agendar|agendar|agenda)\b",
         last_patient, re.IGNORECASE,
     ))
-    if has_time_in_last and has_confirmation_in_last:
+
+    bot_has_date = bool(_extract_date_from_text(last_bot)) if last_bot else False
+    bot_has_time = bool(_extract_time_from_text(last_bot)) or (bool(_SCHEDULE_TIME_RE.search(last_bot)) if last_bot else False)
+
+    # 2. Paciente escolheu ou confirmou HORA (ex: "ok, 10:30") e o bot citou data recentemente
+    if has_time_in_last and (has_confirmation_in_last or bot_has_date):
         return True
 
-    # 2. Bot confirmou horário E paciente concordou?
-    # "Bot ofereceu horário" pode ser tanto confirmação explícita ("fechado
-    # segunda 10h30") quanto oferta/pergunta ("posso separar segunda às 10h30?",
-    # "que tal amanhã às 14h?"). Se paciente responde com aceite simples,
-    # vale.
-    if last_bot and _SCHEDULE_TIME_RE.search(last_bot):
-        bot_offered_schedule = bool(re.search(
-            r"\b(confirmo|fechado|combinado|agendado|anotado|"
-            r"(seu|esse|este) horário|horário (marcado|separado|reservado)|"
-            r"perfeito,? vou|ok,? vou|certo,? vou|"
-            r"que tal|posso (separar|agendar|marcar)|"
-            r"(segunda|terça|quarta|quinta|sexta|sábado|domingo|amanh[ãa]) [àa]s|"
-            r"\d{1,2}\s*h\b)\b",
-            last_bot, re.IGNORECASE,
-        ))
-        patient_agrees = bool(re.match(
-            r"^\s*(sim|ok|perfeito|ótimo|otimo|isso|exato|exatamente|correto|"
-            r"👍|👌|✅|show|blz|beleza|fechado|combinado|isso mesmo|tá|ta|"
-            r"pode ser|pode marcar|manda|fechou|fechado então|"
-            r"combinado então|combinado,? pode|"
-            r"vou querer|quero|sim,? por favor|sim,? quero)\b",
-            last_patient.strip(), re.IGNORECASE,
-        ))
-        if bot_offered_schedule and patient_agrees:
+    # 3. Bot ofereceu horário/data E paciente fez concordância simples
+    if last_bot and (bot_has_date or bot_has_time):
+        if has_confirmation_in_last:
             return True
 
-    # 3. Fallback: stage correto + horário na última msg
-    if detected_stage == "consulta_agendada" and has_time_in_last:
-        # mesmo sem keyword explícita, se stage já é consulta_agendada e a
-        # última msg do paciente tem horário, aceita (cobre "amanhã 14h00" sem
-        # "pode ser").
-        return True
-
-    # 4. Fallback raro: regex bate mesmo sem stage (re-confirmação cruzada)
-    if has_time_in_last and has_confirmation_in_last:
+    # 4. Fallback: stage == consulta_agendada com data ou horário presente
+    if detected_stage == "consulta_agendada" and (has_time_in_last or p_date or bot_has_date):
         return True
 
     return False
@@ -1683,11 +1700,16 @@ async def _extract_schedule_params(
       - source: "regex" | "llm" | "none"
     """
     # 1. TENTATIVA DETERMINÍSTICA (regex). Cobre PT-BR comum sem LLM.
-    # CRÍTICO (15/09): extrai APENAS da ÚLTIMA msg do paciente — o blob do
-    # histórico pode ter horário de OFERTA ANTERIOR da IA (ex: "amanhã às 14h"
-    # sugerido lá no início), e o paciente pode ter mudado de ideia depois
-    # ("na verdade segunda às 10h30"). Pegar do blob daria horário errado.
-    regex_result = _extract_datetime_regex(patient_text or "")
+    # Se o paciente forneceu só a hora (ex: "ok, 10:30") ou só a data,
+    # usa a última mensagem do bot no histórico como fallback para compor data+hora.
+    last_bot_text = ""
+    if history:
+        for m in reversed(history or []):
+            if isinstance(m, dict) and m.get("sender") in ("assistant", "ai", "bot"):
+                last_bot_text = str(m.get("content") or "").strip()
+                break
+
+    regex_result = _extract_datetime_regex(patient_text or "", fallback_blob_for_date=last_bot_text)
     if regex_result:
         patient_name = tenant_cfg.get("patient_name") or "Paciente"
         doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
@@ -1703,12 +1725,7 @@ async def _extract_schedule_params(
             "source": "regex",
         }
     # 1b. ACORDO IMPLÍCITO — paciente ACABOU de concordar com oferta recente
-    #     do bot. Cobre o caso "OK tá agendado" após "9h do dia 18": a regex
-    #     primária só varre a última msg do paciente, então se essa msg não
-    #     tem horário explícito, recaimos na oferta do bot.
-    #     Não chama LLM — extrai direto da oferta.
-    #     Adicionado 16/09/2026 (msg 4805 — Isaías reportou bot enrolando
-    #     sem agendar mesmo após o paciente confirmar).
+    #     do bot ("ok", "sim", "tá agendado" sem hora/data na mensagem dele).
     agreed_result = _probe_agreed_offer(patient_text or "", history or [])
     if agreed_result:
         patient_name = tenant_cfg.get("patient_name") or "Paciente"
@@ -1868,33 +1885,14 @@ def _probe_agreed_offer(
     return _extract_datetime_regex(last_bot)
 
 
-def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
-    """Extrai (data, hora) de PT-BR e devolve dict com start/end ISO-8601 -03:00.
-
-    Suporta:
-      - "amanhã às 14h" / "amanhã às 14h00" / "amanhã 14h"
-      - "domingo 20/09 às 14h" / "domingo 20/09 às 14h00"
-      - "20/09 às 14h" / "20/09 14h"
-      - "quinta às 14h" / "quinta 14h"
-      - "próxima segunda 14h30"
-      - "às 14h de amanhã"
-      - "9 horas da manhã" / "9h da manhã"  (16/09)
-      - "dia 18" / "dia 18 que vem"  (16/09)
-
-    Retorna None se não achar padrão claro.
-    """
-    from datetime import date, datetime, timedelta
-    blob_l = blob.lower()
-    now = datetime.now()
+def _extract_date_from_text(blob: str, now: datetime | None = None) -> date | None:
+    """Extrai objeto date de expressões em PT-BR usando fuso da clínica (America/Fortaleza)."""
+    if now is None:
+        now = datetime.now(TZ_CLINICA)
     today_date = now.date()
+    blob_l = (blob or "").lower()
 
-    # === 1. Resolver DATA ===
-    target_date: date | None = None
-    weekday_map = {
-        "segunda": 0, "terça": 1, "terca": 1, "quarta": 2, "quinta": 3,
-        "sexta": 4, "sábado": 5, "sabado": 5, "domingo": 6,
-    }
-    # dd/mm (ex: "20/09")
+    # 1. dd/mm (ex: "20/09" ou "23/09/2026")
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", blob_l)
     if m:
         d, mo = int(m.group(1)), int(m.group(2))
@@ -1902,118 +1900,162 @@ def _extract_datetime_regex(blob: str) -> dict[str, str] | None:
         if y < 100:
             y += 2000
         try:
-            target_date = date(y, mo, d)
+            return date(y, mo, d)
         except ValueError:
-            target_date = None
-    # dd de <mês> por extenso (ex: "20 de setembro")
-    if not target_date:
-        meses = {
-            "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
-            "abril": 4, "maio": 5, "junho": 6, "julho": 7,
-            "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11,
-            "dezembro": 12,
-        }
-        m = re.search(r"\b(\d{1,2})\s+de\s+([a-zç]+)\b", blob_l)
-        if m and m.group(2) in meses:
-            try:
-                target_date = date(now.year, meses[m.group(2)], int(m.group(1)))
-            except ValueError:
-                target_date = None
-    # amanhã / hoje
-    if not target_date:
-        if "amanhã" in blob_l or "amanha" in blob_l:
-            target_date = today_date + timedelta(days=1)
-        elif "hoje" in blob_l:
-            target_date = today_date
-    # próxima semana + dia da semana
-    if not target_date:
-        for name, wd in weekday_map.items():
-            if name in blob_l:
-                days_ahead = (wd - today_date.weekday()) % 7
-                if days_ahead == 0:
-                    days_ahead = 7  # próxima semana
-                target_date = today_date + timedelta(days=days_ahead)
-                break
-    # só dia da semana (sem "próxima", assume próximo occurrence)
-    if not target_date:
+            pass
+
+    # 2. dd de <mês> por extenso (ex: "20 de setembro")
+    meses = {
+        "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
+        "abril": 4, "maio": 5, "junho": 6, "julho": 7,
+        "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11,
+        "dezembro": 12,
+    }
+    m = re.search(r"\b(\d{1,2})\s+de\s+([a-zç]+)\b", blob_l)
+    if m and m.group(2) in meses:
+        try:
+            return date(now.year, meses[m.group(2)], int(m.group(1)))
+        except ValueError:
+            pass
+
+    # 3. depois de amanhã / amanhã / hoje (testa "depois de amanhã" antes!)
+    if "depois de amanhã" in blob_l or "depois de amanha" in blob_l:
+        return today_date + timedelta(days=2)
+    elif "amanhã" in blob_l or "amanha" in blob_l:
+        return today_date + timedelta(days=1)
+    elif "hoje" in blob_l:
+        return today_date
+
+    # 4. dias da semana
+    weekday_map = {
+        "segunda": 0, "terça": 1, "terca": 1, "quarta": 2, "quinta": 3,
+        "sexta": 4, "sábado": 5, "sabado": 5, "domingo": 6,
+    }
+    if "próxima" in blob_l or "proxima" in blob_l:
         for name, wd in weekday_map.items():
             if name in blob_l:
                 days_ahead = (wd - today_date.weekday()) % 7
                 if days_ahead == 0:
                     days_ahead = 7
-                target_date = today_date + timedelta(days=days_ahead)
-                break
-    # "dia 18" / "dia 18 que vem" — dia do mês por extenso sem mês.
-    # Adicionado 16/09/2026 (msg 4805). Sem mês, inferência: "que vem" → próximo
-    # mês; sem "que vem" → mês atual se ainda não passou, próximo se já passou.
-    if not target_date:
-        m = re.search(r"\bdia\s+(\d{1,2})\b(?:\s+que\s+vem)?\b", blob_l)
-        if m:
-            d = int(m.group(1))
-            is_next = "que vem" in m.group(0)
-            try:
-                cand = date(now.year, now.month, d)
-                # Se já passou esse mês e não pediu "que vem", joga pro próximo.
-                if cand < today_date and not is_next:
-                    next_m = now.month + 1
-                    next_y = now.year + (1 if next_m > 12 else 0)
-                    next_m = ((next_m - 1) % 12) + 1
-                    cand = date(next_y, next_m, d)
-                elif is_next:
-                    # Forçou "que vem" → próximo mês independente do dia atual.
-                    if today_date.day <= d:
-                        next_m = now.month + 1
-                    else:
-                        next_m = now.month + 1
-                    next_y = now.year + (1 if next_m > 12 else 0)
-                    next_m = ((next_m - 1) % 12) + 1
-                    cand = date(next_y, next_m, d)
-                target_date = cand
-            except ValueError:
-                # Esse mês não tem esse dia (ex: dia 31 em fevereiro).
-                # Tenta próximo mês com rollover de ano.
-                next_m = now.month + 1
-                next_y = now.year + (1 if next_m > 12 else 0)
-                next_m = ((next_m - 1) % 12) + 1
-                try:
-                    target_date = date(next_y, next_m, d)
-                except ValueError:
-                    target_date = None
-    if not target_date:
-        return None
+                return today_date + timedelta(days=days_ahead)
 
-    # === 2. Resolver HORA ===
-    # "14h", "14h00", "14:00", "9 h", "às 14h", "9 horas" / "9 horas da manhã"
-    hour = None
-    minute = 0
-    m = re.search(r"(\d{1,2})\s*h\s*(\d{2})?\b", blob_l)
+    for name, wd in weekday_map.items():
+        if name in blob_l:
+            days_ahead = (wd - today_date.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            return today_date + timedelta(days=days_ahead)
+
+    # 5. "dia 18" / "dia 18 que vem"
+    m = re.search(r"\bdia\s+(\d{1,2})\b(?:\s+que\s+vem)?\b", blob_l)
+    if m:
+        d = int(m.group(1))
+        is_next = "que vem" in m.group(0)
+        try:
+            cand = date(now.year, now.month, d)
+            if cand < today_date and not is_next:
+                next_m = (now.month % 12) + 1
+                next_y = now.year + (1 if now.month == 12 else 0)
+                return date(next_y, next_m, d)
+            elif is_next:
+                next_m = (now.month % 12) + 1
+                next_y = now.year + (1 if now.month == 12 else 0)
+                return date(next_y, next_m, d)
+            return cand
+        except ValueError:
+            next_m = (now.month % 12) + 1
+            next_y = now.year + (1 if now.month == 12 else 0)
+            try:
+                return date(next_y, next_m, d)
+            except ValueError:
+                pass
+
+    return None
+
+
+def _extract_time_from_text(blob: str) -> tuple[int, int] | None:
+    """Extrai (hora, minuto) suportando 14h, 14h30, 14hs, 14hrs, 14h30min, 10:30, 09:00, etc."""
+    blob_l = (blob or "").lower()
+
+    # 1. 14h, 14h30, 14hs, 14hrs, 14h30min, 9h00, 09h00
+    m = re.search(r"\b(\d{1,2})\s*h(?:oras?|rs?|s)?\s*(\d{2})?(?:min)?\b", blob_l)
     if m:
         hour = int(m.group(1))
         minute = int(m.group(2)) if m.group(2) else 0
-    if hour is None:
-        # "9 horas" / "nove horas" / "9 horas da manhã"
-        m = re.search(r"\b(\d{1,2})\s+horas?\b", blob_l)
-        if m:
-            hour = int(m.group(1))
-            minute = 0
-            # "9 e meia" / "9 e meia da manhã" → minute = 30
-            if re.search(r"\d{1,2}\s+horas?\s+(?:e\s+meia|em\s+ponto)", blob_l):
-                minute = 30 if "meia" in blob_l else 0
-            # Adicionado 16/09/2026: "9 horas da manhã" / "9 horas da noite"
-            # → 9h é hora cheia (sem meia). Não muda nada — fica 9:00.
-    if hour is None:
-        m = re.search(r"\b(\d{1,2}):(\d{2})\b", blob_l)
-        if m:
-            hour, minute = int(m.group(1)), int(m.group(2))
-    if hour is None or not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return (hour, minute)
+
+    # 2. 10:30, 09:00, 14:30h, 14:30hs, as 09:00
+    m = re.search(r"\b(\d{1,2}):(\d{2})(?:\s*h(?:oras?|rs?|s)?)?\b", blob_l)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return (hour, minute)
+
+    # 3. 9 horas / 9 horas e meia / 9 horas da manhã
+    m = re.search(r"\b(\d{1,2})\s+horas?\b", blob_l)
+    if m:
+        hour = int(m.group(1))
+        minute = 30 if "meia" in blob_l else 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return (hour, minute)
+
+    return None
+
+
+def _extract_datetime_regex(
+    blob: str,
+    fallback_blob_for_date: str | None = None,
+) -> dict[str, str] | None:
+    """Extrai (data, hora) de PT-BR e devolve dict com start/end ISO-8601 -03:00.
+
+    Suporta data dividida: se o paciente mandar apenas a hora (ex: "ok, 10:30"),
+    busca a data na mensagem anterior da IA informada em fallback_blob_for_date.
+    """
+    now = datetime.now(TZ_CLINICA)
+
+    target_date = _extract_date_from_text(blob, now)
+    time_tuple = _extract_time_from_text(blob)
+
+    # Contexto de data dividida: paciente deu horário mas a data estava na oferta do bot
+    if target_date is None and fallback_blob_for_date:
+        target_date = _extract_date_from_text(fallback_blob_for_date, now)
+
+    # Paciente deu data mas horário estava na oferta do bot
+    if time_tuple is None and fallback_blob_for_date:
+        time_tuple = _extract_time_from_text(fallback_blob_for_date)
+
+    if not target_date or not time_tuple:
         return None
 
-    # === 3. Montar ISO-8601 -03:00 ===
+    hour, minute = time_tuple
     start = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
     end = start + timedelta(minutes=50)
     iso_start = start.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
     iso_end = end.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
     return {"start_datetime": iso_start, "end_datetime": iso_end}
+
+
+async def _update_lead_stage(lead_id: str, stage: str, **extra: Any) -> bool:
+    """Sincroniza o stage do lead no Supabase de forma imediata e resiliente."""
+    payload: dict[str, Any] = {"stage": stage, "last_interaction": _now_iso(), **extra}
+    try:
+        sb.table("leads").update(payload).eq("id", lead_id).execute()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Falha ao atualizar lead %s com payload %s: %s — tentando fallback apenas stage",
+            lead_id, payload, exc,
+        )
+        try:
+            sb.table("leads").update({
+                "stage": stage,
+                "last_interaction": _now_iso(),
+            }).eq("id", lead_id).execute()
+            return True
+        except Exception as exc2:
+            logger.error("Falha crítica ao atualizar stage do lead %s para %s: %s", lead_id, stage, exc2)
+            return False
 
 
 async def _maybe_create_calendar_event(
@@ -2024,7 +2066,7 @@ async def _maybe_create_calendar_event(
     history: list[dict[str, Any]],
     tenant_cfg: dict[str, Any],
     detected_stage: str | None,
-) -> None:
+) -> bool:
     """Plan B: detecta intent de agendamento e cria evento direto via MCP.
 
     Disparado depois que a IA já respondeu o paciente. Se a conversa tem
@@ -2045,13 +2087,13 @@ async def _maybe_create_calendar_event(
             instance, looks, detected_stage, (patient_text or "")[:80],
         )
         if not looks:
-            return
+            return False
         if not COMPOSIO_MCP_URL or not COMPOSIO_MCP_API_KEY:
             logger.warning(
                 "[%s] [CALENDAR] MCP não configurado, pulando criação automática",
                 instance,
             )
-            return
+            return False
 
         # Plan B ativado — log pra debug em tempo real (visível via journalctl
         # ou tail do crm-webhook-error.log).
@@ -2079,7 +2121,7 @@ async def _maybe_create_calendar_event(
                 "[%s] [CALENDAR] extrator devolveu should_schedule=false — paciente sem horário confirmado",
                 instance,
             )
-            return
+            return False
 
         start_iso = (extracted.get("start_datetime") or "").strip()
         end_iso = (extracted.get("end_datetime") or "").strip()
@@ -2093,14 +2135,14 @@ async def _maybe_create_calendar_event(
                 "[%s] [CALENDAR] params incompletos: start=%r end=%r summary=%r",
                 instance, start_iso, end_iso, summary,
             )
-            return
+            return False
         # Reforço do timezone — Natal é -03:00 fixo (não tem DST).
         if "-03:00" not in start_iso or "-03:00" not in end_iso:
             logger.warning(
                 "[%s] [CALENDAR] sem offset -03:00 (start=%r end=%r) — abortando",
                 instance, start_iso, end_iso,
             )
-            return
+            return False
 
         # 2. Chama Composio MCP direto (search → execute).
         tenant_user_id = (
@@ -2124,11 +2166,27 @@ async def _maybe_create_calendar_event(
                 instance,
             )
         except Exception as exc:
-            logger.warning(
-                "[%s] [CALENDAR] MCP search falhou: %s — abortando",
+            logger.error(
+                "[%s] [CALENDAR] MCP search falhou: %s — avisando paciente",
                 instance, exc,
             )
-            return
+            failure_msg = (
+                "Seu horário foi reservado com sucesso! Tivemos apenas uma demora técnica "
+                "ao gerar o link do Google Calendar, mas a recepção e o Dr. Matheus já "
+                "estão cientes e vão te enviar a confirmação em instantes por aqui. 👍"
+            )
+            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
+            try:
+                sb.table("messages").insert({
+                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
+                    "lead_id": lead["id"],
+                    "sender": "ai",
+                    "content": failure_msg,
+                    "created_at": _now_iso(),
+                }).execute()
+            except Exception:
+                pass
+            return False
 
         # 3. Executa GOOGLECALENDAR_CREATE_EVENT.
         #    Schema Composio: tools é array de {tool_slug, arguments}.
@@ -2157,24 +2215,14 @@ async def _maybe_create_calendar_event(
                 "COMPOSIO_MULTI_EXECUTE_TOOL", exec_args,
             )
         except Exception as exc:
-            logger.warning(
-                "[%s] [CALENDAR] MCP execute falhou: %s",
+            logger.error(
+                "[%s] [CALENDAR] MCP execute falhou: %s — avisando paciente",
                 instance, exc,
             )
-            return
-
-        # 4. Extrai htmlLink real da resposta (anti-alucinação).
-        html_link, event_id = _extract_event_link_from_mcp(exec_resp)
-        if not html_link:
-            logger.warning(
-                "[%s] [CALENDAR] MCP executou mas sem htmlLink na resposta: %s",
-                instance, str(exec_resp)[:500],
-            )
-            # Envia mensagem honesta ao paciente: failure de criação.
             failure_msg = (
-                "Tentei criar o evento no Google Calendar, mas a resposta veio "
-                "sem link de confirmação. Nossa equipe confirma o horário em "
-                "instantes. Posso ajudar em algo mais?"
+                "Seu horário foi reservado com sucesso! Tivemos uma oscilação na integração "
+                "com a agenda para gerar o link direto, mas já registrei seu agendamento "
+                "e nossa equipe entrará em contato em instantes para confirmar. 🙂"
             )
             await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
             try:
@@ -2187,7 +2235,33 @@ async def _maybe_create_calendar_event(
                 }).execute()
             except Exception:
                 pass
-            return
+            return False
+
+        # 4. Extrai htmlLink real da resposta (anti-alucinação).
+        html_link, event_id = _extract_event_link_from_mcp(exec_resp)
+        if not html_link:
+            logger.error(
+                "[%s] [CALENDAR] MCP executou mas sem htmlLink na resposta: %s",
+                instance, str(exec_resp)[:500],
+            )
+            # Envia mensagem honesta ao paciente: failure de criação.
+            failure_msg = (
+                "Seu horário foi anotado com sucesso! Tivemos apenas uma demora para "
+                "gerar o convite do Google Calendar. Nossa equipe confirma com você "
+                "em instantes por aqui. Posso ajudar em algo mais?"
+            )
+            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
+            try:
+                sb.table("messages").insert({
+                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
+                    "lead_id": lead["id"],
+                    "sender": "ai",
+                    "content": failure_msg,
+                    "created_at": _now_iso(),
+                }).execute()
+            except Exception:
+                pass
+            return False
 
         # 5. Sucesso! Envia follow-up WhatsApp com link REAL do Calendar.
         followup = (
@@ -2203,16 +2277,21 @@ async def _maybe_create_calendar_event(
             instance, send_ok.get("ok"), event_id, html_link[:80],
         )
 
-        # 6. Persiste event_id no lead (somente se a coluna existir — tolerância
-        #    ao deploy incremental; migração SQL roda depois pra adicionar).
-        try:
-            sb.table("leads").update({
-                "last_interaction": _now_iso(),
-            }).eq("id", lead["id"]).execute()
-        except Exception as exc:
-            logger.warning(
-                "[%s] [CALENDAR] falha ao atualizar last_interaction: %s",
-                instance, exc,
+        # 6. Sincronização Obrigatória de Stage:
+        #    Assim que o GOOGLECALENDAR_CREATE_EVENT retornar sucesso (htmlLink real),
+        #    force IMEDIATAMENTE a atualização do lead no Supabase para 'consulta_agendada'
+        #    e atualize appointment_schedule. O Kanban do Deskcomm move o card na hora.
+        synced = await _update_lead_stage(
+            lead["id"],
+            "consulta_agendada",
+            appointment_schedule=start_iso,
+        )
+        if synced:
+            lead["stage"] = "consulta_agendada"
+            lead["appointment_schedule"] = start_iso
+            logger.info(
+                "[%s] [CALENDAR] lead %s sincronizado com sucesso: stage=consulta_agendada, schedule=%s",
+                instance, lead["id"], start_iso,
             )
 
         # 7. Grava follow-up também em messages pra histórico ficar completo
@@ -2232,8 +2311,10 @@ async def _maybe_create_calendar_event(
             "[%s] [CALENDAR] ✅ evento criado event_id=%s link=%s",
             instance, event_id, html_link[:80],
         )
+        return True
     except Exception as exc:
         logger.exception("[%s] _maybe_create_calendar_event falhou: %s", instance, exc)
+        return False
 
 
 def _extract_event_link_from_mcp(exec_resp: Any) -> tuple[str | None, str | None]:
