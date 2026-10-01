@@ -9,7 +9,7 @@ export type PipelineStage =
 
 export type HandoffState = 'ia_ativa' | 'humano_assumiu';
 
-export type UserRole = 'super_admin' | 'clinic_admin' | 'attendant_doctor';
+export type UserRole = 'super_admin' | 'clinic_admin' | 'attendant_doctor' | 'admin';
 
 export type AiEngineMode = 'hermes_vps' | 'byok';
 

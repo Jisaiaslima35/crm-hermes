@@ -36,7 +36,7 @@ export interface AuthApi extends AuthState {
 // Na UI, equivale a "clinic_admin" (admin da clínica).
 function roleFromClaims(rawRole: string | undefined): UserRole {
   if (rawRole === 'super_admin') return 'super_admin';
-  if (rawRole === 'clinica' || rawRole === 'clinic_admin') return 'clinic_admin';
+  if (rawRole === 'clinica' || rawRole === 'clinic_admin' || rawRole === 'admin') return 'clinic_admin';
   if (rawRole === 'attendant_doctor') return 'attendant_doctor';
   // default seguro: clínica (visão enxuta). Evita cair em super_admin
   // caso o JWT venha sem claim.

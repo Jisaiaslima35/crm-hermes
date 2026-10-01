@@ -21,7 +21,7 @@ import * as remote from '../services/supabaseService';
 //   "5584991367962@s.whatsapp.net" → +55 84 99136-7962
 //   "5584991367962"               → +55 84 99136-7962
 //   "+55 84 99136-7962"           → idem (pass-through seguro)
-function formatBrazilPhone(raw?: string | null): string {
+export function formatBrazilPhone(raw?: string | null): string {
   if (!raw) return '—';
   const digits = raw.replace(/\D/g, '');
   if (digits.length === 0) return '—';
@@ -57,6 +57,7 @@ interface WhatsAppInstancesModalProps {
   activeTenant: Tenant;
   onUpdateTenant: (updatedTenant: Tenant) => void;
   onClose: () => void;
+  isInline?: boolean;
 }
 
 type QrStatus =
@@ -78,6 +79,7 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
   activeTenant,
   onUpdateTenant,
   onClose,
+  isInline = false,
 }) => {
   const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [qrStatus, setQrStatus] = useState<QrStatus>({ kind: 'idle' });
@@ -248,100 +250,87 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
     stopPolling();
     setQrStatus({ kind: 'loading' });
 
-    // FLUXO SEGURO: se a Evolution ainda reporta a sessão como `open`
-    // (ex.: troca de número oficial sem trocar de chip), precisamos
-    // desconectar antes para o Baileys não corromper a sessão.
     try {
-      const statusPayload = await remote.getInstanceStatus(sessionName);
-      const state = (statusPayload as { state?: string } | null)?.state;
-      if (state === 'open') {
-        const confirmed = window.confirm(
-          `A sessão "${sessionName}" ainda consta CONECTADA na Evolution.\n\n` +
-            'Para trocar de número com segurança, é necessário desconectar antes ' +
-            '(isso evita corrupção de sessão no Baileys). Continuar com logout + novo pareamento?'
-        );
-        if (!confirmed) {
-          setQrStatus({ kind: 'idle' });
-          return;
-        }
-        const logout = await remote.logoutInstance(sessionName);
-        if (!logout.ok) {
-          window.alert(
-            `Não consegui desconectar (HTTP ${logout.status ?? '??'}). Tente de novo.`
-          );
-          setQrStatus({ kind: 'idle' });
-          return;
-        }
-        // Limpa estado local para refletir o logout
-        setLinkedPhone(null);
+      // 1. Solicita pareamento com auto-provisioning e webhook automático
+      const result = await remote.requestPairingQrCode(
+        sessionName,
+        computedWebhookUrl,
+        false
+      );
+
+      // Se já estava conectada na Evolution
+      if (result.already_connected || result.state === 'open') {
+        const details = await remote.getInstanceDetails(sessionName);
+        const phoneDigits = pickPhoneDigits(details);
+        if (phoneDigits) setLinkedPhone(phoneDigits);
+
         const updated: Tenant = {
           ...activeTenant,
           whatsappInstance: {
             ...activeTenant.whatsappInstance,
-            status: 'disconnected',
-            phoneNumber: '',
+            status: 'connected',
+            phoneNumber: formatBrazilPhone(phoneDigits || activeTenant.whatsappInstance.phoneNumber),
+            lastSync: new Date().toLocaleString('pt-BR'),
           },
         };
         onUpdateTenant(updated);
+        setQrStatus({ kind: 'connected' });
+        window.setTimeout(() => onClose(), 1500);
+        return;
       }
+
+      const base64 = result.base64;
+      if (!base64) {
+        setQrStatus({
+          kind: 'error',
+          message:
+            'Evolution API não retornou QR Code. A instância pode estar reiniciando. Tente novamente em alguns segundos.',
+        });
+        return;
+      }
+
+      const src = base64.startsWith('data:image') ? base64 : `data:image/png;base64,${base64}`;
+      setQrStatus({ kind: 'waiting', base64: src, pairingCode: result.pairingCode });
+
+      // Inicia polling a cada 2.5s para detectar quando a secretária ler o QR Code
+      pollRef.current = window.setInterval(async () => {
+        try {
+          const st = await remote.getInstanceStatus(sessionName);
+          const state = (st as { state?: string } | null)?.state || 'unknown';
+          if (state === 'open') {
+            stopPolling();
+            setQrStatus({ kind: 'connected' });
+
+            // Busca os detalhes e o número oficial vinculado
+            const details = await remote.getInstanceDetails(sessionName);
+            const phoneDigits = pickPhoneDigits(details);
+            if (phoneDigits) setLinkedPhone(phoneDigits);
+
+            const updated: Tenant = {
+              ...activeTenant,
+              whatsappInstance: {
+                ...activeTenant.whatsappInstance,
+                status: 'connected',
+                phoneNumber: formatBrazilPhone(phoneDigits || activeTenant.whatsappInstance.phoneNumber),
+                lastSync: new Date().toLocaleString('pt-BR'),
+              },
+            };
+            onUpdateTenant(updated);
+
+            // Fecha o modal após 1.5s dando feedback visual verde
+            window.setTimeout(() => onClose(), 1500);
+          }
+        } catch {
+          // silencia — continua tentando
+        }
+      }, POLL_INTERVAL_MS);
     } catch (err) {
-      console.warn('[WhatsAppInstancesModal] pré-check de status falhou', err);
-      // segue o fluxo mesmo assim — algumas versões da Evolution não têm
-      // /connectionState e o `/connect` resolve sozinho.
-    }
-
-    // 1) Tenta /instance/connect (instância já existe)
-    let base64: string | undefined;
-    let pairingCode: string | undefined;
-    const connectResult = await remote.getInstanceConnect(sessionName);
-    if (connectResult?.base64) {
-      base64 = connectResult.base64;
-      pairingCode = connectResult.pairingCode;
-    } else {
-      // 2) Fallback: cria a instância (POST /instance/create já devolve QR)
-      const created = await remote.createEvolutionInstance(sessionName, {
-        webhookUrl: computedWebhookUrl,
-      });
-      const qr = created?.qrcode || created;
-      base64 = qr?.base64 || created?.base64;
-      pairingCode = qr?.pairingCode || created?.pairingCode;
-    }
-
-    if (!base64) {
+      console.error('[WhatsAppInstancesModal] Erro ao iniciar pareamento:', err);
       setQrStatus({
         kind: 'error',
-        message:
-          'Evolution API não retornou QR Code. Verifique se a instância existe e a apikey está correta.',
+        message: 'Falha na comunicação com o servidor de pareamento. Tente novamente.',
       });
-      return;
     }
-    const src = base64.startsWith('data:image') ? base64 : `data:image/png;base64,${base64}`;
-    setQrStatus({ kind: 'waiting', base64: src, pairingCode });
-
-    // Inicia polling a cada 3s para detectar conexão
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const st = await remote.getInstanceStatus(sessionName);
-        const state = (st as { state?: string } | null)?.state || 'unknown';
-        if (state === 'open') {
-          stopPolling();
-          setQrStatus({ kind: 'connected' });
-          const updated: Tenant = {
-            ...activeTenant,
-            whatsappInstance: {
-              ...activeTenant.whatsappInstance,
-              status: 'connected',
-              lastSync: new Date().toLocaleString('pt-BR'),
-            },
-          };
-          onUpdateTenant(updated);
-          // Fecha o modal após 1.5s pra dar feedback visual
-          window.setTimeout(() => onClose(), 1500);
-        }
-      } catch {
-        // silencia — continua tentando
-      }
-    }, POLL_INTERVAL_MS);
   };
 
   const handleCancelQr = () => {
@@ -427,10 +416,20 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div
+      className={
+        isInline
+          ? 'flex-1 overflow-y-auto p-4 md:p-6 bg-slate-950 flex flex-col items-center'
+          : 'fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4'
+      }
+    >
       <div
-        id="modal-whatsapp-instances"
-        className="w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in-50 zoom-in-95"
+        id={isInline ? 'view-whatsapp-instances' : 'modal-whatsapp-instances'}
+        className={
+          isInline
+            ? 'w-full max-w-3xl bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto'
+            : 'w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in-50 zoom-in-95'
+        }
       >
         {/* Header */}
         <div className="p-4 border-b border-slate-800 bg-slate-850 flex items-center justify-between">
@@ -447,12 +446,23 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
               </p>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2">
+            {isInline ? (
+              <button
+                onClick={onClose}
+                className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-750 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+              >
+                Voltar ao Kanban
+              </button>
+            ) : (
+              <button
+                onClick={onClose}
+                className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Body */}
@@ -677,12 +687,15 @@ export const WhatsAppInstancesModal: React.FC<WhatsAppInstancesModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-4 border-t border-slate-800 bg-slate-850 flex items-center justify-end">
+        <div className="p-4 border-t border-slate-800 bg-slate-850 flex items-center justify-between">
+          <span className="text-[11px] text-slate-400">
+            Instância vinculada exclusivamente a <strong>{activeTenant.name}</strong>
+          </span>
           <button
             onClick={onClose}
             className="px-5 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg transition-colors cursor-pointer"
           >
-            Fechar Painel
+            {isInline ? 'Voltar ao Kanban' : 'Fechar Painel'}
           </button>
         </div>
       </div>

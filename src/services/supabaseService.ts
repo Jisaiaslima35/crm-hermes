@@ -548,13 +548,69 @@ export interface EvolutionCreateResult {
   pairingCode?: string;
 }
 
+const crmWebhookBase =
+  (import.meta.env.VITE_CRM_WEBHOOK_URL as string | undefined) ||
+  'https://crm-webhook.automacaojs.us';
+
+export async function checkEvolutionInstanceExists(
+  instanceName: string
+): Promise<boolean> {
+  if (!evolutionBase || !evolutionKey) return false;
+  try {
+    const res = await fetch(`${evolutionBase}/instance/fetchInstances`, {
+      headers: { apikey: evolutionKey },
+    });
+    if (!res.ok) return false;
+    const list = (await res.json()) as Array<{ name?: string }>;
+    if (!Array.isArray(list)) return false;
+    return list.some((item) => item.name === instanceName);
+  } catch {
+    return false;
+  }
+}
+
+export async function setEvolutionWebhook(
+  instanceName: string,
+  webhookUrl: string
+): Promise<boolean> {
+  if (!evolutionBase || !evolutionKey) return false;
+  try {
+    const res = await fetch(
+      `${evolutionBase}/webhook/set/${encodeURIComponent(instanceName)}`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: evolutionKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          webhook: {
+            enabled: true,
+            url: webhookUrl,
+            headers: {
+              apikey: evolutionKey,
+            },
+            webhook_by_events: true,
+            webhookByEvents: true,
+            byEvents: true,
+            events: ['MESSAGES_UPSERT', 'CONNECTION_UPDATE'],
+          },
+        }),
+      }
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function getInstanceConnect(
   instanceName: string
 ): Promise<EvolutionConnectResult | null> {
   if (!evolutionBase || !evolutionKey) return null;
   try {
     const res = await fetch(
-      `${evolutionBase}/instance/connect/${instanceName}`,
+      `${evolutionBase}/instance/connect/${encodeURIComponent(instanceName)}`,
       { headers: { apikey: evolutionKey } }
     );
     if (!res.ok) return null;
@@ -583,7 +639,6 @@ export async function createEvolutionInstance(
   const integration = opts.integration ?? 'WHATSAPP-BAILEYS';
   const body: Record<string, unknown> = {
     instanceName,
-    token: '',
     qrcode: true,
     integration,
   };
@@ -597,34 +652,86 @@ export async function createEvolutionInstance(
     if (!res.ok) return null;
     const data = (await res.json()) as EvolutionCreateResult;
 
-    // Se o create já aceitou, configuramos o webhook em background.
-    if (data.instance?.instanceName && opts.webhookUrl) {
-      try {
-        await fetch(`${evolutionBase}/webhook/set/${instanceName}`, {
-          method: 'POST',
-          headers: { apikey: evolutionKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            webhook: {
-              enabled: true,
-              url: opts.webhookUrl,
-              webhookByEvents: false,
-              webhookBase64: false,
-              events: [
-                'MESSAGES_UPSERT',
-                'MESSAGES_UPDATE',
-                'CONNECTION_UPDATE',
-                'QRCODE_UPDATED',
-                'PRESENCE_UPDATE',
-              ],
-            },
-          }),
-        });
-      } catch {
-        // silencioso — webhook pode ser configurado depois
-      }
+    // Configuração Automática do Webhook após criação da instância
+    if (opts.webhookUrl) {
+      await setEvolutionWebhook(instanceName, opts.webhookUrl);
     }
     return data;
   } catch {
     return null;
   }
+}
+
+export async function requestPairingQrCode(
+  instanceName: string,
+  webhookUrl?: string,
+  forceLogout: boolean = false
+): Promise<{
+  base64?: string;
+  code?: string;
+  pairingCode?: string;
+  state?: string;
+  already_connected?: boolean;
+}> {
+  const targetWebhookUrl =
+    webhookUrl || `https://crm-webhook.automacaojs.us/webhook/evolution/${instanceName}`;
+
+  // 1. Tenta via proxy backend do CRM-Hermes (/api/whatsapp/pair/{instance})
+  try {
+    const proxyRes = await fetch(
+      `${crmWebhookBase}/api/whatsapp/pair/${encodeURIComponent(instanceName)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          force_logout: forceLogout,
+          webhook_url: targetWebhookUrl,
+        }),
+      }
+    );
+    if (proxyRes.ok) {
+      const pData = await proxyRes.json();
+      if (pData.base64 || pData.already_connected || pData.state === 'open') {
+        return pData;
+      }
+    }
+  } catch (proxyErr) {
+    console.warn('[supabaseService] Backend pair proxy indisponível, usando fallback direto', proxyErr);
+  }
+
+  // 2. Fallback direto no client com checagem de existência prévia (evita 404 em /connect)
+  const exists = await checkEvolutionInstanceExists(instanceName);
+
+  let base64: string | undefined;
+  let code: string | undefined;
+  let pairingCode: string | undefined;
+  let state = 'close';
+
+  if (!exists) {
+    // Auto-provisioning via create
+    const created = await createEvolutionInstance(instanceName, {
+      webhookUrl: targetWebhookUrl,
+    });
+    const qr = created?.qrcode || created;
+    base64 = (qr && 'base64' in qr ? qr.base64 : undefined) || created?.base64;
+    code = qr && 'code' in qr ? (qr.code as string | undefined) : undefined;
+    pairingCode = (qr && 'pairingCode' in qr ? qr.pairingCode : undefined) || created?.pairingCode;
+    state = 'connecting';
+  } else {
+    // Instância já existe: se forceLogout, desconecta antes
+    if (forceLogout) {
+      await logoutInstance(instanceName);
+    }
+    const connectResult = await getInstanceConnect(instanceName);
+    if (connectResult?.base64) {
+      base64 = connectResult.base64;
+      code = connectResult.code;
+      pairingCode = connectResult.pairingCode;
+      state = 'connecting';
+    }
+    // Garante webhook configurado
+    await setEvolutionWebhook(instanceName, targetWebhookUrl);
+  }
+
+  return { base64, code, pairingCode, state };
 }

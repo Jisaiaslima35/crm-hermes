@@ -64,7 +64,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClose,
 }) => {
   const isSuperAdmin = userRole === 'super_admin';
-  const isClinic = userRole === 'clinic_admin' || userRole === 'attendant_doctor';
+  const isClinic = userRole === 'clinic_admin' || userRole === 'admin' || userRole === 'attendant_doctor';
+  const canManageWhatsApp =
+    userRole === 'super_admin' ||
+    userRole === 'clinic_admin' ||
+    userRole === 'admin';
 
   return (
     <aside
@@ -228,11 +232,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
 
-          {/* === VISÃO TÉCNICA — só pro super_admin === */}
-          {isSuperAdmin && (
+          {/* === CONECTIVIDADE & WHATSAPP (Super Admin e Admin da Clínica) === */}
+          {canManageWhatsApp && (
             <>
               <div className="pt-2 px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                Conectividade & IA
+                {isSuperAdmin ? 'Conectividade & IA' : 'Conectividade'}
               </div>
 
               <button
@@ -246,14 +250,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
               >
                 <div className="flex items-center gap-2.5">
                   <QrCode className="w-4 h-4" />
-                  <span>Instâncias WhatsApp</span>
+                  <span>{isSuperAdmin ? 'Instâncias WhatsApp' : 'Conexão WhatsApp'}</span>
                 </div>
                 <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-semibold">
                   <Wifi className="w-3 h-3" />
                   Evolution
                 </span>
               </button>
+            </>
+          )}
 
+          {/* === VISÃO TÉCNICA — só pro super_admin === */}
+          {isSuperAdmin && (
+            <>
               <button
                 id="nav-ai-settings"
                 onClick={() => setCurrentView('ai_settings')}
@@ -320,13 +329,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-sky-400">
-              {userRole === 'super_admin' ? 'SA' : userRole === 'clinic_admin' ? 'AD' : 'OP'}
+              {userRole === 'super_admin'
+                ? 'SA'
+                : userRole === 'clinic_admin' || userRole === 'admin'
+                ? 'AD'
+                : 'OP'}
             </div>
             <div className="min-w-0">
               <p className="text-xs font-medium text-slate-200 truncate">
                 {userRole === 'super_admin'
                   ? 'Super Admin (SaaS)'
-                  : userRole === 'clinic_admin'
+                  : userRole === 'clinic_admin' || userRole === 'admin'
                   ? 'Admin da Clínica'
                   : 'Atendente / Médico'}
               </p>

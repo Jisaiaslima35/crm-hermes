@@ -7,7 +7,7 @@ import { SilenceRadarView } from './components/SilenceRadarView';
 import { LeadsListView } from './components/LeadsListView';
 import { SuperAdminDashboard } from './components/SuperAdminDashboard';
 import { AiEngineSettingsModal } from './components/AiEngineSettingsModal';
-import { WhatsAppInstancesModal } from './components/WhatsAppInstancesModal';
+import { WhatsAppInstancesModal, formatBrazilPhone } from './components/WhatsAppInstancesModal';
 import { NewLeadModal } from './components/NewLeadModal';
 import { NewTenantModal } from './components/NewTenantModal';
 import { LiveKanban } from './components/LiveKanban';
@@ -120,10 +120,10 @@ function AppInner() {
   const [toast, setToast] = useState<{
     id: number;
     message: string;
-    type: 'success' | 'warning' | 'info';
+    type: 'success' | 'warning' | 'info' | 'error';
   } | null>(null);
 
-  const showToast = (message: string, type: 'success' | 'warning' | 'info' = 'info') => {
+  const showToast = (message: string, type: 'success' | 'warning' | 'info' | 'error' = 'info') => {
     const id = Date.now();
     setToast({ id, message, type });
     setTimeout(() => {
@@ -144,10 +144,25 @@ function AppInner() {
         liveStore.setTenants(ts);
 
         // RBAC: clínica só vê o próprio tenant. Super admin vê todos.
-        const visibleTenants =
-          userRole === 'super_admin'
-            ? ts
-            : ts.filter((t) => t.id === authTenantId);
+        let visibleTenants = ts;
+        if (userRole !== 'super_admin') {
+          if (authTenantId) {
+            const matched = ts.filter(
+              (t) =>
+                t.id === authTenantId ||
+                (authTenantId.includes('matheus') && t.name.toLowerCase().includes('matheus'))
+            );
+            visibleTenants =
+              matched.length > 0
+                ? matched
+                : ts.filter((t) => t.name.toLowerCase().includes('matheus'));
+          } else {
+            visibleTenants = ts.filter((t) => t.name.toLowerCase().includes('matheus'));
+          }
+          if (visibleTenants.length === 0 && ts.length > 0) {
+            visibleTenants = [ts[0]];
+          }
+        }
 
         setTenants(visibleTenants);
         if (visibleTenants[0]) setActiveTenantId(visibleTenants[0].id);
@@ -279,6 +294,56 @@ function AppInner() {
 
   const activeTenant =
     tenants.find((t) => t.id === activeTenantId) || tenants[0];
+
+  // Sincroniza em background o status e número do WhatsApp do tenant ativo com a Evolution API
+  useEffect(() => {
+    const sessionName = activeTenant?.whatsappInstance?.sessionName;
+    if (!sessionName) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const [statusPayload, details] = await Promise.all([
+          remote.getInstanceStatus(sessionName),
+          remote.getInstanceDetails(sessionName),
+        ]);
+        if (cancelled) return;
+
+        const stateRaw =
+          (statusPayload as { state?: string } | null)?.state ||
+          details?.connectionStatus ||
+          'unknown';
+        const isOpen = stateRaw === 'open';
+        const newStatus = isOpen ? 'connected' : 'disconnected';
+        const ownerPhone = details?.ownerJid || details?.number;
+
+        if (
+          newStatus !== activeTenant.whatsappInstance.status ||
+          (ownerPhone && formatBrazilPhone(ownerPhone) !== activeTenant.whatsappInstance.phoneNumber)
+        ) {
+          const updated: Tenant = {
+            ...activeTenant,
+            whatsappInstance: {
+              ...activeTenant.whatsappInstance,
+              status: newStatus,
+              phoneNumber: ownerPhone
+                ? formatBrazilPhone(ownerPhone)
+                : activeTenant.whatsappInstance.phoneNumber,
+              lastSync: new Date().toLocaleString('pt-BR'),
+            },
+          };
+          deskcommService.updateTenant(updated);
+          setTenants((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+        }
+      } catch (err) {
+        console.warn('[App] Sincronização em background do WhatsApp falhou:', err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTenant?.id, activeTenant?.whatsappInstance?.sessionName]);
 
   // Handler: Switch Tenant
   const handleSelectTenant = (tenantId: string) => {
@@ -432,6 +497,12 @@ function AppInner() {
     showToast(`Configurações de IA da clínica salvas com sucesso!`, 'success');
   };
 
+  // Handler: Save Tenant Config from WhatsApp modal/view (sem toast de IA)
+  const handleUpdateWhatsAppTenant = useCallback((updatedTenant: Tenant) => {
+    const saved = deskcommService.updateTenant(updatedTenant);
+    setTenants((prev) => prev.map((t) => (t.id === saved.id ? saved : t)));
+  }, []);
+
   // Handler: Create New Lead
   const handleCreateLead = async (leadData: Partial<Lead>) => {
     try {
@@ -489,7 +560,9 @@ function AppInner() {
       {/* Toast Notification */}
       {toast && (
         <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-slate-900/95 border border-slate-700 shadow-2xl text-xs text-white animate-in slide-in-from-bottom-3 duration-200">
-          {toast.type === 'warning' ? (
+          {toast.type === 'error' ? (
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          ) : toast.type === 'warning' ? (
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
           ) : toast.type === 'success' ? (
             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -599,26 +672,12 @@ function AppInner() {
           )}
 
           {currentView === 'whatsapp' && (
-            <div className="flex-1 flex items-center justify-center p-6">
-              <div className="max-w-xl text-center space-y-4">
-                <div className="w-16 h-16 rounded-2xl bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center mx-auto">
-                  <Bot className="w-8 h-8 text-emerald-400" />
-                </div>
-                <h2 className="text-xl font-bold text-white">
-                  Instância WhatsApp Evolution API
-                </h2>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Gerenciador da sessão ativa da clínica <strong>{activeTenant.name}</strong>.
-                  Abra o painel com QR Code, teste o webhook e veja o status da bateria.
-                </p>
-                <button
-                  onClick={() => setShowWhatsappModal(true)}
-                  className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl shadow-lg transition-colors cursor-pointer"
-                >
-                  Abrir Gerenciador de Instância WhatsApp & QR Code
-                </button>
-              </div>
-            </div>
+            <WhatsAppInstancesModal
+              activeTenant={activeTenant}
+              onUpdateTenant={handleUpdateWhatsAppTenant}
+              onClose={() => setCurrentView('kanban')}
+              isInline={true}
+            />
           )}
 
           {currentView === 'ai_settings' && (
@@ -674,7 +733,7 @@ function AppInner() {
       {showWhatsappModal && (
         <WhatsAppInstancesModal
           activeTenant={activeTenant}
-          onUpdateTenant={handleSaveTenant}
+          onUpdateTenant={handleUpdateWhatsAppTenant}
           onClose={() => setShowWhatsappModal(false)}
         />
       )}

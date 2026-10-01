@@ -56,6 +56,13 @@ export const Topbar: React.FC<TopbarProps> = ({
   onToggleAiAutoReply,
 }) => {
   const isSuperAdmin = userRole === 'super_admin';
+  const canManageWhatsApp =
+    userRole === 'super_admin' ||
+    userRole === 'clinic_admin' ||
+    userRole === 'admin';
+  const instanceStatus = activeTenant.whatsappInstance?.status;
+  const isConnected = instanceStatus === 'connected';
+  const isReconnecting = instanceStatus === 'reconnecting';
   const aiEnabled = activeTenant.aiAutoReplyEnabled;
 
   return (
@@ -230,25 +237,61 @@ export const Topbar: React.FC<TopbarProps> = ({
           </button>
         )}
 
-        {/* WhatsApp Instance Status Badge (SÓ super_admin) — mobile: só bolinha animada */}
-        {isSuperAdmin && (
+        {/* WhatsApp Instance Status Badge (Super Admin e Admin da Clínica) */}
+        {canManageWhatsApp && (
           <button
             id="btn-topbar-whatsapp"
             onClick={onOpenWhatsappModal}
-            className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-2.5 py-1.5 rounded-lg bg-slate-800/90 hover:bg-slate-800 border border-slate-700/80 text-xs text-slate-200 transition-all cursor-pointer shrink-0"
-            title="Clique para gerenciar a instância WhatsApp / QR Code"
+            className={`flex items-center gap-1.5 sm:gap-2 px-2 sm:px-2.5 py-1.5 rounded-lg border text-xs transition-all cursor-pointer shrink-0 ${
+              isConnected
+                ? 'bg-slate-800/90 hover:bg-slate-800 border-slate-700/80 text-slate-200'
+                : isReconnecting
+                ? 'bg-amber-950/40 hover:bg-amber-950/60 border-amber-600/50 text-amber-200'
+                : 'bg-rose-950/40 hover:bg-rose-950/60 border-rose-600/50 text-rose-200'
+            }`}
+            title={
+              isConnected
+                ? `WhatsApp Conectado (${activeTenant.whatsappInstance.sessionName}) — Clique para gerenciar ou ver QR Code`
+                : isReconnecting
+                ? `WhatsApp Reconectando (${activeTenant.whatsappInstance.sessionName}) — Clique para abrir o painel`
+                : `WhatsApp Desconectado (${activeTenant.whatsappInstance.sessionName}) — Clique para escanear o QR Code`
+            }
           >
             <span className="relative flex h-2.5 w-2.5 shrink-0">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+              {isConnected && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+                  isConnected
+                    ? 'bg-emerald-500'
+                    : isReconnecting
+                    ? 'bg-amber-500'
+                    : 'bg-rose-500'
+                }`}
+              />
             </span>
-            <Wifi className="w-3.5 h-3.5 text-emerald-400 shrink-0 hidden sm:inline" />
+            <Wifi
+              className={`w-3.5 h-3.5 shrink-0 hidden sm:inline ${
+                isConnected
+                  ? 'text-emerald-400'
+                  : isReconnecting
+                  ? 'text-amber-400'
+                  : 'text-rose-400'
+              }`}
+            />
             <span className="font-semibold text-[11px] hidden sm:inline">
-              WhatsApp Online
+              {isConnected
+                ? 'WhatsApp Online'
+                : isReconnecting
+                ? 'Reconectando...'
+                : 'WhatsApp Desconectado'}
             </span>
-            <span className="text-[10px] px-1 py-0.5 rounded bg-emerald-950/80 text-emerald-300 font-mono hidden lg:inline">
-              {activeTenant.whatsappInstance.batteryLevel}%
-            </span>
+            {activeTenant.whatsappInstance?.batteryLevel > 0 && (
+              <span className="text-[10px] px-1 py-0.5 rounded bg-emerald-950/80 text-emerald-300 font-mono hidden lg:inline">
+                {activeTenant.whatsappInstance.batteryLevel}%
+              </span>
+            )}
           </button>
         )}
 
