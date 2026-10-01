@@ -12,3 +12,14 @@ __pycache__/
 *.bak
 *.bak-*
 webhook_server.py.bak-*
+# Mídia temporária (Whisper WAV cru, downloads Evolution, previews)
+*.wav
+*.raw
+*.mp3
+*.mp4
+*.oga
+*.ogg
+/tmp_*.py
+# Logs de aplicação (não versionar)
+logs/
+*.pid

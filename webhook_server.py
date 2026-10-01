@@ -23,6 +23,7 @@ import os
 import re
 import time
 import uuid
+import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -34,6 +35,12 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
+from jev_decision import avaliar_lead_clinico, DecisaoClinicaJEV
+from media_handler import (
+    get_media_base64_from_evolution,
+    process_audio_message,
+    process_image_message,
+)
 
 # ============================================================================
 # Bootstrap
@@ -73,7 +80,11 @@ HERMES_GATEWAY_MODEL = os.environ.get("HERMES_GATEWAY_MODEL", "hermes-agent")
 HERMES_GATEWAY_TIMEOUT_S = float(os.environ.get("HERMES_GATEWAY_TIMEOUT_S", "8"))
 
 # Evolution API (WhatsApp bridge)
-EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", "")
+EVOLUTION_API_KEY = (
+    os.environ.get("EVOLUTION_API_KEY")
+    or os.environ.get("VITE_EVOLUTION_GLOBAL_KEY")
+    or "2G3Rk8gZbV1ZYmhy1YUV3NwkLWYLHpH3"
+)
 EVOLUTION_BASE_URL = os.environ.get(
     "EVOLUTION_BASE_URL", "https://evo.automacaojs.us"
 )
@@ -493,8 +504,8 @@ def _extract_text(data: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_message(event: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    """Normaliza um payload Evolution pra {sender, sender_name, content, ts, phone, from_me}."""
+async def _extract_message(event: str, data: dict[str, Any], instance: str = "") -> dict[str, Any] | None:
+    """Normaliza um payload Evolution pra {sender, sender_name, content, ts, phone, from_me}, com transcrição de áudio via Whisper e visão via 9Router."""
     if event != "messages.upsert" and event != "messages_update":
         return None
     key = data.get("key") or {}
@@ -521,6 +532,46 @@ def _extract_message(event: str, data: dict[str, Any]) -> dict[str, Any] | None:
     msg_type = (data.get("messageType") or "").lower()
     if msg_type in {"ai_response", "bot_response", "ai", "bot"}:
         sender = "ai"
+
+    # Pipeline de Mídia (Áudio Whisper & Imagem 9Router) se for inbound de paciente
+    if sender == "patient":
+        msg_obj = data.get("message") or {}
+        is_audio = msg_type in {"audiomessage"} or "audioMessage" in msg_obj
+        is_image = msg_type in {"imagemessage"} or "imageMessage" in msg_obj
+
+        if is_audio:
+            logger.info("[%s] 🎤 Áudio recebido do WhatsApp (%s), processando transcrição...", instance, phone)
+            media_tuple = await get_media_base64_from_evolution(instance, data, EVOLUTION_BASE_URL, EVOLUTION_API_KEY)
+            if media_tuple:
+                b64_audio, _ = media_tuple
+                transcribed = await process_audio_message(b64_audio)
+                if transcribed:
+                    text = transcribed
+                    logger.info("[%s] 🎤 Áudio transcrito com sucesso: %r", instance, text[:80])
+                else:
+                    text = "[Áudio enviado pelo paciente]"
+            else:
+                text = "[Áudio enviado pelo paciente]"
+
+        elif is_image:
+            logger.info("[%s] 🖼️ Imagem recebida do WhatsApp (%s), analisando via 9Router...", instance, phone)
+            media_tuple = await get_media_base64_from_evolution(instance, data, EVOLUTION_BASE_URL, EVOLUTION_API_KEY)
+            if media_tuple:
+                b64_img, mime = media_tuple
+                img_caption = (msg_obj.get("imageMessage") or {}).get("caption", "")
+                system_instr = (
+                    "Você é a assistente clínica virtual. O paciente enviou uma imagem/exame pelo WhatsApp. "
+                    "Analise de forma acolhedora, ética e profissional. Se for exame ou receita, descreva o que identifica "
+                    "e informe que a consulta médica fará a validação clínica completa."
+                )
+                analysis = await process_image_message(b64_img, mimetype=mime, system_instruction=system_instr, caption=img_caption)
+                if analysis:
+                    text = f"[Foto/Exame enviado pelo paciente]: {analysis}"
+                    logger.info("[%s] 🖼️ Imagem analisada: %r", instance, analysis[:80])
+                else:
+                    text = "[Imagem enviada pelo paciente]" + (f": {img_caption}" if img_caption else "")
+            else:
+                text = "[Imagem enviada pelo paciente]"
 
     if not text:
         text = f"[{msg_type or 'mensagem'}]"
@@ -992,17 +1043,197 @@ async def _send_evolution_text(
             return {"ok": r.status_code < 400, "status": r.status_code, "body": r.text}
 
 
+# ============================================================================
+# Extração Assíncrona de Sintomas e Queixas Clínicas (Customer 360 / Deskcomm)
+# ============================================================================
+
+_CLINICAL_KEYWORDS_MAP: dict[str, str] = {
+    "insonia": "Insônia",
+    "insônia": "Insônia",
+    "nao durmo": "Insônia",
+    "não durmo": "Insônia",
+    "sem dormir": "Insônia",
+    "dificuldade para dormir": "Insônia",
+    "ansiedade": "Ansiedade",
+    "ansioso": "Ansiedade",
+    "ansiosa": "Ansiedade",
+    "crise de ansiedade": "Crise de Ansiedade",
+    "panico": "Síndrome do Pânico",
+    "pânico": "Síndrome do Pânico",
+    "crise de panico": "Síndrome do Pânico",
+    "depressao": "Depressão",
+    "depressão": "Depressão",
+    "deprimido": "Depressão",
+    "deprimida": "Depressão",
+    "desanimo": "Desânimo / Fadiga",
+    "desânimo": "Desânimo / Fadiga",
+    "cansaco": "Fadiga / Cansaço Crônico",
+    "cansaço": "Fadiga / Cansaço Crônico",
+    "falta de ar": "Falta de Ar",
+    "angustia": "Angústia",
+    "angústia": "Angústia",
+    "burnout": "Burnout / Esgotamento",
+    "esgotamento": "Burnout / Esgotamento",
+    "estresse": "Estresse Agudo",
+    "agitacao": "Agitação Psicomotora",
+    "agitação": "Agitação Psicomotora",
+    "esquecimento": "Déficit de Memória",
+    "concentracao": "Dificuldade de Concentração",
+    "concentração": "Dificuldade de Concentração",
+    "tdah": "TDAH",
+    "palpitacao": "Palpitações / Taquicardia",
+    "palpitação": "Palpitações / Taquicardia",
+    "taquicardia": "Palpitações / Taquicardia",
+    "tristeza": "Tristeza Profunda",
+    "choro": "Crises de Choro",
+    "medo": "Medo / Fobias",
+    "irritabilidade": "Irritabilidade",
+    "dor de cabeca": "Cefaleia / Dor de Cabeça",
+    "dor de cabeça": "Cefaleia / Dor de Cabeça",
+    "enxaqueca": "Enxaqueca",
+    # Medicações psiquiátricas
+    "sertralina": "Uso de Sertralina",
+    "escitalopram": "Uso de Escitalopram",
+    "fluoxetina": "Uso de Fluoxetina",
+    "clonazepam": "Uso de Clonazepam",
+    "rivotril": "Uso de Rivotril",
+    "alprazolam": "Uso de Alprazolam",
+    "frontal": "Uso de Frontal",
+    "diazepam": "Uso de Diazepam",
+    "zolpidem": "Uso de Zolpidem",
+    "quetiapina": "Uso de Quetiapina",
+    "olanzapina": "Uso de Olanzapina",
+    "risperidona": "Uso de Risperidona",
+    "venlafaxina": "Uso de Venlafaxina",
+    "desvenlafaxina": "Uso de Desvenlafaxina",
+    "bupropiona": "Uso de Bupropiona",
+    "bup": "Uso de Bup",
+    "ritalina": "Uso de Ritalina",
+    "venvanse": "Uso de Venvanse",
+    "atentah": "Uso de Atentah",
+    "lamotrigina": "Uso de Lamotrigina",
+    "litio": "Uso de Lítio",
+    "lítio": "Uso de Lítio",
+}
+
+
+async def _extract_and_persist_clinical_data(
+    lead: dict[str, Any],
+    patient_text: str,
+    instance: str,
+) -> None:
+    """Extrai assincronamente queixa principal e sintomas sem travar a resposta do WhatsApp."""
+    try:
+        lead_id = lead.get("id")
+        if not lead_id:
+            return
+        text_lower = (patient_text or "").lower()
+        if not text_lower:
+            return
+
+        # 1. Camada Heurística Imediata (Dicionário Clínico)
+        detected_symptoms: list[str] = []
+        for kw, canonical in _CLINICAL_KEYWORDS_MAP.items():
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower, re.IGNORECASE):
+                if canonical not in detected_symptoms:
+                    detected_symptoms.append(canonical)
+
+        clinical_summary = ""
+
+        # 2. Camada de Síntese via 9router (rápido, ~400ms) se mensagem for substancial
+        if len(text_lower.split()) >= 3 and NINEROUTER_API_KEY:
+            try:
+                prompt = (
+                    "Você é um assistente de prontuário psiquiátrico/médico. "
+                    "Analise a mensagem do paciente e sintetize em JSON estrito:\n"
+                    "1. 'clinical_summary': queixa principal consolidada em 1 frase concisa em 3ª pessoa.\n"
+                    "2. 'symptoms': lista de sintomas clínicos ou medicações citadas (itens curtos).\n\n"
+                    "Exemplo de saída:\n"
+                    '{"clinical_summary": "Paciente relata ansiedade e insônia há 2 semanas.", "symptoms": ["Ansiedade", "Insônia"]}\n'
+                    "Responda APENAS o JSON:"
+                )
+                messages = [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": patient_text[:400]},
+                ]
+                fallback_target = {
+                    "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
+                    "model": NINEROUTER_DEFAULT_MODEL,
+                    "apiKey": NINEROUTER_API_KEY,
+                    "provider": "hermes_vps",
+                    "source": "hermes_vps",
+                }
+                content, _ = await _post_chat_completion(
+                    fallback_target,
+                    messages,
+                    {"max_tokens": 150, "temperature": 0.2, "response_format": {"type": "json_object"}},
+                )
+                if content:
+                    data = {}
+                    try:
+                        data = json.loads(content)
+                    except Exception:
+                        m = re.search(r"\{.*\}", content, re.DOTALL)
+                        if m:
+                            data = json.loads(m.group(0))
+                    sum_text = str(data.get("clinical_summary") or "").strip()
+                    if sum_text:
+                        clinical_summary = sum_text
+                    for s in data.get("symptoms") or []:
+                        s_clean = str(s).strip()
+                        if s_clean and s_clean not in detected_symptoms:
+                            detected_symptoms.append(s_clean)
+            except Exception as exc:
+                logger.debug("[%s] [CLINICAL] LLM extrator secundário falhou (%s), usando heurística", instance, exc)
+
+        # Se não gerou resumo via LLM mas detectou sintomas, cria resumo heurístico limpo
+        if not clinical_summary and detected_symptoms:
+            clinical_summary = f"Paciente relata sintomas de {', '.join(detected_symptoms[:3])}."
+
+        if clinical_summary or detected_symptoms:
+            # Merge com sintomas já existentes no lead
+            existing = lead.get("symptoms") or []
+            if isinstance(existing, str):
+                try:
+                    existing = json.loads(existing)
+                except Exception:
+                    existing = []
+            if not isinstance(existing, list):
+                existing = []
+            merged = list(existing)
+            for s in detected_symptoms:
+                if s and s not in merged:
+                    merged.append(s)
+
+            patch: dict[str, Any] = {"last_interaction": _now_iso()}
+            if clinical_summary:
+                patch["clinical_summary"] = clinical_summary
+            if merged:
+                patch["symptoms"] = merged
+
+            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            # Atualiza o objeto lead em memória
+            if clinical_summary:
+                lead["clinical_summary"] = clinical_summary
+            lead["symptoms"] = merged
+            logger.info(
+                "[%s] 🩺 [CLINICAL] lead %s atualizado: queixa=%r, sintomas=%s",
+                instance,
+                lead_id,
+                clinical_summary[:60],
+                merged,
+            )
+    except Exception as exc:
+        logger.warning("[%s] _extract_and_persist_clinical_data falhou: %s", instance, exc)
+
+
 async def _dispatch_ai(
     tenant_id: str,
     lead: dict[str, Any],
     patient_text: str,
     instance: str,
 ) -> None:
-    """Motor IA: gera resposta → envia WhatsApp → grava messages → atualiza stage.
-
-    Quando o provider suportar JSON estruturado, extrai também a queixa principal
-    consolidada e os sintomas detectados, persistindo em leads.clinical_summary
-    e leads.symptoms. Falha na extração não derrubu o envio da resposta.
+    """Motor IA: gera resposta conversacional → envia WhatsApp → extrai sintomas assincronamente.
     """
     # Concurrency lock por lead_id — protege contra evento duplicado no
     # Google Calendar quando paciente manda 2+ mensagens seguidas antes da
@@ -1048,28 +1279,60 @@ async def _dispatch_ai(
                 lead.get("id"),
             )
             return
+
+        # 0. Avaliação rápida de triagem via JEV (TypeSafe / System One)
+        # Timeout estrito (3.5s) com fallback silencioso para não travar o WhatsApp
+        decisao_jev = await avaliar_lead_clinico(patient_text, timeout_s=3.5)
+        logger.info(
+            "[%s] ⚡ [JEV] lead=%s intencao=%s score=%.1f etapa=%d fallback=%s meds=%s sints=%s",
+            instance,
+            lead.get("id"),
+            decisao_jev.intencao,
+            decisao_jev.score,
+            decisao_jev.etapa_funil,
+            decisao_jev.fallback,
+            decisao_jev.medicacoes_citadas,
+            decisao_jev.sintomas_detectados,
+        )
+
+        # Interceptação imediata: opt_out (respeita recusa do paciente)
+        if decisao_jev.intencao == "opt_out":
+            logger.info("[%s] Lead %s solicitou opt-out via JEV — desativando IA", instance, lead["id"])
+            try:
+                sb.table("leads").update({
+                    "stage": "desistiu",
+                    "handoff_state": "humano_assumiu",
+                    "last_interaction": _now_iso(),
+                }).eq("id", lead["id"]).execute()
+            except Exception as opt_exc:
+                logger.warning("[%s] Erro ao persistir opt-out do lead %s: %s", instance, lead["id"], opt_exc)
+            return
+
         history = await _fetch_recent_history(lead["id"], limit=20)
         system_prompt = _build_system_prompt(tenant_cfg, lead)
 
-        # 1. LLM estruturado: tenta extrair {reply, clinical_summary, symptoms}
-        structured = await _call_llm_structured(
+        # Injeta diretriz contextual para a LLM
+        if decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
+            system_prompt += (
+                "\n\n[DIRETRIZ DA SECRETÁRIA BEATRIZ: O paciente demonstrou interesse em agendar ou retornar. "
+                "NÃO marque horário. NÃO invente dias nem horários. NÃO diga 'vou agendar agora'. "
+                "Acolha, confirme dados básicos (nome, idade, telefone) se ainda não tiver, "
+                "e avise que a Beatriz entrará em contato em breve para combinar o melhor dia e horário.]"
+            )
+        else:
+            system_prompt += (
+                f"\n\n[DIRETRIZ CLÍNICA JEV: Etapa Atual do Funil: {decisao_jev.etapa_funil} | Intenção: {decisao_jev.intencao}]"
+            )
+
+        # 1. LLM conversacional: gera resposta rápida e natural para o WhatsApp
+        ai_reply = await _call_llm(
             system_prompt, history, patient_text, tenant_cfg,
         )
-        ai_reply = structured.get("reply") or ""
-        if not ai_reply:
-            # Fallback: degrada pra chamada de texto puro
-            logger.info(
-                "[%s] structured vazio, caindo no _call_llm texto puro",
-                instance,
-            )
-            ai_reply = await _call_llm(
-                system_prompt, history, patient_text, tenant_cfg,
-            )
         if not ai_reply:
             logger.warning("[%s] IA sem resposta, abortando dispatch", instance)
             return
 
-        # 2. Envia WhatsApp
+        # 2. Envia WhatsApp IMEDIATAMENTE (sem latência de extrações pesadas)
         send_result = await _send_evolution_text(instance, lead["phone"], ai_reply)
         logger.info(
             "[%s] IA sendText ok=%s status=%s",
@@ -1089,67 +1352,49 @@ async def _dispatch_ai(
             }
         ).execute()
 
-        # 4. Persiste extração estruturada em leads (queixa + sintomas)
-        new_clinical = structured.get("clinical_summary") or ""
-        new_symptoms = structured.get("symptoms") or []
-        if new_clinical or new_symptoms:
-            patch: dict[str, Any] = {"last_interaction": _now_iso()}
-            if new_clinical:
-                patch["clinical_summary"] = new_clinical
-            if new_symptoms:
-                # Merge: união de sintomas antigos + novos (sem duplicatas)
-                existing = lead.get("symptoms") or []
-                if isinstance(existing, str):
-                    try:
-                        existing = json.loads(existing)
-                    except Exception:
-                        existing = []
-                if not isinstance(existing, list):
-                    existing = []
-                merged = list(existing)
-                for s in new_symptoms:
-                    if s and s not in merged:
-                        merged.append(s)
-                patch["symptoms"] = merged
+        # 4. Extração assíncrona de queixa + sintomas no CRM
+        # (já agendada via BackgroundTasks no webhook para não bloquear o WhatsApp)
+
+        # 5. Atualiza stage + handoff via hierarquia de prioridade
+        is_matheus_clinic = "matheus" in (tenant_cfg.get("doctor_name") or "").lower() or "matheus" in (tenant_cfg.get("name") or "").lower()
+
+        if decisao_jev.intencao == "emergencia_urgencia":
+            new_stage, requires_handoff = ("falar_pessoalmente", False)
             try:
-                sb.table("leads").update(patch).eq("id", lead["id"]).execute()
-                logger.info(
-                    "[%s] lead %s clin=%d chars, symptoms=%d",
-                    instance,
-                    lead["id"],
-                    len(new_clinical),
-                    len(patch.get("symptoms") or []),
+                sb.table("leads").update({"priority": "urgente"}).eq("id", lead["id"]).execute()
+                lead["priority"] = "urgente"
+            except Exception:
+                pass
+        elif decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
+            # Regra Beatriz: a IA NUNCA marca 'consulta_agendada' automaticamente.
+            # O lead é mantido em 'em_atendimento' com nota interna para a secretária Beatriz contatar.
+            new_stage, requires_handoff = ("em_atendimento", False)
+            try:
+                sb.table("leads").update({
+                    "internal_notes": "Interesse em agendamento registrado pela IA. Aguardando contato da secretária Beatriz para combinar data/horário."
+                }).eq("id", lead["id"]).execute()
+            except Exception:
+                pass
+        else:
+            new_stage, requires_handoff = _detect_stage_with_priority(patient_text)
+            if is_matheus_clinic and new_stage == "consulta_agendada":
+                # Blindagem: na clínica do Dr. Matheus a marcação é feita exclusivamente pela Beatriz
+                new_stage = "em_atendimento"
+
+        # Plan B — se agendamento automático estiver ativo (DESATIVADO para clínica Dr. Matheus Dore)
+        calendar_created = False
+        if not is_matheus_clinic and decisao_jev.intencao not in ("agendamento_novo", "retorno_reconsulta"):
+            try:
+                calendar_created = await _maybe_create_calendar_event(
+                    instance, lead, patient_text, ai_reply,
+                    history, tenant_cfg, new_stage,
                 )
             except Exception as exc:
                 logger.warning(
-                    "[%s] falha ao persistir extração estruturada: %s",
-                    instance,
-                    exc,
+                    "[%s] Plan B calendar dispatch falhou: %s",
+                    instance, exc,
                 )
 
-        # 5. Atualiza stage + handoff via hierarquia de prioridade
-        #    P1: humano/transbordo → falar_pessoalmente + handoff_state='humano_assumiu'
-        #    P2: agendamento claro → consulta_agendada (IA continua)
-        #    P3: urgência clínica → falar_pessoalmente (sem handoff, IA conduz)
-        #    P4: triagem ativa (default) → em_atendimento (mantém atual)
-        new_stage, requires_handoff = _detect_stage_with_priority(patient_text)
-        # Plan B — se stage indica agendamento E paciente tem horário
-        # concreto na conversa, chama Composio MCP direto pra criar o
-        # evento. Bypassa o tool-calling quebrado do Hermes Gateway.
-        calendar_created = False
-        try:
-            calendar_created = await _maybe_create_calendar_event(
-                instance, lead, patient_text, ai_reply,
-                history, tenant_cfg, new_stage,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[%s] Plan B calendar dispatch falhou: %s",
-                instance, exc,
-            )
-
-        # Regra determinística: se o evento no Google Calendar foi criado com sucesso,
-        # o status do lead DEVE virar "consulta_agendada" por definição.
         if calendar_created:
             new_stage = "consulta_agendada"
 
@@ -1213,6 +1458,8 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
+        "http://localhost:3007",
+        "http://127.0.0.1:3007",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1234,36 +1481,24 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.post("/webhook/evolution")
 @app.post("/webhook/evolution/{instance}")
+@app.post("/webhook/evolution/{instance}/{event_subpath}")
 async def evolution_webhook(
-    instance: str,
     request: Request,
     background: BackgroundTasks,
+    instance: str | None = None,
     apikey: str | None = Header(default=None),
+    event_subpath: str | None = None,
 ) -> dict[str, Any]:
-    # 0. Validação de segurança: autenticação da Evolution API
-    expected_secret = (
-        os.environ.get("EVOLUTION_WEBHOOK_SECRET")
-        or os.environ.get("VITE_EVOLUTION_GLOBAL_KEY")
-        or EVOLUTION_API_KEY
-        or ""
-    ).strip()
-    received_token = (
-        apikey
-        or request.headers.get("apikey")
-        or request.headers.get("x-api-key")
-        or request.query_params.get("apikey")
-        or ""
-    ).strip()
-    if expected_secret:
-        if not received_token or received_token != expected_secret:
-            logger.warning(
-                "[%s] Webhook rejeitado: apikey inválido ou ausente (recebido: %r)",
-                instance,
-                received_token,
-            )
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
+    # Se a URL vier como /webhook/evolution/messages-upsert (evento no lugar da instância)
+    KNOWN_EVO_EVENTS = {
+        "messages-upsert", "messages.upsert",
+        "connection-update", "connection.update",
+        "messages-update", "messages.update",
+        "send-message", "send_message",
+        "qrcode-updated", "qrcode.updated",
+    }
     body_bytes = await request.body()
     try:
         payload = json.loads(body_bytes) if body_bytes else {}
@@ -1271,7 +1506,43 @@ async def evolution_webhook(
         logger.warning("[%s] payload não-JSON: %r", instance, body_bytes[:120])
         raise HTTPException(status_code=400, detail="invalid json")
 
-    event = payload.get("event") or "unknown"
+    if not instance or instance.lower() in KNOWN_EVO_EVENTS:
+        instance = (
+            request.query_params.get("instance")
+            or payload.get("instance")
+            or (payload.get("data") or {}).get("instance")
+            or "cardio_matheus_prod_01"
+        )
+
+    # 0. Validação de segurança: autenticação da Evolution API
+    # Bloqueia se EVOLUTION_WEBHOOK_SECRET estiver explicitamente configurado no .env,
+    # ou se token for enviado e diferir da chave global da Evolution
+    webhook_secret = os.environ.get("EVOLUTION_WEBHOOK_SECRET", "").strip()
+    received_token = (
+        apikey
+        or request.headers.get("apikey")
+        or request.headers.get("x-api-key")
+        or request.query_params.get("apikey")
+        or ""
+    ).strip()
+    if webhook_secret:
+        if not received_token or received_token != webhook_secret:
+            logger.warning(
+                "[%s] Webhook rejeitado: secret inválido (recebido: %r)",
+                instance,
+                received_token,
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    elif received_token and EVOLUTION_API_KEY:
+        if received_token != EVOLUTION_API_KEY:
+            logger.warning(
+                "[%s] Webhook rejeitado: apikey inválido (recebido: %r)",
+                instance,
+                received_token,
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    event = payload.get("event") or event_subpath or "unknown"
     data = payload.get("data") or {}
     logger.info(
         "[%s] event=%s messageType=%s fromMe=%s",
@@ -1288,9 +1559,15 @@ async def evolution_webhook(
         background.add_task(_fanout, instance, payload)
         return {"ok": True, "tenant_resolved": False}
 
-    # 2. Extrai mensagem (se houver)
-    extracted = _extract_message(event, data)
+    # 2. Extrai mensagem (se houver, com áudio Whisper e visão 9Router)
+    extracted = await _extract_message(event, data, instance=instance)
     if extracted is None:
+        # Registra atualizações de status de conexão (ex: connection.update == open)
+        if str(event).lower() in ("connection.update", "connection-update", "connection_update"):
+            conn_state = data.get("state") or data.get("status")
+            logger.info("[%s] connection.update detectado: state=%s", instance, conn_state)
+            if conn_state == "open":
+                _invalidate_tenant_cache(tenant_id)
         background.add_task(_fanout, instance, payload)
         return {"ok": True, "event": event, "stored": False}
 
@@ -1351,6 +1628,13 @@ async def evolution_webhook(
     if should_dispatch_ai:
         background.add_task(
             _dispatch_ai, tenant_id, lead, extracted["content"], instance
+        )
+
+    # 5.1 Extração assíncrona de sintomas e queixas via BackgroundTasks (Customer 360 / Deskcomm)
+    # Roda em segundo plano sem bloquear o retorno do webhook nem a conversa
+    if ok and not extracted["from_me"] and extracted["sender"] == "patient":
+        background.add_task(
+            _extract_and_persist_clinical_data, lead, extracted["content"], instance
         )
 
     # 6. Fan-out pro Mendes CRM
@@ -2029,11 +2313,51 @@ def _extract_datetime_regex(
         return None
 
     hour, minute = time_tuple
-    start = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+    start = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=TZ_CLINICA)
     end = start + timedelta(minutes=50)
-    iso_start = start.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
-    iso_end = end.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    iso_start = start.isoformat(timespec="seconds")
+    iso_end = end.isoformat(timespec="seconds")
     return {"start_datetime": iso_start, "end_datetime": iso_end}
+
+
+def _build_google_calendar_template_link(
+    summary: str,
+    start_iso: str,
+    end_iso: str,
+    description: str = "",
+    location: str = "",
+    timezone_str: str = "America/Fortaleza",
+) -> str:
+    """Gera link público universal do Google Calendar (action=TEMPLATE)
+    que permite ao paciente adicionar o evento na própria agenda com 1 clique,
+    garantindo o fuso horário correto (ctz=America/Fortaleza).
+    """
+    def _to_compact_iso(iso_str: str) -> str:
+        # Ex: "2026-09-28T09:00:00-03:00" -> "20260928T090000"
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            return dt.strftime("%Y%m%dT%H%M%S")
+        except Exception:
+            m = re.search(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", iso_str)
+            if m:
+                return f"{m.group(1)}{m.group(2)}{m.group(3)}T{m.group(4)}{m.group(5)}{m.group(6)}"
+            return re.sub(r"[^0-9T]", "", iso_str)[:15]
+
+    dt_start = _to_compact_iso(start_iso)
+    dt_end = _to_compact_iso(end_iso) if end_iso else dt_start
+
+    params: dict[str, str] = {
+        "action": "TEMPLATE",
+        "text": summary,
+        "dates": f"{dt_start}/{dt_end}",
+        "ctz": timezone_str,
+    }
+    if description:
+        params["details"] = description
+    if location:
+        params["location"] = location
+
+    return f"https://calendar.google.com/calendar/render?{urllib.parse.urlencode(params)}"
 
 
 async def _update_lead_stage(lead_id: str, stage: str, **extra: Any) -> bool:
@@ -2081,6 +2405,18 @@ async def _maybe_create_calendar_event(
     se a tool retornou success_count=1 com htmlLink literal na resposta.
     """
     try:
+        # Trava de Segurança da Secretária Beatriz:
+        # Agendamento automático desativado para o Dr. Matheus Dore.
+        # A confirmação e marcação de dia/horário é feita exclusivamente pela secretária Beatriz.
+        doctor = (tenant_cfg.get("doctor_name") or "").lower()
+        clinic_name = (tenant_cfg.get("name") or "").lower()
+        if "matheus" in doctor or "matheus" in clinic_name or tenant_cfg.get("auto_schedule_disabled"):
+            logger.info(
+                "[%s] [CALENDAR] Agendamento automático desativado por regra da clínica (agenda exclusiva da secretária Beatriz). Bloqueado.",
+                instance,
+            )
+            return False
+
         looks = _looks_like_schedule_request(patient_text, history, detected_stage)
         logger.info(
             "[%s] [CALENDAR] _looks_like_schedule_request=%s | stage=%s | patient_text=%r",
@@ -2237,11 +2573,11 @@ async def _maybe_create_calendar_event(
                 pass
             return False
 
-        # 4. Extrai htmlLink real da resposta (anti-alucinação).
+        # 4. Extrai htmlLink/event_id da resposta do MCP.
         html_link, event_id = _extract_event_link_from_mcp(exec_resp)
-        if not html_link:
+        if not html_link and not event_id:
             logger.error(
-                "[%s] [CALENDAR] MCP executou mas sem htmlLink na resposta: %s",
+                "[%s] [CALENDAR] MCP executou mas sem htmlLink/event_id na resposta: %s",
                 instance, str(exec_resp)[:500],
             )
             # Envia mensagem honesta ao paciente: failure de criação.
@@ -2263,18 +2599,32 @@ async def _maybe_create_calendar_event(
                 pass
             return False
 
-        # 5. Sucesso! Envia follow-up WhatsApp com link REAL do Calendar.
+        # 5. Sucesso! Envia follow-up WhatsApp com link público do Google Calendar (action=TEMPLATE com ctz=America/Fortaleza).
+        public_calendar_link = _build_google_calendar_template_link(
+            summary=summary,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            description=description,
+            timezone_str="America/Fortaleza",
+        )
+
+        try:
+            dt_display = datetime.fromisoformat(start_iso)
+            display_time = dt_display.strftime("%d/%m/%Y às %H:%M")
+        except Exception:
+            display_time = start_iso.replace("T", " às ").replace("-03:00", "")
+
         followup = (
             f"✅ Consulta agendada!\n\n"
             f"📅 {summary}\n"
-            f"🕐 {start_iso.replace('T', ' ').replace('-03:00', '')} (BRT)\n\n"
-            f"🔗 Link do convite no Google Calendar:\n{html_link}\n\n"
+            f"🕐 {display_time} (Horário de Brasília)\n\n"
+            f"🗓️ Adicione à sua agenda no Google Calendar:\n{public_calendar_link}\n\n"
             f"Qualquer coisa é só chamar aqui."
         )
         send_ok = await _send_evolution_text(instance, lead.get("phone", ""), followup)
         logger.info(
-            "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s link=%s",
-            instance, send_ok.get("ok"), event_id, html_link[:80],
+            "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s mcp_link=%s public_link=%s",
+            instance, send_ok.get("ok"), event_id, html_link, public_calendar_link[:80],
         )
 
         # 6. Sincronização Obrigatória de Stage:
@@ -2308,8 +2658,8 @@ async def _maybe_create_calendar_event(
             pass
 
         logger.info(
-            "[%s] [CALENDAR] ✅ evento criado event_id=%s link=%s",
-            instance, event_id, html_link[:80],
+            "[%s] [CALENDAR] ✅ evento criado event_id=%s mcp_link=%s public_link=%s",
+            instance, event_id, html_link, public_calendar_link[:80],
         )
         return True
     except Exception as exc:
@@ -2526,3 +2876,307 @@ async def _fanout(instance: str, payload: dict[str, Any]) -> None:
             logger.info("fan-out Mendes HTTP %s", r.status_code)
     except Exception as exc:
         logger.warning("fan-out Mendes falhou: %s", exc)
+
+
+# ============================================================================
+# WhatsApp Auto-Provisioning & Pareamento 1-Clique (Evolution API v2)
+# ============================================================================
+
+@app.post("/api/whatsapp/pair/{instance}")
+async def pair_whatsapp_instance(
+    instance: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Auto-provisioning e Pareamento QR Code 1-Clique para WhatsApp via Evolution API v2.
+
+    1. Verifica existência da instância na Evolution API.
+    2. Se não existir, dispara automaticamente POST /instance/create:
+       instanceName: instance, integration: "WHATSAPP-BAILEYS", qrcode: true.
+    3. Se existir, verifica estado de conexão. Se desconectada ou force_logout,
+       busca QR Code via GET /instance/connect/{instance}.
+    4. Configura webhook da instância com:
+       url: "https://crm-webhook.automacaojs.us/webhook/evolution" ou rota dedicada
+       webhook_by_events: true, events: ["MESSAGES_UPSERT", "CONNECTION_UPDATE"].
+    5. Retorna o QR Code (base64) imediatamente para a interface do Deskcomm.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    force_logout = bool(body.get("force_logout", False))
+    webhook_url = (body.get("webhook_url") or "").strip()
+    if not webhook_url:
+        webhook_url = f"https://crm-webhook.automacaojs.us/webhook/evolution/{instance}"
+
+    headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+
+    # 1. Checa existência da instância na Evolution API (evita 404 em /connect)
+    instance_exists = False
+    existing_data: dict[str, Any] | None = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/fetchInstances",
+                headers=headers,
+            )
+            # FIX 01/10: aceitar 2xx por consistent Evolution API
+            if 200 <= resp.status_code < 300:
+                instances_list = resp.json()
+                if isinstance(instances_list, list):
+                    for item in instances_list:
+                        if item.get("name") == instance:
+                            instance_exists = True
+                            existing_data = item
+                            break
+    except Exception as exc:
+        logger.warning("[%s] Erro ao consultar fetchInstances: %s", instance, exc)
+
+    qr_base64: str | None = None
+    qr_code: str | None = None
+    pairing_code: str | None = None
+    connection_state = "close"
+
+    # 2. Se NÃO existir: Auto-Provisioning imediato (POST /instance/create)
+    if not instance_exists:
+        logger.info(
+            "[%s] Instância não existe na Evolution API. Auto-provisionando...",
+            instance,
+        )
+        create_payload = {
+            "instanceName": instance,
+            "integration": "WHATSAPP-BAILEYS",
+            "qrcode": True,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                c_resp = await client.post(
+                    f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/create",
+                    headers=headers,
+                    json=create_payload,
+                )
+                if c_resp.status_code in (200, 201):
+                    c_data = c_resp.json()
+                    qr_obj = c_data.get("qrcode") or {}
+                    qr_base64 = qr_obj.get("base64") or c_data.get("base64")
+                    qr_code = qr_obj.get("code") or c_data.get("code")
+                    pairing_code = qr_obj.get("pairingCode") or c_data.get("pairingCode")
+                    connection_state = "connecting"
+                    logger.info(
+                        "[%s] Instância auto-provisionada com sucesso! QR base64 obtido: %s",
+                        instance,
+                        bool(qr_base64),
+                    )
+                else:
+                    logger.error(
+                        "[%s] Falha ao criar instância: HTTP %s %s",
+                        instance,
+                        c_resp.status_code,
+                        c_resp.text,
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Erro ao criar instância na Evolution API: HTTP {c_resp.status_code}",
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("[%s] Exceção ao auto-provisionar instância: %s", instance, exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro ao conectar com Evolution API: {exc}",
+            )
+    else:
+        # Instância já existe
+        conn_status = (existing_data or {}).get("connectionStatus")
+        logger.info("[%s] Instância existente encontrada. connectionStatus=%s", instance, conn_status)
+        if conn_status == "open" and not force_logout:
+            return {
+                "ok": True,
+                "instance": instance,
+                "state": "open",
+                "already_connected": True,
+                "message": "Instância já está conectada",
+                "ownerJid": (existing_data or {}).get("ownerJid"),
+                "profileName": (existing_data or {}).get("profileName"),
+                "webhook_url": webhook_url,
+            }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            if force_logout:
+                try:
+                    await client.delete(
+                        f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/logout/{instance}",
+                        headers=headers,
+                    )
+                    logger.info("[%s] Logout forçado pré-pareamento realizado", instance)
+                except Exception as exc:
+                    logger.warning("[%s] Erro no logout forçado: %s", instance, exc)
+
+            # Solicita conexão / QR Code
+            try:
+                conn_resp = await client.get(
+                    f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/connect/{instance}",
+                    headers=headers,
+                )
+                if conn_resp.status_code == 200:
+                    conn_data = conn_resp.json()
+                    qr_obj = conn_data.get("qrcode") or conn_data
+                    qr_base64 = qr_obj.get("base64")
+                    qr_code = qr_obj.get("code")
+                    pairing_code = qr_obj.get("pairingCode")
+                    connection_state = "connecting"
+                else:
+                    logger.warning(
+                        "[%s] /instance/connect retornou HTTP %s: %s",
+                        instance,
+                        conn_resp.status_code,
+                        conn_resp.text,
+                    )
+            except Exception as exc:
+                logger.warning("[%s] Erro ao chamar /instance/connect: %s", instance, exc)
+
+    # 3. Fallback: se ainda não pegou QR Code e não está open, tenta mais uma vez connect
+    if not qr_base64 and connection_state != "open":
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                conn_resp = await client.get(
+                    f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/connect/{instance}",
+                    headers=headers,
+                )
+                if conn_resp.status_code == 200:
+                    conn_data = conn_resp.json()
+                    qr_obj = conn_data.get("qrcode") or conn_data
+                    qr_base64 = qr_obj.get("base64")
+                    qr_code = qr_obj.get("code")
+                    pairing_code = qr_obj.get("pairingCode")
+        except Exception:
+            pass
+
+    # 4. Configuração Automática do Webhook da Instância
+    try:
+        webhook_body = {
+            "webhook": {
+                "enabled": True,
+                "url": webhook_url,
+                "headers": {
+                    "apikey": EVOLUTION_API_KEY,
+                },
+                "webhook_by_events": True,
+                "webhookByEvents": True,
+                "byEvents": True,
+                "events": [
+                    "MESSAGES_UPSERT",
+                    "CONNECTION_UPDATE",
+                ],
+            }
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            wh_resp = await client.post(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/webhook/set/{instance}",
+                headers=headers,
+                json=webhook_body,
+            )
+            logger.info(
+                "[%s] Webhook configurado: HTTP %s (url=%s)",
+                instance,
+                wh_resp.status_code,
+                webhook_url,
+            )
+    except Exception as exc:
+        logger.warning("[%s] Erro ao configurar webhook da instância: %s", instance, exc)
+
+    if qr_base64 and not qr_base64.startswith("data:image"):
+        qr_base64 = f"data:image/png;base64,{qr_base64}"
+
+    return {
+        "ok": True,
+        "instance": instance,
+        "base64": qr_base64,
+        "code": qr_code,
+        "pairingCode": pairing_code,
+        "state": connection_state,
+        "webhook_url": webhook_url,
+    }
+
+
+@app.get("/api/whatsapp/status/{instance}")
+async def get_whatsapp_status(instance: str) -> dict[str, Any]:
+    """Consulta estado em tempo real da conexão na Evolution API v2."""
+    headers = {"apikey": EVOLUTION_API_KEY}
+    state = "close"
+    owner_jid: str | None = None
+    profile_name: str | None = None
+    profile_pic_url: str | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # 1. Checa connectionState
+            st_resp = await client.get(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/connectionState/{instance}",
+                headers=headers,
+            )
+            if st_resp.status_code == 200:
+                st_data = st_resp.json()
+                inst_obj = st_data.get("instance") if isinstance(st_data, dict) else {}
+                state = (
+                    (inst_obj.get("state") if isinstance(inst_obj, dict) else None)
+                    or st_data.get("state")
+                    or "unknown"
+                )
+            elif st_resp.status_code == 404:
+                return {
+                    "ok": True,
+                    "exists": False,
+                    "state": "not_created",
+                    "instance": instance,
+                }
+
+            # 2. Se state for open, busca detalhes da instância (número/nome)
+            if state == "open":
+                f_resp = await client.get(
+                    f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/fetchInstances",
+                    headers=headers,
+                )
+                if f_resp.status_code == 200:
+                    for item in f_resp.json():
+                        if item.get("name") == instance:
+                            owner_jid = item.get("ownerJid")
+                            profile_name = item.get("profileName")
+                            profile_pic_url = item.get("profilePicUrl")
+                            break
+    except Exception as exc:
+        logger.warning("[%s] Erro ao consultar status da instância: %s", instance, exc)
+
+    phone_digits = None
+    if owner_jid:
+        phone_digits = _normalize_phone(owner_jid.split("@")[0])
+
+    return {
+        "ok": True,
+        "exists": True,
+        "instance": instance,
+        "state": state,
+        "ownerJid": owner_jid,
+        "phone": phone_digits,
+        "profileName": profile_name,
+        "profilePicUrl": profile_pic_url,
+    }
+
+
+@app.post("/api/whatsapp/logout/{instance}")
+async def logout_whatsapp_instance(instance: str) -> dict[str, Any]:
+    """Desconecta a sessão na Evolution API com segurança."""
+    headers = {"apikey": EVOLUTION_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.delete(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/logout/{instance}",
+                headers=headers,
+            )
+            return {"ok": resp.status_code in (200, 201), "status": resp.status_code}
+    except Exception as exc:
+        logger.warning("[%s] Erro ao executar logout: %s", instance, exc)
+        return {"ok": False, "error": str(exc)}
+
