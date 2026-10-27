@@ -275,13 +275,15 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     const hours = Math.max(1, Math.round(mins / 60));
     try {
       // Grava no BACKEND: é ele que cifra a chave BYOK. Se o gestor não
-      // digitou uma chave nova, reenviamos a máscara — o backend mantém a
-      // chave que já tem guardada.
+      // digitou uma chave nova, o campo `byok_api_key` é OMITIDO do body
+      // (undefined) — o backend mantém a chave que já tem guardada.
+      // (Reenviar a máscara seria frágil: uma chave curta mascara como
+      // '****' e uma máscara editada à mão seria ignorada em silêncio.)
       const saved = await deskcommService.saveAiEngineConfig(activeTenant.id, {
         ai_mode: config.mode,
         byok_provider: config.byokProvider,
         byok_model: config.byokModel,
-        byok_api_key: byokKeyDraft.trim() || byokKeyMasked || undefined,
+        byok_api_key: byokKeyDraft.trim() || undefined,
         persona_name: config.personaName,
         tone_of_voice: config.tone,
         system_prompt: config.systemPrompt,

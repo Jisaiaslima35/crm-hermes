@@ -319,10 +319,18 @@ def _mask_secret(plain: str) -> str:
 
 def _looks_like_mask(value: str) -> bool:
     """True se o valor recebido do frontend parece ser a máscara (ex. 'sk-a...9xY2')
-    e não uma chave nova — nesse caso o backend mantém a que já tem."""
+    e não uma chave nova — nesse caso o backend mantém a que já tem.
+
+    Também reconhece a máscara curta '****' (usada quando a chave tem <=12
+    chars) — sem isto, uma chave curta era substituída pela máscara ao
+    reenviar, e ficava gravada '****' como se fosse a chave verdadeira.
+    """
     if not value:
         return True
-    return "..." in value and value.count(".") == 3
+    v = value.strip()
+    if v in ("****", "****..."):
+        return True
+    return "..." in v and v.count(".") == 3
 
 # Cache em memória com TTL de 60s: evolution_instance -> (tenant_id, fetched_at)
 _TENANT_BY_INSTANCE: dict[str, tuple[str, float]] = {}
@@ -1501,12 +1509,22 @@ async def _post_chat_completion(
     `tools` (opcional): lista OpenAI-compat de function definitions injetada
     no payload. Quando o LLM responde com `tool_calls`, retorna-os em vez de
     levantar — quem chamou decide se executa em loop ou cai pra texto puro.
+
+    Provider `anthropic` usa a API nativa (27/10/2026): a translate o system
+    prompt pra campo próprio, converte as tools e lê a resposta no formato
+    Anthropic.
     """
     timeout = (
         HERMES_GATEWAY_TIMEOUT_S
         if target["source"] == "hermes_gateway"
         else 20.0
     )
+
+    if (target.get("provider") or "").lower() == "anthropic":
+        return await _post_anthropic_completion(
+            target, messages, payload_extras, tools, timeout
+        )
+
     payload = {
         "model": target["model"],
         "messages": messages,
@@ -1532,6 +1550,113 @@ async def _post_chat_completion(
     message = (data.get("choices") or [{}])[0].get("message", {})
     content = (message.get("content") or "").strip()
     tool_calls = message.get("tool_calls") or []
+    if not content and not tool_calls:
+        raise RuntimeError(f"LLM devolveu content vazio ({target['source']})")
+    return content, tool_calls
+
+
+def _to_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Converte tools OpenAI-compat → Anthropic (input_schema)."""
+    out: list[dict[str, Any]] = []
+    for t in tools or []:
+        fn = t.get("function") or {}
+        out.append(
+            {
+                "name": fn.get("name") or "",
+                "description": fn.get("description") or "",
+                "input_schema": fn.get("parameters")
+                or {"type": "object", "properties": {}},
+            }
+        )
+    return out
+
+
+def _from_anthropic_tool_calls(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Converte blocos tool_use do Anthropic → tool_calls OpenAI-compat."""
+    out: list[dict[str, Any]] = []
+    for i, b in enumerate(blocks or []):
+        if b.get("type") != "tool_use":
+            continue
+        out.append(
+            {
+                "id": b.get("id") or f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": b.get("name") or "",
+                    "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False),
+                },
+            }
+        )
+    return out
+
+
+async def _post_anthropic_completion(
+    target: dict[str, Any],
+    messages: list[dict[str, Any]],
+    payload_extras: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+    timeout: float,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Chamada à API nativa da Anthropic (/v1/messages).
+
+    Diferenças face ao OpenAI-compat que são tratadas aqui:
+      * endpoint: /v1/messages (não /chat/completions)
+      * auth: header `x-api-key` (não Authorization: Bearer)
+      * system prompt: campo top-level `system` (não é uma message)
+      * max_tokens é OBRIGATÓRIO
+      * tools: {name, description, input_schema} (não {type, function})
+      * resposta: content[] com blocos text/tool_use (não choices[].message)
+    """
+    system_text = ""
+    chat_messages: list[dict[str, Any]] = []
+    for m in messages or []:
+        if m.get("role") == "system":
+            system_text = m.get("content") or ""
+        else:
+            chat_messages.append(
+                {"role": m.get("role") or "user", "content": m.get("content") or ""}
+            )
+
+    extras = dict(payload_extras or {})
+    # `response_format` e `reasoning` não existem na API Anthropic.
+    extras.pop("response_format", None)
+    extras.pop("reasoning", None)
+    extras.pop("stream", None)
+
+    payload: dict[str, Any] = {
+        "model": target["model"],
+        "max_tokens": int(
+            extras.pop("max_tokens", None) or _ANTHROPIC_DEFAULT_MAX_TOKENS
+        ),
+        "messages": chat_messages,
+        "stream": False,
+        **extras,
+    }
+    if system_text:
+        payload["system"] = system_text
+    if tools:
+        payload["tools"] = _to_anthropic_tools(tools)
+
+    headers = {
+        "x-api-key": target["apiKey"],
+        "anthropic-version": _ANTHROPIC_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{target['baseUrl']}/v1/messages",
+            json=payload,
+            headers=headers,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    blocks = data.get("content") or []
+    content = "".join(
+        (b.get("text") or "") for b in blocks if b.get("type") == "text"
+    ).strip()
+    tool_calls = _from_anthropic_tool_calls(blocks)
     if not content and not tool_calls:
         raise RuntimeError(f"LLM devolveu content vazio ({target['source']})")
     return content, tool_calls
@@ -1642,12 +1767,21 @@ async def _call_llm(
 
 
 # Mapa de provedores BYOK → endpoint base OpenAI-compat.
-# Anthropic fica de fora (API não é OpenAI-compat; exigia refator maior).
+# 27/10/2026: Anthropic adicionado. A API da Anthropic NÃO é OpenAI-compat
+# (endpoint, headers, payload e resposta são diferentes) — o _post_chat_completion
+# traduz o payload quando o provider é 'anthropic'. Sem isto, o painel
+# oferecia Claude mas o runtime ignorava a chave e caía no Hermes VPS em
+# silêncio (falsa confiança para o cliente).
 _BROADCAST_PROVIDERS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "anthropic": "https://api.anthropic.com",
 }
+
+# Versão da API Anthropic + limite de tokens quando o caller não especifica.
+_ANTHROPIC_API_VERSION = "2023-06-01"
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_llm_target(tenant_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -6074,26 +6208,30 @@ async def test_tenant_ai_engine(tenant_id: str, request: Request) -> dict[str, A
             detail="Nenhuma chave BYOK configurada para este tenant.",
         )
 
-    endpoints = {
-        "anthropic": "https://api.anthropic.com",
-        "openai": "https://api.openai.com",
-        "openrouter": "https://openrouter.ai/api",
+    # URL de modelos POR provider (o path difere entre APIs).
+    # 27/10/2026: 'gemini' acrescentado — é o default do painel e sem isto o
+    # "Testar Conexão" devolvia 400 "Provedor desconhecido".
+    provider_models_url = {
+        "anthropic": "https://api.anthropic.com/v1/models",
+        "openai": "https://api.openai.com/v1/models",
+        "openrouter": "https://openrouter.ai/api/v1/models",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/models",
     }
-    base = endpoints.get(provider)
-    if not base:
+    models_url = provider_models_url.get(provider)
+    if not models_url:
         raise HTTPException(status_code=400, detail=f"Provedor desconhecido: {provider}")
 
     headers = {"Content-Type": "application/json"}
     if provider == "anthropic":
         headers["x-api-key"] = key
-        headers["anthropic-version"] = "2023-06-01"
+        headers["anthropic-version"] = _ANTHROPIC_API_VERSION
     else:
         headers["Authorization"] = f"Bearer {key}"
 
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(f"{base}/v1/models", headers=headers)
+            resp = await client.get(models_url, headers=headers)
         latency_ms = int((time.monotonic() - started) * 1000)
 
         if resp.status_code == 401:

@@ -99,8 +99,11 @@ function formatPhone(digits: string): string {
 export function maskSecret(raw: string | null | undefined): string {
   const v = (raw || '').trim();
   if (!v) return '';
-  if (v.length <= 10) return v.slice(0, 2) + '*'.repeat(Math.max(0, v.length - 2));
-  return `${v.slice(0, 6)}...${v.slice(-4)}`;
+  // Formato IDÊNTICO ao `_mask_secret` do backend (8 chars + '...' + 4 chars).
+  // Se divergirem, o frontend mostra uma máscara e o backend devolve outra —
+  // e o gestor fica a achar que a chave mudou.
+  if (v.length <= 12) return '****';
+  return `${v.slice(0, 8)}...${v.slice(-4)}`;
 }
 
 function dbTenantToTenant(row: DbTenant): Tenant {
@@ -206,7 +209,12 @@ function dbMessageToMessage(row: DbMessage): LeadMessage {
 export async function getTenants(): Promise<Tenant[]> {
   const { data, error } = await supabase
     .from('tenants')
-    .select('*')
+    // Lista LITERAL (não uma const) de propósito: o supabase-js só consegue
+    // inferir o tipo do resultado quando a string é literal. E NÃO usamos
+    // select('*') para a coluna legada `byok_api_key` (chave do cliente em
+    // claro) e a `byok_api_key_encrypted` não atravessarem a rede até ao
+    // browser. A máscara vem do endpoint autenticado do backend.
+    .select('id, name, specialty, doctor_name, phone, city, logo_url, primary_color, business_niche, ai_mode, byok_provider, byok_model, persona_name, tone_of_voice, system_prompt, schedule_rules, followup_rules, ai_auto_reply_enabled, evolution_instance, evolution_status, created_at')
     .order('name', { ascending: true });
   if (error) throw new Error(`getTenants: ${error.message}`);
   return (data ?? []).map(dbTenantToTenant);
