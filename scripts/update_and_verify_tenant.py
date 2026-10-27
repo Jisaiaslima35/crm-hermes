@@ -12,7 +12,7 @@ load_dotenv('/root/apps/crm-hermes/.env')
 from supabase import create_client
 
 url = os.environ["VITE_SUPABASE_URL"]
-key = os.environ["VITE_SUPABASE_ANON_KEY"]
+key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["VITE_SUPABASE_ANON_KEY"]
 sb = create_client(url, key)
 
 v3_prompt_path = Path("/root/.gemini/antigravity-ide/brain/d29c7fb3-2656-44c4-91af-748c30aee0c8/scratch/v3_prompt.txt")

@@ -12,7 +12,7 @@ load_dotenv(BASE_DIR / ".env")
 v3_prompt_path = Path("/root/.gemini/antigravity-ide/brain/d29c7fb3-2656-44c4-91af-748c30aee0c8/scratch/v3_prompt.txt")
 v3_text = v3_prompt_path.read_text(encoding="utf-8").strip()
 
-sb = create_client(os.environ["VITE_SUPABASE_URL"], os.environ["VITE_SUPABASE_ANON_KEY"])
+sb = create_client(os.environ["VITE_SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["VITE_SUPABASE_ANON_KEY"])
 
 tenant_id = "11111111-1111-1111-1111-111111111111"
 res = sb.table("tenants").update({
