@@ -577,7 +577,7 @@ def is_contact_ignored(tenant_id: str | None, phone: str = "", name: str = "") -
         try:
             tenant_filter = ["1111", "11111111-1111-1111-1111-111111111111"] if "1111" in t_str else [t_str]
             res = (
-                sb.table("tenant_ignored_contacts")
+                sb_service.table("tenant_ignored_contacts")
                 .select("id, tenant_id, name, phone, reason")
                 .in_("tenant_id", tenant_filter)
                 .execute()
@@ -954,13 +954,28 @@ def _validate_slot_against_schedule(
 
         # Trava Anti-Overbooking: verificar max_capacity contra contagem em appointments
         max_cap = int(matched_slot.get("max_capacity") or 6)
+        if max_cap > 0 and not tenant_id:
+            # 27/10/2026: sem tenant_id NAO se pode contar as vagas — antes
+            # passava em silencio e o limite era ignorado. Agora bloqueia
+            # (defesa em profundidade: nunca aceitar um agendamento sem
+            # conseguir validar o limite de vagas).
+            logger.warning(
+                "[CALENDAR] Overbooking: sem tenant_id nao se pode validar o "
+                "limite de vagas (max_cap=%s) — agendamento bloqueado",
+                max_cap,
+            )
+            return {
+                "ok": False,
+                "reason": "tenant_id_sem_vagas",
+                "schedule_violation": "Não foi possível validar o limite de vagas deste dia.",
+            }
         if max_cap > 0 and tenant_id:
             day_str = dt_local.strftime("%Y-%m-%d")
             day_start_iso = f"{day_str}T00:00:00-03:00"
             day_end_iso = f"{day_str}T23:59:59-03:00"
             try:
                 res = (
-                    sb.table("appointments")
+                    sb_service.table("appointments")
                     .select("id", count="exact")
                     .eq("tenant_id", tenant_id)
                     .neq("status", "cancelou")
@@ -1078,7 +1093,7 @@ def _get_or_create_lead(
         return None
     variants = _phone_variants(phone)
     res = (
-        sb.table("leads")
+        sb_service.table("leads")
         .select("*")
         .eq("tenant_id", tenant_id)
         .in_("phone", variants)
@@ -1114,11 +1129,11 @@ def _get_or_create_lead(
             update_data["name"] = valid_name
             lead_row["name"] = valid_name
 
-        sb.table("leads").update(update_data).eq("id", lead_row["id"]).execute()
+        sb_service.table("leads").update(update_data).eq("id", lead_row["id"]).execute()
         return lead_row
 
     insert = (
-        sb.table("leads")
+        sb_service.table("leads")
         .insert(
             {
                 "tenant_id": tenant_id,
@@ -1300,7 +1315,7 @@ async def _fetch_recent_history(
 ) -> list[dict[str, Any]]:
     """Busca histórico recente (últimas N mensagens) do lead."""
     res = (
-        sb.table("messages")
+        sb_service.table("messages")
         .select("sender, content, created_at")
         .eq("lead_id", lead_id)
         .order("created_at", desc=True)
@@ -1677,6 +1692,43 @@ def _build_chat_messages(
     return messages
 
 
+def _hermes_vps_fallback_target() -> dict[str, Any]:
+    """Target de fallback para o motor Hermes VPS (9router).
+
+    Usado quando o motor principal do tenant falha — seja o gateway dedicado
+    (caiu), seja a chave BYOK do cliente (invalida, sem saldo, ou em
+    rate-limit). O paciente nunca deve ficar sem resposta no WhatsApp: o
+    fail-safe do _dispatch_ai transfere para humano e desliga a IA do lead,
+    o que parte a automacao que o cliente pagou.
+    """
+    _9key = (
+        os.environ.get("NINEROUTER_API_KEY")
+        or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
+        or NINEROUTER_API_KEY
+        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+    ).strip()
+    return {
+        "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
+        "model": NINEROUTER_DEFAULT_MODEL,
+        "apiKey": _9key,
+        "provider": "hermes_vps",
+        "source": "hermes_vps",
+    }
+
+
+def _http_status_of(exc: Exception) -> int | None:
+    """Extrai o status HTTP de uma excecao httpx (401/402/429 = problema da
+    chave do cliente; 5xx/timeout = problema do provider)."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+# Status que indicam que a CHAVE DO CLIENTE esta com problema (nao o prompt).
+# O PRD pede fallback automatico para estes casos.
+BYOK_KEY_ERROR_STATUSES = {401, 402, 403, 429}
+
+
 async def _call_llm(
     system_prompt: str,
     history: list[dict[str, Any]],
@@ -1729,31 +1781,30 @@ async def _call_llm(
             raise RuntimeError(f"Erro técnico detectado na resposta do LLM ({target.get('source')}): {content[:100]}")
         return content
     except Exception as exc:
-        if target["source"] != "hermes_gateway":
+        status = _http_status_of(exc)
+        if target["source"] not in ("hermes_gateway", "byok"):
             logger.warning(
                 "_call_llm falhou (source=%s provider=%s): %s",
                 target["source"], target["provider"], exc,
             )
             return ""
-        # Gateway dedicado caiu — tenta 9router antes de devolver vazio.
-        _9key = (
-            os.environ.get("NINEROUTER_API_KEY")
-            or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
-            or NINEROUTER_API_KEY
-            or "sk-ee9be57a70a07560-etddrv-19a7661c"
-        ).strip()
-        fallback = {
-            "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
-            "model": NINEROUTER_DEFAULT_MODEL,
-            "apiKey": _9key,
-            "provider": "hermes_vps",
-            "source": "hermes_vps",
-        }
-        try:
+        # Gateway dedicado caiu — OU a chave BYOK do cliente esta com problema.
+        # Em ambos os casos servimos via Hermes VPS: o paciente nunca fica sem
+        # resposta (e sem desligar a IA do lead, que era o que acontecia).
+        if target["source"] == "byok":
+            logger.error(
+                "[BYOK_FAIL] tenant=%s provider=%s model=%s status=%s exc=%r "
+                "| A SERVIR VIA HERMES VPS (a chave do cliente precisa de revisao)",
+                tenant_cfg.get("id") or tenant_cfg.get("tenant_id") or "?",
+                target["provider"], target["model"], status, str(exc)[:200],
+            )
+        else:
             logger.warning(
                 "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router (texto puro)",
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
+        fallback = _hermes_vps_fallback_target()
+        try:
             content, _ = await _post_chat_completion(fallback, messages, payload_extras)
             if _is_technical_error_text(content):
                 logger.error("[_call_llm fallback] 9Router retornou erro técnico: %r", content[:200])
@@ -1962,25 +2013,31 @@ async def _call_llm_structured(
         content, _ = await _post_chat_completion(target, messages, payload_extras)
         return await _parse(content)
     except Exception as exc:
-        if target["source"] != "hermes_gateway":
+        status = _http_status_of(exc)
+        if target["source"] not in ("hermes_gateway", "byok"):
             logger.warning(
                 "_call_llm_structured falhou (source=%s provider=%s): %s",
                 target["source"], target["provider"], exc,
             )
             return empty
-        # Gateway caiu — fallback 9router antes de devolver erro silencioso.
-        fallback = {
-            "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
-            "model": NINEROUTER_DEFAULT_MODEL,
-            "apiKey": NINEROUTER_API_KEY,
-            "provider": "hermes_vps",
-            "source": "hermes_vps",
-        }
-        try:
+        # Gateway caiu — OU a chave BYOK do cliente esta com problema
+        # (invalida, sem saldo, rate-limit). Em ambos os casos servimos via
+        # Hermes VPS: o paciente nunca fica sem resposta e a IA do lead nao
+        # e desligada pelo fail-safe.
+        if target["source"] == "byok":
+            logger.error(
+                "[BYOK_FAIL] tenant=%s provider=%s model=%s status=%s exc=%r "
+                "| A SERVIR VIA HERMES VPS (a chave do cliente precisa de revisao)",
+                tenant_cfg.get("id") or tenant_cfg.get("tenant_id") or "?",
+                target["provider"], target["model"], status, str(exc)[:200],
+            )
+        else:
             logger.warning(
                 "[HERMES_FAIL] gateway=%s model=%s exc_type=%s exc=%r | caindo fallback 9router",
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
+        fallback = _hermes_vps_fallback_target()
+        try:
             content, _ = await _post_chat_completion(fallback, messages, payload_extras)
             return await _parse(content)
         except Exception as exc2:
@@ -2191,7 +2248,7 @@ async def _extract_and_persist_clinical_data(
             if merged:
                 patch["symptoms"] = merged
 
-            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            sb_service.table("leads").update(patch).eq("id", lead_id).execute()
             # Atualiza o objeto lead em memória
             if clinical_summary:
                 lead["clinical_summary"] = clinical_summary
@@ -2245,7 +2302,7 @@ async def _mine_silent_conversation(
 
         # 1. Recupera as mensagens recentes do lead para compor o contexto
         res_msgs = (
-            sb.table("messages")
+            sb_service.table("messages")
             .select("sender, content, created_at")
             .eq("lead_id", lead_id)
             .order("created_at", desc=False)
@@ -2532,7 +2589,7 @@ async def _mine_silent_conversation(
                 patch["priority"] = "urgente"
 
             # Atualiza o lead no Supabase
-            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            sb_service.table("leads").update(patch).eq("id", lead_id).execute()
             logger.info(
                 "[%s] ✈️ [MINERADOR TURISMO] Lead %s atualizado: stage=%s destino=%s prob=%s",
                 instance, lead_id, patch.get("stage"), destino, patch.get("conversion_probability"),
@@ -2573,7 +2630,7 @@ async def _mine_silent_conversation(
                         except Exception:
                             ret_date_str = dep_date_str
 
-                    existing_trips = sb.table("lead_trips").select("id").eq("tenant_id", tenant_id).eq("lead_id", lead_id).limit(1).execute()
+                    existing_trips = sb_service.table("lead_trips").select("id").eq("tenant_id", tenant_id).eq("lead_id", lead_id).limit(1).execute()
                     trip_payload = {
                         "tenant_id": tenant_id,
                         "lead_id": lead_id,
@@ -2585,10 +2642,10 @@ async def _mine_silent_conversation(
                     }
                     if existing_trips.data and len(existing_trips.data) > 0:
                         trip_id = existing_trips.data[0]["id"]
-                        sb.table("lead_trips").update(trip_payload).eq("id", trip_id).execute()
+                        sb_service.table("lead_trips").update(trip_payload).eq("id", trip_id).execute()
                         logger.info("[%s] ✈️ [MINERADOR TURISMO] lead_trips %s atualizado (destino=%s, ida=%s)", instance, trip_id, dest_final, dep_date_str)
                     else:
-                        sb.table("lead_trips").insert(trip_payload).execute()
+                        sb_service.table("lead_trips").insert(trip_payload).execute()
                         logger.info("[%s] ✈️ [MINERADOR TURISMO] lead_trips inserido (destino=%s, ida=%s)", instance, dest_final, dep_date_str)
                 except Exception as trip_err:
                     logger.warning("[%s] Erro ao sincronizar lead_trips no minerador: %s", instance, trip_err)
@@ -2596,7 +2653,7 @@ async def _mine_silent_conversation(
                 # Se veio valor no texto (ex: 1200), registra lançamento financeiro
                 if val_float and val_float > 0:
                     try:
-                        sb.table("financial_entries").insert({
+                        sb_service.table("financial_entries").insert({
                             "tenant_id": tenant_id,
                             "lead_id": lead_id,
                             "title": f"Pacote / Viagem: {dest_final}",
@@ -2652,7 +2709,7 @@ async def _mine_silent_conversation(
                     patch["internal_notes"] = f"{curr_notes}\n[ALERTA_INCIDENTE] {resumo_conversa or sintomas_ou_queixa}".strip()
 
             # Executa update em public.leads
-            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            sb_service.table("leads").update(patch).eq("id", lead_id).execute()
             logger.info(
                 "[%s] 🕵️ [MINERADOR SILENCIOSO] Lead %s atualizado: stage=%s sentimento=%s agendamento=%s",
                 instance, lead_id, patch.get("stage"), sentimento, data_agendamento,
@@ -2672,7 +2729,7 @@ async def _mine_silent_conversation(
                         _reason_enum = "cancelamento"
                     else:
                         _reason_enum = "insatisfacao_geral"
-                    sb.table("customer_complaints").insert({
+                    sb_service.table("customer_complaints").insert({
                         "tenant_id": tenant_id,
                         "lead_id": lead_id,
                         "client_name": (lead.get("name") or lead.get("phone") or "Paciente")[:255],
@@ -2706,7 +2763,7 @@ async def _mine_silent_conversation(
                         day_end = dt_local.strftime("%Y-%m-%d 23:59:59-03:00")
 
                         existing_appts = (
-                            sb.table("appointments")
+                            sb_service.table("appointments")
                             .select("id")
                             .eq("tenant_id", tenant_id)
                             .eq("lead_id", lead_id)
@@ -2717,7 +2774,7 @@ async def _mine_silent_conversation(
                         )
                         if not existing_appts.data:
                             patient_name = lead.get("name") or lead.get("phone") or "Paciente"
-                            sb.table("appointments").insert({
+                            sb_service.table("appointments").insert({
                                 "tenant_id": tenant_id,
                                 "lead_id": lead_id,
                                 "title": f"Consulta: {patient_name[:200]}",
@@ -2851,7 +2908,7 @@ async def _record_atrito(
 
     # 1) Grava a reclamação (sempre, qualquer severidade)
     try:
-        sb.table("customer_complaints").insert({
+        sb_service.table("customer_complaints").insert({
             "tenant_id": tenant_id,
             "lead_id": lead.get("id"),
             "client_name": client_name,
@@ -2875,7 +2932,7 @@ async def _record_atrito(
     # 2) Kill-switch: se severidade crítica → humano_assumiu + stage='falar_pessoalmente' (Coluna 3 do Kanban)
     if sev == "critica":
         try:
-            sb.table("leads").update({
+            sb_service.table("leads").update({
                 "stage": "falar_pessoalmente",
                 "handoff_state": "humano_assumiu",
                 "last_interaction": _now_iso(),
@@ -3062,7 +3119,7 @@ async def _record_appointment_financial_entry(
     try:
         # Evita duplicidade se já houver lançamento pendente recente para este lead
         existing = (
-            sb.table("financial_entries")
+            sb_service.table("financial_entries")
             .select("id, status")
             .eq("tenant_id", tenant_id)
             .eq("lead_id", lead_id)
@@ -3090,7 +3147,7 @@ async def _record_appointment_financial_entry(
         final_service = service_name or detected_service
         client_name = lead.get("name") or lead.get("phone") or "Paciente"
 
-        sb.table("financial_entries").insert({
+        sb_service.table("financial_entries").insert({
             "tenant_id": tenant_id,
             "lead_id": lead_id,
             "client_name": client_name,
@@ -3167,7 +3224,7 @@ async def _process_payment_proof_inbound(
 
         # 2. Busca lançamento pendente do lead
         existing = (
-            sb.table("financial_entries")
+            sb_service.table("financial_entries")
             .select("id, notes, status, amount")
             .eq("tenant_id", tenant_id)
             .eq("lead_id", lead_id)
@@ -3190,7 +3247,7 @@ async def _process_payment_proof_inbound(
             if is_valid_receipt and final_amount > 0:
                 update_payload["amount"] = final_amount
 
-            sb.table("financial_entries").update(update_payload).eq("id", entry_id).execute()
+            sb_service.table("financial_entries").update(update_payload).eq("id", entry_id).execute()
             logger.info(
                 "[%s] 💵 [COMPROVANTE] Entrada %s atualizada para status=%s (valor=R$%.2f)",
                 instance, entry_id, target_status, final_amount
@@ -3217,7 +3274,7 @@ async def _process_payment_proof_inbound(
             if paid_at_val:
                 new_fin["paid_at"] = paid_at_val
 
-            sb.table("financial_entries").insert(new_fin).execute()
+            sb_service.table("financial_entries").insert(new_fin).execute()
             logger.info(
                 "[%s] 💵 [COMPROVANTE] Nova entrada criada com status=%s (valor=R$%.2f) para lead %s",
                 instance, target_status, final_amount, lead_id
@@ -3248,7 +3305,7 @@ async def _dispatch_ai(
         try:
             wait_msg = "Tô finalizando sua resposta aqui, já te mando em segundos! 🙂"
             await _send_evolution_text(instance, lead["phone"], wait_msg)
-            sb.table("messages").insert({
+            sb_service.table("messages").insert({
                 "tenant_id": tenant_id,
                 "lead_id": lead["id"],
                 "sender": "ai",
@@ -3311,7 +3368,7 @@ async def _dispatch_ai(
         if _is_appointment_cancel_request(patient_text):
             logger.info("[%s] 📅 Lead %s solicitou cancelamento/desmarcação de consulta — atualizando stage para 'cancelou'", instance, lead["id"])
             try:
-                sb.table("leads").update({
+                sb_service.table("leads").update({
                     "stage": "cancelou",
                     "last_interaction": _now_iso(),
                 }).eq("id", lead["id"]).execute()
@@ -3321,7 +3378,7 @@ async def _dispatch_ai(
             cancel_reply = "Compreendo perfeitamente. Registrei o cancelamento da sua consulta. Se desejar reagendar para outro dia ou horário no futuro, é só nos avisar por aqui. Estamos à disposição!"
             await _send_evolution_text(instance, lead.get("phone", ""), cancel_reply)
             try:
-                sb.table("messages").insert({
+                sb_service.table("messages").insert({
                     "tenant_id": tenant_id,
                     "lead_id": lead["id"],
                     "sender": "ai",
@@ -3337,7 +3394,7 @@ async def _dispatch_ai(
         if _is_opt_out_request(patient_text) and not _is_appointment_cancel_request(patient_text):
             logger.info("[%s] 🛑 Lead %s solicitou opt-out estrito — desativando IA e follow-up", instance, lead["id"])
             try:
-                sb.table("leads").update({
+                sb_service.table("leads").update({
                     "stage": "cancelou",
                     "handoff_state": "opt_out",
                     "ai_active": False,
@@ -3355,7 +3412,7 @@ async def _dispatch_ai(
             )
             await _send_evolution_text(instance, lead.get("phone", ""), farewell_msg)
             try:
-                sb.table("messages").insert({
+                sb_service.table("messages").insert({
                     "tenant_id": tenant_id,
                     "lead_id": lead["id"],
                     "sender": "ai",
@@ -3434,7 +3491,7 @@ async def _dispatch_ai(
             )
             ai_reply = "Recebemos sua mensagem! Nossa equipe já vai te atender."
             try:
-                sb.table("leads").update({
+                sb_service.table("leads").update({
                     "handoff_state": "humano_assumiu",
                     "ai_active": False,
                     "internal_notes": "Transferido para atendimento humano por fail-safe (falha na IA).",
@@ -3452,7 +3509,7 @@ async def _dispatch_ai(
         )
 
         # 3. Grava resposta em messages (sender='ai' = bot)
-        sb.table("messages").insert(
+        sb_service.table("messages").insert(
             {
                 "tenant_id": tenant_id,
                 "lead_id": lead["id"],
@@ -3471,7 +3528,7 @@ async def _dispatch_ai(
         if decisao_jev.intencao == "emergencia_urgencia":
             new_stage, requires_handoff = ("falar_pessoalmente", False)
             try:
-                sb.table("leads").update({"priority": "urgente"}).eq("id", lead["id"]).execute()
+                sb_service.table("leads").update({"priority": "urgente"}).eq("id", lead["id"]).execute()
                 lead["priority"] = "urgente"
             except Exception:
                 pass
@@ -3480,7 +3537,7 @@ async def _dispatch_ai(
             # O lead é mantido em 'em_atendimento' com nota interna para a secretária Beatriz contatar.
             new_stage, requires_handoff = ("em_atendimento", False)
             try:
-                sb.table("leads").update({
+                sb_service.table("leads").update({
                     "internal_notes": "Interesse em agendamento registrado pela IA. Aguardando contato da secretária Beatriz para combinar data/horário."
                 }).eq("id", lead["id"]).execute()
             except Exception:
@@ -3533,7 +3590,7 @@ async def _dispatch_ai(
                     "stage=%s, handoff_state=humano_assumiu",
                     instance, lead["id"], new_stage,
                 )
-            sb.table("leads").update(patch).eq("id", lead["id"]).execute()
+            sb_service.table("leads").update(patch).eq("id", lead["id"]).execute()
             logger.info(
                 "[%s] lead %s stage %s → %s (handoff=%s)",
                 instance,
@@ -3547,7 +3604,7 @@ async def _dispatch_ai(
             # Caso raro: stage já é falar_pessoalmente mas handoff ainda
             # não estava marcado. Garante kill-switch.
             if (lead.get("handoff_state") or "ai") != "humano_assumiu":
-                sb.table("leads").update(
+                sb_service.table("leads").update(
                     {
                         "handoff_state": "humano_assumiu",
                         "last_interaction": _now_iso(),
@@ -3785,7 +3842,7 @@ async def provision_tenant(payload: dict[str, Any], request: Request) -> dict[st
     seeded = 0
     for pos, s in enumerate(PROVISION_SEEDS[niche], start=1):
         try:
-            sb.table("kanban_stages").upsert({
+            sb_service.table("kanban_stages").upsert({
                 "tenant_id": tenant_id, "title": s["title"], "slug": s["slug"],
                 "position": pos, "ai_keywords": s["keywords"], "trigger_keywords": s["keywords"],
                 "ai_prompt_hint": s["desc"], "semantic_description": s["desc"],
@@ -3899,14 +3956,14 @@ async def kanban_stage_create(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="tenant_id e title sao obrigatorios")
     slug = str(payload.get("slug") or "").strip() or _slugify(title)
     try:
-        cur = sb.table("kanban_stages").select("position").eq("tenant_id", tenant_id).order("position", desc=True).limit(1).execute()
+        cur = sb_service.table("kanban_stages").select("position").eq("tenant_id", tenant_id).order("position", desc=True).limit(1).execute()
         position = int(payload.get("position") or ((cur.data[0]["position"] + 1) if cur.data else 1))
     except Exception:
         position = 1
     keywords = payload.get("trigger_keywords") or payload.get("ai_keywords") or []
     desc = str(payload.get("semantic_description") or payload.get("ai_prompt_hint") or "")
     try:
-        row = sb.table("kanban_stages").insert({
+        row = sb_service.table("kanban_stages").insert({
             "tenant_id": tenant_id, "title": title, "slug": slug, "position": position,
             "ai_keywords": keywords, "trigger_keywords": keywords,
             "ai_prompt_hint": desc, "semantic_description": desc,
@@ -3939,7 +3996,7 @@ async def kanban_stage_update(stage_id: str, payload: dict[str, Any]) -> dict[st
     if not patch:
         raise HTTPException(status_code=400, detail="nada para atualizar")
     try:
-        row = sb.table("kanban_stages").update(patch).eq("id", stage_id).execute()
+        row = sb_service.table("kanban_stages").update(patch).eq("id", stage_id).execute()
         if not row.data:
             raise HTTPException(status_code=404, detail="etapa nao encontrada")
         return {"ok": True, "stage": row.data[0]}
@@ -3952,7 +4009,7 @@ async def kanban_stage_update(stage_id: str, payload: dict[str, Any]) -> dict[st
 @app.delete("/api/kanban/stages/{stage_id}")
 async def kanban_stage_delete(stage_id: str) -> dict[str, Any]:
     try:
-        cur = sb.table("kanban_stages").select("id, tenant_id, slug, is_system_protected").eq("id", stage_id).limit(1).execute()
+        cur = sb_service.table("kanban_stages").select("id, tenant_id, slug, is_system_protected").eq("id", stage_id).limit(1).execute()
         if not cur.data:
             raise HTTPException(status_code=404, detail="etapa nao encontrada")
         stage = cur.data[0]
@@ -3960,17 +4017,17 @@ async def kanban_stage_delete(stage_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="etapa protegida pelo sistema nao pode ser excluida")
         tenant_id = stage["tenant_id"]
         # Destino da realocacao: novo_lead se existir, senao a etapa de menor posicao
-        dest = sb.table("kanban_stages").select("slug, position").eq("tenant_id", tenant_id).neq("id", stage_id).order("position").limit(1).execute().data or []
+        dest = sb_service.table("kanban_stages").select("slug, position").eq("tenant_id", tenant_id).neq("id", stage_id).order("position").limit(1).execute().data or []
         if not dest:
             raise HTTPException(status_code=400, detail="nao ha etapa de destino para realocar os leads")
         dest_slug = next((d["slug"] for d in dest if d["slug"] == "novo_lead"), dest[0]["slug"])
         moved = 0
         try:
-            upd = sb.table("leads").update({"stage": dest_slug}).eq("tenant_id", tenant_id).eq("stage", stage["slug"]).execute()
+            upd = sb_service.table("leads").update({"stage": dest_slug}).eq("tenant_id", tenant_id).eq("stage", stage["slug"]).execute()
             moved = len(upd.data or [])
         except Exception as exc:
             logger.warning("[KANBAN-DELETE] realocacao falhou: %s", exc)
-        sb.table("kanban_stages").delete().eq("id", stage_id).execute()
+        sb_service.table("kanban_stages").delete().eq("id", stage_id).execute()
         return {"ok": True, "moved_leads": moved, "moved_to": dest_slug}
     except HTTPException:
         raise
@@ -4081,7 +4138,7 @@ async def _prospector_dispatch_runner(job_id: str, instance: str, rows: list[dic
                 logger.warning("[PROSPECTOR] envio falhou %s: %s", phone, exc)
             if ok:
                 try:
-                    sb.table("prospector_leads").update({
+                    sb_service.table("prospector_leads").update({
                         "status": "enviado",
                         "last_contact_at": datetime.now(timezone.utc).isoformat(),
                     }).eq("id", lead["id"]).execute()
@@ -4122,7 +4179,7 @@ async def prospector_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="tenant_id e message sao obrigatorios")
     limit = int(payload.get("limit") or 15)
     lead_ids = payload.get("lead_ids") or []
-    q = sb.table("prospector_leads").select("*").eq("tenant_id", tenant_id).eq("status", "pendente")
+    q = sb_service.table("prospector_leads").select("*").eq("tenant_id", tenant_id).eq("status", "pendente")
     if lead_ids:
         q = q.in_("id", lead_ids)
     rows = (q.order("created_at").limit(limit).execute().data) or []
@@ -4155,7 +4212,7 @@ async def prospector_job(job_id: str) -> dict[str, Any]:
 async def prospector_stats(tenant_id: str) -> dict[str, Any]:
     counts = {"pendente": 0, "enviado": 0, "respondeu": 0, "sem_resposta": 0, "total": 0}
     try:
-        rows = sb.table("prospector_leads").select("status").eq("tenant_id", tenant_id).execute().data or []
+        rows = sb_service.table("prospector_leads").select("status").eq("tenant_id", tenant_id).execute().data or []
         for r in rows:
             counts["total"] += 1
             s = r.get("status") or "pendente"
@@ -4169,7 +4226,7 @@ async def prospector_stats(tenant_id: str) -> dict[str, Any]:
 @app.get("/api/prospector/leads")
 async def prospector_leads_list(tenant_id: str, limit: int = 200) -> dict[str, Any]:
     try:
-        rows = sb.table("prospector_leads").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(limit).execute().data or []
+        rows = sb_service.table("prospector_leads").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(limit).execute().data or []
         return {"ok": True, "leads": rows}
     except Exception as exc:
         return {"ok": False, "leads": [], "error": str(exc)}
@@ -4180,7 +4237,7 @@ async def kanban_stages(tenant_id: str) -> dict[str, Any]:
     """Colunas oficiais do funil do tenant (tabela kanban_stages, ordenadas)."""
     try:
         res = (
-            sb.table("kanban_stages")
+            sb_service.table("kanban_stages")
             .select("id, slug, title, position, ai_keywords, ai_prompt_hint, has_automation, trigger_keywords, semantic_description, is_system_protected, color_accent")
             .eq("tenant_id", tenant_id)
             .order("position")
@@ -4196,7 +4253,7 @@ async def kanban_stages(tenant_id: str) -> dict[str, Any]:
 async def kanban_automations(tenant_id: str) -> dict[str, Any]:
     """Reguas de automacao do tenant (tabela stage_automations)."""
     try:
-        res = sb.table("stage_automations").select("*").eq("tenant_id", tenant_id).execute()
+        res = sb_service.table("stage_automations").select("*").eq("tenant_id", tenant_id).execute()
         return {"ok": True, "automations": res.data or []}
     except Exception as exc:
         logger.error("[kanban/automations] %s", exc)
@@ -4427,14 +4484,14 @@ async def evolution_webhook(
         # em novo_lead pelo fluxo normal e o JEV assume a triagem).
         if not from_me:
             try:
-                sb.table("prospector_leads").update({"status": "respondeu"}).eq("tenant_id", tenant_id).in_("phone", _phone_variants(extracted["phone"])).eq("status", "enviado").execute()
+                sb_service.table("prospector_leads").update({"status": "respondeu"}).eq("tenant_id", tenant_id).in_("phone", _phone_variants(extracted["phone"])).eq("status", "enviado").execute()
             except Exception:
                 pass
 
         # TURISMO: atendente humano respondeu -> novo_lead/lead_real viram em_atendimento
         if from_me and _is_tourism_hook and str(lead.get("stage") or "") in ("novo_lead", "lead_real"):
             try:
-                sb.table("leads").update({"stage": "em_atendimento", "updated_at": _now_iso()}).eq("id", lead["id"]).execute()
+                sb_service.table("leads").update({"stage": "em_atendimento", "updated_at": _now_iso()}).eq("id", lead["id"]).execute()
                 lead["stage"] = "em_atendimento"
                 logger.info("[%s] [TURISMO] Atendente respondeu: lead %s -> em_atendimento", instance, lead["id"])
             except Exception as _terr:
@@ -4450,7 +4507,7 @@ async def evolution_webhook(
             "media_type": extracted.get("media_type", "text"),
             "media_url": extracted.get("media_url"),
         }
-        res = sb.table("messages").insert(insert_payload).execute()
+        res = sb_service.table("messages").insert(insert_payload).execute()
         ok = bool(res.data)
         if ok:
             stored_count += 1
@@ -4478,7 +4535,7 @@ async def evolution_webhook(
         # BOAS-VINDAS IMEDIATAS (Turismo): primeiro contato de um numero novo
         if ok and not extracted["from_me"] and _is_tourism_hook:
             try:
-                _msg_count = sb.table("messages").select("id").eq("lead_id", lead["id"]).limit(2).execute()
+                _msg_count = sb_service.table("messages").select("id").eq("lead_id", lead["id"]).limit(2).execute()
                 if len(_msg_count.data or []) <= 1:
                     from zoneinfo import ZoneInfo as _ZI
                     _hour = datetime.now(_ZI("America/Sao_Paulo")).hour
@@ -4486,7 +4543,7 @@ async def evolution_webhook(
                     _welcome = f"{_saud}! Aqui é da ESVC Turismo. Como posso te ajudar hoje? Em qual viagem você está pensando?"
                     _w_enabled = True
                     try:
-                        _auto = sb.table("stage_automations").select("message_template, is_active").eq("tenant_id", tenant_id).eq("stage_key", "boas_vindas").limit(1).execute()
+                        _auto = sb_service.table("stage_automations").select("message_template, is_active").eq("tenant_id", tenant_id).eq("stage_key", "boas_vindas").limit(1).execute()
                         if _auto.data:
                             _w_enabled = bool(_auto.data[0].get("is_active", True))
                             if _auto.data[0].get("message_template"):
@@ -4501,7 +4558,7 @@ async def evolution_webhook(
                     _sent_ok = _sent.get("ok") if isinstance(_sent, dict) else bool(_sent)
                     logger.info("[%s] [BOAS-VINDAS] lead=%s phone=%s enviado=%s", instance, lead["id"], extracted["phone"], _sent_ok)
                     if _sent_ok:
-                        sb.table("messages").insert({
+                        sb_service.table("messages").insert({
                             "tenant_id": tenant_id, "lead_id": lead["id"],
                             "sender": "ai", "content": _welcome, "created_at": _now_iso(),
                         }).execute()
@@ -4516,7 +4573,7 @@ async def evolution_webhook(
                     instance, lead["id"], extracted["phone"], extracted["content"],
                 )
                 try:
-                    sb.table("leads").update({
+                    sb_service.table("leads").update({
                         "stage": "cancelou",
                         "last_interaction": _now_iso(),
                     }).eq("id", lead["id"]).execute()
@@ -4540,7 +4597,7 @@ async def evolution_webhook(
                     "internal_notes": "Contato solicitou opt-out / descadastro de mensagens automáticas.",
                 }
                 try:
-                    sb.table("leads").update(opt_out_patch).eq("id", lead["id"]).execute()
+                    sb_service.table("leads").update(opt_out_patch).eq("id", lead["id"]).execute()
                 except Exception as opt_err:
                     logger.error("[%s] Erro ao atualizar lead com opt-out: %s", instance, opt_err)
 
@@ -4551,7 +4608,7 @@ async def evolution_webhook(
                 await _send_evolution_text(instance, extracted["phone"], farewell_msg)
 
                 try:
-                    sb.table("messages").insert({
+                    sb_service.table("messages").insert({
                         "tenant_id": tenant_id,
                         "lead_id": lead["id"],
                         "sender": "ai",
@@ -4596,7 +4653,7 @@ async def evolution_webhook(
             if is_client_close or is_attendant_close:
                 try:
                     dest_f = lead.get("trip_destination") or "Gramado"
-                    sb.table("leads").update({
+                    sb_service.table("leads").update({
                         "stage": "fechou",
                         "conversion_probability": 98,
                         "negotiation_stage": "fechou",
@@ -4614,7 +4671,7 @@ async def evolution_webhook(
                 # Checa descadastro no turismo
                 if any(w in msg_lower for w in ["não quero mais", "nao quero mais", "sair", "parar", "stop", "remover meu número", "remover meu numero", "descadastrar"]):
                     try:
-                        sb.table("leads").update({
+                        sb_service.table("leads").update({
                             "opt_out_reactivation": True,
                             "stage": "cancelou",
                             "handoff_state": "opt_out",
@@ -4631,7 +4688,7 @@ async def evolution_webhook(
                     if current_lead_stage not in ["fechou", "fechou_vendido", "negociacao", "em_negociacao"]:
                         target_st = "cotacao" if any(k in msg_lower for k in ["quanto", "preco", "preço", "cotacao", "cotação", "valor"]) else "em_atendimento"
                         try:
-                            sb.table("leads").update({
+                            sb_service.table("leads").update({
                                 "stage": target_st,
                                 "last_interaction": _now_iso(),
                             }).eq("id", lead["id"]).execute()
@@ -4654,7 +4711,7 @@ async def evolution_webhook(
                         quote_update["stage"] = "cotacao"
                         lead["stage"] = "cotacao"
                     try:
-                        sb.table("leads").update(quote_update).eq("id", lead["id"]).execute()
+                        sb_service.table("leads").update(quote_update).eq("id", lead["id"]).execute()
                         logger.info("[%s] ✈️ [TURISMO] Cotação enviada pelo atendente gravada lead=%s (stage=%s)", instance, lead["id"], quote_update.get("stage", current_lead_stage))
                     except Exception as e:
                         logger.error("[%s] Erro ao registrar cotação enviada: %s", instance, e)
@@ -5529,7 +5586,7 @@ async def _update_lead_stage(lead_id: str, stage: str, **extra: Any) -> bool:
     """Sincroniza o stage do lead no Supabase de forma imediata e resiliente."""
     payload: dict[str, Any] = {"stage": stage, "last_interaction": _now_iso(), **extra}
     try:
-        sb.table("leads").update(payload).eq("id", lead_id).execute()
+        sb_service.table("leads").update(payload).eq("id", lead_id).execute()
         return True
     except Exception as exc:
         logger.warning(
@@ -5537,7 +5594,7 @@ async def _update_lead_stage(lead_id: str, stage: str, **extra: Any) -> bool:
             lead_id, payload, exc,
         )
         try:
-            sb.table("leads").update({
+            sb_service.table("leads").update({
                 "stage": stage,
                 "last_interaction": _now_iso(),
             }).eq("id", lead_id).execute()
@@ -5684,7 +5741,7 @@ async def _maybe_create_calendar_event(
 
         appt_id = None
         try:
-            appt_res = sb.table("appointments").insert(appt_payload).execute()
+            appt_res = sb_service.table("appointments").insert(appt_payload).execute()
             if appt_res.data:
                 appt_id = appt_res.data[0].get("id")
                 logger.info(
@@ -5743,7 +5800,7 @@ async def _maybe_create_calendar_event(
                 exec_resp = await _composio_mcp_call("COMPOSIO_MULTI_EXECUTE_TOOL", exec_args)
                 html_link, event_id = _extract_event_link_from_mcp(exec_resp)
                 if event_id and appt_id:
-                    sb.table("appointments").update({"google_event_id": event_id}).eq("id", appt_id).execute()
+                    sb_service.table("appointments").update({"google_event_id": event_id}).eq("id", appt_id).execute()
                     logger.info("[%s] [CALENDAR] google_event_id %s vinculado ao appointment %s", instance, event_id, appt_id)
             except Exception as mcp_exc:
                 logger.warning("[%s] [CALENDAR] Composio MCP falhou (não-bloqueante): %s", instance, mcp_exc)
@@ -5792,7 +5849,7 @@ async def _maybe_create_calendar_event(
 
         # 8. GRAVA O FOLLOW-UP EM MESSAGES (HISTÓRICO DO CHAT)
         try:
-            sb.table("messages").insert({
+            sb_service.table("messages").insert({
                 "tenant_id": target_tenant_id,
                 "lead_id": lead["id"],
                 "sender": "ai",
@@ -6837,7 +6894,7 @@ async def api_sync_whatsapp_contacts(request: Request) -> dict[str, Any]:
         offset = 0
         page_size = 500
         while True:
-            res_leads = sb.table("leads").select("id, phone, name").eq("tenant_id", tenant_id).range(offset, offset + page_size - 1).execute()
+            res_leads = sb_service.table("leads").select("id, phone, name").eq("tenant_id", tenant_id).range(offset, offset + page_size - 1).execute()
             chunk = res_leads.data or []
             for l in chunk:
                 p_lead = re.sub(r"\D", "", str(l.get("phone") or ""))
@@ -6859,7 +6916,7 @@ async def api_sync_whatsapp_contacts(request: Request) -> dict[str, Any]:
                 curr_name = (curr_lead.get("name") or "").strip()
                 if (not curr_name or curr_name.startswith("Contato ")) and c_name and not is_invalid_patient_name(c_name):
                     try:
-                        sb.table("leads").update({"name": c_name}).eq("id", curr_lead["id"]).execute()
+                        sb_service.table("leads").update({"name": c_name}).eq("id", curr_lead["id"]).execute()
                         updates_count += 1
                     except Exception:
                         pass
@@ -6880,7 +6937,7 @@ async def api_sync_whatsapp_contacts(request: Request) -> dict[str, Any]:
         for i in range(0, len(new_leads_to_insert), chunk_size):
             chunk = new_leads_to_insert[i : i + chunk_size]
             try:
-                sb.table("leads").upsert(chunk, on_conflict="tenant_id,phone").execute()
+                sb_service.table("leads").upsert(chunk, on_conflict="tenant_id,phone").execute()
                 inserted_count += len(chunk)
             except Exception as batch_err:
                 logger.warning("[CAMPAIGN_SYNC] Falha ao inserir lote: %s", batch_err)
@@ -6929,7 +6986,7 @@ async def api_campaigns_audience(request: Request) -> dict[str, Any]:
         page_size = 500
         while True:
             res = (
-                sb.table("leads")
+                sb_service.table("leads")
                 .select("id, name, phone, stage, last_interaction, created_at, last_campaign_at")
                 .eq("tenant_id", tenant_id)
                 .range(offset, offset + page_size - 1)
@@ -7070,7 +7127,7 @@ async def import_leads_batch(
             return {"ok": False, "error": "Nenhum contato encontrado no arquivo ou payload enviado."}
 
         # Busca existentes para deduplicação
-        existing_res = sb.table("leads").select("phone").eq("tenant_id", tenant_id).execute()
+        existing_res = sb_service.table("leads").select("phone").eq("tenant_id", tenant_id).execute()
         existing_phones = {str(r.get("phone") or "") for r in (existing_res.data or [])}
 
         inserted_count = 0
@@ -7121,7 +7178,7 @@ async def import_leads_batch(
             # Insere em lotes
             batch_size = 100
             for i in range(0, len(rows_to_insert), batch_size):
-                sb.table("leads").insert(rows_to_insert[i:i + batch_size]).execute()
+                sb_service.table("leads").insert(rows_to_insert[i:i + batch_size]).execute()
 
         logger.info(
             "[IMPORT_LEADS] Tenant %s: %d contatos lidos, %d inseridos na etapa '%s', %d ignorados/duplicados",
