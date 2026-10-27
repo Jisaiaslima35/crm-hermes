@@ -22,7 +22,11 @@ export interface DbTenant {
   phone: string;
   ai_mode: 'hermes_vps' | 'byok';
   evolution_instance: string;
-  evolution_status: 'connected' | 'disconnected' | 'reconnecting';
+  // ATENÇÃO: `evolution_status` NÃO existe como coluna em `tenants` (só
+  // existe no tipo, o que fazia o SELECT devolver HTTP 400 e o CRM inteiro
+  // ficar sem dados). A coluna real é `status`.
+  evolution_status?: 'connected' | 'disconnected' | 'reconnecting';
+  status?: string | null;
   created_at: string;
   // Config do motor IA (migration 4625)
   system_prompt?: string | null;
@@ -139,7 +143,10 @@ function dbTenantToTenant(row: DbTenant): Tenant {
     whatsappInstance: {
       sessionName: row.evolution_instance,
       phoneNumber: row.phone,
-      status: row.evolution_status,
+      status: (row.evolution_status ?? row.status ?? 'disconnected') as
+        | 'connected'
+        | 'disconnected'
+        | 'reconnecting',
       batteryLevel: 0,
       webhookUrl: '',
       lastSync: row.created_at,
@@ -214,7 +221,7 @@ export async function getTenants(): Promise<Tenant[]> {
     // select('*') para a coluna legada `byok_api_key` (chave do cliente em
     // claro) e a `byok_api_key_encrypted` não atravessarem a rede até ao
     // browser. A máscara vem do endpoint autenticado do backend.
-    .select('id, name, specialty, doctor_name, phone, city, logo_url, primary_color, business_niche, ai_mode, byok_provider, byok_model, persona_name, tone_of_voice, system_prompt, schedule_rules, followup_rules, ai_auto_reply_enabled, evolution_instance, evolution_status, created_at')
+    .select('id, name, specialty, doctor_name, phone, city, logo_url, primary_color, business_niche, ai_mode, byok_provider, byok_model, persona_name, tone_of_voice, system_prompt, schedule_rules, followup_rules, ai_auto_reply_enabled, evolution_instance, status, created_at')
     .order('name', { ascending: true });
   if (error) throw new Error(`getTenants: ${error.message}`);
   return (data ?? []).map(dbTenantToTenant);
