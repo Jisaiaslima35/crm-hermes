@@ -441,20 +441,20 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                 onDragOver={(e) => handleDragOver(e, stage.id)}
                 onDragLeave={handleDragLeave}
                 onDrop={(e) => handleDrop(e, stage.id)}
-                className={`w-[85vw] sm:w-[320px] md:w-[290px] shrink-0 flex-shrink-0 flex flex-col rounded-2xl bg-slate-900/50 border transition-all ${
+                className={`w-[85vw] sm:w-[320px] md:w-[290px] shrink-0 flex-shrink-0 flex flex-col rounded-[20px] bg-[var(--bg-secondary)] transition-all ${
                   isHovered
-                    ? 'border-sky-400/80 bg-sky-950/20 shadow-xl ring-2 ring-sky-500/20'
-                    : 'border-slate-800/80'
+                    ? 'shadow-[0_10px_34px_rgba(0,0,0,0.55),0_0_0_2px_rgba(10,132,255,0.45)]'
+                    : 'shadow-[var(--shadow-card)]'
                 }`}
               >
                 {/* Column Header */}
-                <div className="p-3.5 border-b border-slate-800/80">
+                <div className="p-4 border-b border-[var(--separator-soft)]">
                   {stage.colorAccent && (
-                    <div className="h-1 rounded-full mb-2" style={{ backgroundColor: stage.colorAccent }} />
+                    <div className="h-1 rounded-full mb-2.5" style={{ backgroundColor: stage.colorAccent }} />
                   )}
                   <div className="flex items-center justify-between mb-1">
                     <div className="flex items-center gap-1.5 min-w-0">
-                      <h3 className="font-bold text-xs text-white tracking-wide truncate min-w-0">
+                      <h3 className="font-semibold text-[13px] text-[var(--label-primary)] tracking-wide truncate min-w-0">
                         {stage.title}
                       </h3>
                       {/* Ícone de Engrenagem (⚙️) para etapas com automação */}
@@ -466,10 +466,11 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                             setAutomationStageKey(stage.automationStageKey || 'cotacao');
                             setAutomationModalOpen(true);
                           }}
-                          className="p-1 rounded-md text-amber-400 hover:text-amber-300 hover:bg-amber-500/20 transition-colors cursor-pointer"
+                          className="ap-icon-btn !min-w-[36px] !min-h-[36px] text-amber-400 hover:text-amber-300 hover:bg-amber-500/20 transition-colors cursor-pointer"
                           title="⚙️ Configurar automações e réguas de envio desta etapa"
+                          aria-label={`Configurar automações da etapa ${stage.title}`}
                         >
-                          <Settings className="w-3.5 h-3.5" />
+                          <Settings className="w-4 h-4" />
                         </button>
                       )}
                       {/* Menu contextual CRUD (so em funil dinamico) */}
@@ -481,14 +482,15 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                               e.stopPropagation();
                               setOpenMenuStage(openMenuStage === stage.id ? null : stage.id);
                             }}
-                            className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-700/60 transition-colors cursor-pointer"
+                            className="ap-icon-btn !min-w-[36px] !min-h-[36px] text-[var(--label-secondary)] hover:text-[var(--label-primary)] transition-colors cursor-pointer"
                             title="Opções da etapa"
+                            aria-label={`Opções da etapa ${stage.title}`}
                           >
                             <span className="text-sm leading-none font-bold">⋮</span>
                           </button>
                           {openMenuStage === stage.id && (
                             <div
-                              className="absolute left-0 top-7 z-30 w-56 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl py-1"
+                              className="absolute left-0 top-9 z-30 w-56 rounded-[16px] bg-[var(--bg-elevated)] shadow-[var(--shadow-panel)] py-1"
                               onClick={(e) => e.stopPropagation()}
                             >
                               <button

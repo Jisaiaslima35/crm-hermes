@@ -1,5 +1,276 @@
 @import "tailwindcss";
 
+/* ============================================================================
+   APPLE HIG — DESIGN TOKENS (2026-10-27)
+   ----------------------------------------------------------------------------
+   Tokens de sistema da Apple na variante DARK (a app é dark-first).
+   A ideia: tirar as bordas duras (border-slate-700/80) e passar a hierarquia
+   por SOMBRA + FUNDO + TIPOGRAFIA, como o HIG pede (Deference + Depth).
+
+   Regra de contraste (HIG / WCAG AA): texto normal >= 4.5:1 sobre o fundo.
+   --label-secondary a 0.62 sobre #1C1C1E dá ~7:1. --label-tertiary a 0.35
+   fica para metadados nao-essenciais (nao usar para texto que se leia).
+   ========================================================================== */
+:root {
+  /* ---- Labels (texto) ---- */
+  --label-primary: #ffffff;
+  --label-secondary: rgba(235, 235, 245, 0.62);
+  --label-tertiary: rgba(235, 235, 245, 0.35);
+
+  /* ---- Backgrounds ---- */
+  --bg-primary: #000000;
+  --bg-secondary: #1c1c1e;
+  --bg-tertiary: #2c2c2e;
+  --bg-elevated: #323235;
+  --bg-fill: rgba(120, 120, 128, 0.16);
+
+  /* ---- Separators ---- */
+  --separator: rgba(84, 84, 88, 0.6);
+  --separator-soft: rgba(84, 84, 88, 0.32);
+
+  /* ---- Cores de sistema (dark) ---- */
+  --system-blue: #0a84ff;
+  --system-green: #30d158;
+  --system-indigo: #5e5ce6;
+  --system-orange: #ff9f0a;
+  --system-pink: #ff375f;
+  --system-purple: #bf5af2;
+  --system-red: #ff453a;
+  --system-teal: #64d2ff;
+  --system-yellow: #ffd60a;
+
+  /* ---- Raios concentricos (inner + padding = outer) ---- */
+  --radius-control: 12px;
+  --radius-card: 16px;
+  --radius-panel: 20px;
+  --radius-capsule: 9999px;
+
+  /* ---- Sombras semanticas (substituem bordas duras) ---- */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.36), 0 4px 14px rgba(0, 0, 0, 0.26);
+  --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.42), 0 14px 32px rgba(0, 0, 0, 0.4);
+  --shadow-panel: 0 8px 30px rgba(0, 0, 0, 0.46);
+  --shadow-control: 0 1px 2px rgba(0, 0, 0, 0.3);
+
+  /* ---- Motion (curvas da Apple) ---- */
+  --ease-out: cubic-bezier(0, 0, 0.58, 1);
+  --ease-default: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-spring: cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  --dur-instant: 100ms;
+  --dur-fast: 200ms;
+  --dur-normal: 300ms;
+
+  /* ---- Touch target minimo (HIG iOS) ---- */
+  --tap-min: 44px;
+
+  --brand-color: #0ea5e9;
+}
+
+/* ============================================================================
+   COMPONENTES HIG
+   ========================================================================== */
+@layer components {
+  /* Card: fundo solido + sombra suave. Sem borda dura. */
+  .ap-card {
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+    transition: box-shadow var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out),
+      background-color var(--dur-fast) var(--ease-out);
+  }
+  .ap-card-hover:hover {
+    box-shadow: var(--shadow-card-hover);
+    transform: translateY(-1px);
+  }
+  .ap-card-hover:active {
+    transform: scale(0.99);
+  }
+
+  /* Panel (colunas do kanban, sheets): raio maior, sombra de painel. */
+  .ap-panel {
+    background-color: var(--bg-secondary);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--shadow-panel);
+  }
+
+  /* Chip / badge: fundo suave, sem borda. */
+  .ap-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: var(--radius-capsule);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+
+  /* Botao primario: capsula, 44px min, azul de sistema. */
+  .ap-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: var(--tap-min);
+    padding: 0 20px;
+    border-radius: var(--radius-capsule);
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    transition: transform var(--dur-instant) var(--ease-out),
+      background-color var(--dur-fast) var(--ease-out),
+      opacity var(--dur-fast) var(--ease-out);
+  }
+  .ap-btn:active {
+    transform: scale(0.97);
+  }
+  .ap-btn-primary {
+    background-color: var(--system-blue);
+    color: #fff;
+  }
+  .ap-btn-primary:hover {
+    background-color: #3d9bff;
+  }
+  .ap-btn-secondary {
+    background-color: rgba(10, 132, 255, 0.14);
+    color: var(--system-blue);
+  }
+  .ap-btn-secondary:hover {
+    background-color: rgba(10, 132, 255, 0.22);
+  }
+  .ap-btn-ghost {
+    background-color: transparent;
+    color: var(--label-secondary);
+  }
+  .ap-btn-ghost:hover {
+    background-color: var(--bg-fill);
+    color: var(--label-primary);
+  }
+  .ap-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* Botao de icone: alvo de toque 44x44 minimo. */
+  .ap-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--tap-min);
+    min-height: var(--tap-min);
+    border-radius: var(--radius-control);
+    border: none;
+    background: transparent;
+    color: var(--label-secondary);
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out);
+  }
+  .ap-icon-btn:hover {
+    background-color: var(--bg-fill);
+    color: var(--label-primary);
+  }
+  .ap-icon-btn:active {
+    transform: scale(0.94);
+  }
+
+  /* Campo de formulario: 44px, raio 12, foco com anel de 4px. */
+  .ap-field {
+    width: 100%;
+    min-height: var(--tap-min);
+    padding: 10px 14px;
+    border-radius: var(--radius-control);
+    background-color: var(--bg-fill);
+    border: 1px solid transparent;
+    color: var(--label-primary);
+    font-size: 14px;
+    outline: none;
+    transition: border-color var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
+  }
+  .ap-field::placeholder {
+    color: var(--label-tertiary);
+  }
+  .ap-field:focus {
+    border-color: var(--system-blue);
+    box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.28);
+  }
+
+  /* Toggle estilo iOS: pill 51x31 com knob que desliza. */
+  .ap-toggle {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+    width: 51px;
+    height: 31px;
+    border-radius: var(--radius-capsule);
+    background-color: rgba(120, 120, 128, 0.32);
+    border: none;
+    cursor: pointer;
+    transition: background-color var(--dur-normal) var(--ease-out);
+  }
+  .ap-toggle[data-on="true"] {
+    background-color: var(--system-green);
+  }
+  .ap-toggle::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 27px;
+    height: 27px;
+    border-radius: 50%;
+    background-color: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    transition: transform var(--dur-normal) var(--ease-spring);
+  }
+  .ap-toggle[data-on="true"]::after {
+    transform: translateX(20px);
+  }
+
+  /* Secao de formulario (grouped list style do iOS). */
+  .ap-form-section {
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+  }
+  .ap-form-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: var(--tap-min);
+    padding: 10px 14px;
+  }
+  .ap-form-row + .ap-form-row {
+    border-top: 1px solid var(--separator-soft);
+  }
+  .ap-form-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--label-primary);
+  }
+  .ap-form-hint {
+    font-size: 11px;
+    color: var(--label-secondary);
+  }
+}
+
+/* Acessibilidade: respeitar prefers-reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @media print {
   /* Ocultar navegação, menus laterais, topo, barras de rolagem e toasts */
   header,
@@ -32,5 +303,3 @@
     size: A4 portrait;
   }
 }
-
-:root { --brand-color: #0ea5e9; }

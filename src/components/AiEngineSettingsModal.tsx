@@ -335,7 +335,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
       <div
         id="modal-ai-engine-settings"
-        className="w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in-50 zoom-in-95"
+        className="w-full max-w-2xl bg-[var(--bg-secondary)] rounded-[20px] shadow-[var(--shadow-panel)] overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in-50 zoom-in-95"
       >
         {/* Header */}
         <div className="p-4 border-b border-slate-800 bg-slate-850 flex items-center justify-between">
@@ -438,7 +438,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
 
           {/* Mode-specific Fields */}
           {config.mode === 'hermes_vps' ? (
-            <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 space-y-3">
+            <div className="ap-form-section p-4 space-y-3">
               <div className="flex items-center gap-2 text-xs font-bold text-sky-400 mb-1">
                 <Server className="w-4 h-4" />
                 <span>Configurações do Cluster Hermes VPS</span>
@@ -454,7 +454,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                   placeholder="https://vps-hermes.suaclinica.med.br/api/v1"
                   value={config.hermesEndpoint}
                   onChange={(e) => setConfig({ ...config, hermesEndpoint: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder:text-slate-600 font-mono focus:outline-none focus:border-sky-500"
+                  className="ap-field font-mono !text-[12px]"
                 />
               </div>
 
@@ -468,12 +468,12 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                   placeholder="hms_live_..."
                   value={config.hermesToken}
                   onChange={(e) => setConfig({ ...config, hermesToken: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder:text-slate-600 font-mono focus:outline-none focus:border-sky-500"
+                  className="ap-field font-mono !text-[12px]"
                 />
               </div>
             </div>
           ) : (
-            <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 space-y-3">
+            <div className="ap-form-section p-4 space-y-3">
               <div className="flex items-center gap-2 text-xs font-bold text-purple-400 mb-1">
                 <Key className="w-4 h-4" />
                 <span>Configurações do Provedor BYOK</span>
@@ -496,7 +496,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                         byokModel: provData ? provData.models[0] : config.byokModel,
                       });
                     }}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                    className="ap-field !text-[12px]"
                   >
                     {BYOK_PROVIDERS.map((p) => (
                       <option key={p.id} value={p.id}>
@@ -519,7 +519,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                     id="select-byok-model"
                     value={config.byokModel}
                     onChange={(e) => setConfig({ ...config, byokModel: e.target.value })}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono focus:outline-none focus:border-purple-500"
+                    className="ap-field font-mono !text-[12px]"
                   >
                     {(discoveredModels.length > 0
                       ? discoveredModels
@@ -546,7 +546,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                     onChange={(e) => setByokKeyDraft(e.target.value)}
                     autoComplete="off"
                     spellCheck={false}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 pr-10 text-xs text-white placeholder:text-slate-600 font-mono focus:outline-none focus:border-purple-500"
+                    className="ap-field pr-10 font-mono !text-[12px]"
                   />
                   {byokKeyDraft && (
                     <button
@@ -587,14 +587,14 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
           )}
 
           {/* Test Connection Button & Status */}
-          <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950/80 border border-slate-800">
+          <div className="flex items-center justify-between p-3 rounded-[14px] bg-white/[0.04]">
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 id="btn-test-ai-connection"
                 onClick={handleTestConnection}
                 disabled={isTesting}
-                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-sky-400 hover:text-sky-300 border border-slate-700 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                className="ap-btn ap-btn-secondary !min-h-[36px] !px-3.5 !text-[12px]"
               >
                 {isTesting ? (
                   <>
@@ -637,7 +637,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
           </div>
 
           {/* Persona & Triage Rules */}
-          <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 space-y-3">
+          <div className="ap-form-section p-4 space-y-3">
             <div className="flex items-center gap-2 text-xs font-bold text-slate-200">
               <Stethoscope className="w-4 h-4 text-emerald-400" />
               <span>Persona Clínica & Protocolo de WhatsApp</span>
@@ -652,7 +652,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                   type="text"
                   value={config.personaName}
                   onChange={(e) => setConfig({ ...config, personaName: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
+                  className="ap-field !text-[12px]"
                 />
               </div>
 
@@ -663,7 +663,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                 <select
                   value={config.tone}
                   onChange={(e) => setConfig({ ...config, tone: e.target.value as any })}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
+                  className="ap-field !text-[12px]"
                 >
                   <option value="acolhedor">Acolhedor & Empático</option>
                   <option value="clinico">Clínico & Técnico</option>
@@ -680,13 +680,13 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                 rows={4}
                 value={config.systemPrompt}
                 onChange={(e) => setConfig({ ...config, systemPrompt: e.target.value })}
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-200 leading-relaxed font-mono focus:outline-none focus:border-sky-500"
+                className="ap-field !p-2.5 !text-[12px] leading-relaxed font-mono"
               />
             </div>
 
             <div className="pt-3 border-t border-slate-800 space-y-3">
               {/* Toggle de Follow-up Automático com Badge de Status */}
-              <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/60 p-3 rounded-xl border border-slate-800">
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-white/[0.04] p-3 rounded-[14px]">
                 <div className="flex items-center gap-2.5">
                   <Clock className="w-4 h-4 text-amber-400" />
                   <div>
@@ -718,18 +718,12 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                       enabled: !prev.enabled,
                     }))
                   }
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                    followupRules.enabled ? 'bg-emerald-600' : 'bg-slate-700'
-                  }`}
+                  className="ap-toggle"
+                  data-on={followupRules.enabled ? 'true' : 'false'}
                   role="switch"
                   aria-checked={followupRules.enabled}
+                  aria-label="Ativar regras de follow-up"
                 >
-                  <span
-                    aria-hidden="true"
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                      followupRules.enabled ? 'translate-x-5' : 'translate-x-0'
-                    }`}
-                  />
                 </button>
               </div>
 
@@ -748,7 +742,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                       silence_hours: Math.max(1, Math.round(mins / 60)),
                     }));
                   }}
-                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-400"
+                  className="ap-field !px-2.5 !text-[12px] focus:!border-amber-400"
                 >
                   <option value={10}>10 minutos</option>
                   <option value={15}>15 minutos (Padrão)</option>
@@ -762,22 +756,25 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
           </div>
 
           {/* Grade de Atendimento & Limite de Vagas por Dia (Fase Beatriz) */}
-          <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 space-y-4">
+          <div className="ap-form-section p-4 space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
               <div className="flex items-center gap-2 text-xs font-bold text-slate-200">
                 <Calendar className="w-4 h-4 text-emerald-400" />
                 <span>Grade de Atendimento & Limite de Vagas por Dia</span>
               </div>
               <label className="flex items-center gap-2 cursor-pointer text-xs">
-                <input
-                  type="checkbox"
-                  checked={scheduleRules.enabled !== false}
-                  onChange={(e) =>
-                    setScheduleRules((prev) => ({ ...prev, enabled: e.target.checked }))
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={scheduleRules.enabled !== false}
+                  aria-label="Ativar grade de atendimento"
+                  onClick={() =>
+                    setScheduleRules((prev) => ({ ...prev, enabled: prev.enabled === false }))
                   }
-                  className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500"
+                  className="ap-toggle"
+                  data-on={scheduleRules.enabled !== false ? 'true' : 'false'}
                 />
-                <span className="text-[11px] font-semibold text-slate-300">
+                <span className="text-[12px] font-medium text-[var(--label-primary)]">
                   Grade Ativa
                 </span>
               </label>
@@ -790,7 +787,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
             {/* Lista de Slots */}
             <div className="space-y-2.5">
               {(!scheduleRules.weekly_slots || scheduleRules.weekly_slots.length === 0) ? (
-                <div className="p-4 rounded-xl border border-dashed border-slate-700/80 bg-slate-900/50 text-center">
+                <div className="p-4 rounded-[16px] border border-dashed border-[var(--separator)] bg-white/[0.03] text-center">
                   <p className="text-xs text-slate-400">
                     Nenhuma regra de grade ou limite de vagas configurado.
                   </p>
@@ -802,7 +799,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                 scheduleRules.weekly_slots.map((slot, index) => (
                   <div
                     key={index}
-                    className="p-3 bg-slate-900 border border-slate-800 hover:border-slate-700/80 rounded-xl flex flex-wrap sm:flex-nowrap items-center gap-3 transition-colors"
+                    className="p-3 bg-[var(--bg-tertiary)] rounded-[14px] flex flex-wrap sm:flex-nowrap items-center gap-3 transition-colors shadow-[var(--shadow-card)]"
                   >
                     {/* Select Dia da Semana */}
                     <div className="flex-1 min-w-[140px]">
@@ -814,7 +811,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                         onChange={(e) =>
                           handleUpdateSlot(index, 'day_of_week', Number(e.target.value))
                         }
-                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                        className="ap-field !px-2.5 !text-[12px]"
                       >
                         {DAYS_OF_WEEK.map((d) => (
                           <option key={d.value} value={d.value}>
@@ -835,7 +832,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                         onChange={(e) =>
                           handleUpdateSlot(index, 'start_time', e.target.value)
                         }
-                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white text-center font-mono focus:outline-none focus:border-emerald-500"
+                        className="ap-field !px-2 !text-[12px] text-center font-mono"
                       />
                     </div>
 
@@ -850,7 +847,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                         onChange={(e) =>
                           handleUpdateSlot(index, 'end_time', e.target.value)
                         }
-                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white text-center font-mono focus:outline-none focus:border-emerald-500"
+                        className="ap-field !px-2 !text-[12px] text-center font-mono"
                       />
                     </div>
 
@@ -872,7 +869,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                               Math.max(1, parseInt(e.target.value) || 1)
                             )
                           }
-                          className="w-full bg-slate-850 border border-slate-700 rounded-lg pl-2.5 pr-7 py-1.5 text-xs text-white text-center font-bold focus:outline-none focus:border-emerald-500"
+                          className="ap-field !pl-2.5 !pr-7 !text-[12px] text-center font-bold"
                         />
                         <Users className="w-3.5 h-3.5 text-slate-500 absolute right-2.5 top-2 pointer-events-none" />
                       </div>
@@ -900,7 +897,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                 type="button"
                 id="btn-add-schedule-slot"
                 onClick={handleAddSlot}
-                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-emerald-400 hover:text-emerald-300 border border-slate-700 hover:border-emerald-600/50 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                className="ap-btn ap-btn-secondary !min-h-[36px] !px-3.5 !text-[12px] !text-emerald-300"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>+ Adicionar Regra / Horário</span>
@@ -910,11 +907,11 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="p-4 border-t border-slate-800 bg-slate-850 flex items-center justify-between">
+        <div className="p-4 border-t border-[var(--separator-soft)] bg-[var(--bg-tertiary)] flex items-center justify-between">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-xs font-semibold text-slate-400 hover:text-white transition-colors cursor-pointer"
+            className="ap-btn ap-btn-ghost !min-h-[36px] !px-4 !text-[12px]"
           >
             Cancelar
           </button>
@@ -923,7 +920,7 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
             id="btn-save-ai-settings"
             onClick={handleSave}
             disabled={isSaving}
-            className="px-5 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all cursor-pointer"
+            className="ap-btn ap-btn-primary !min-h-[36px] !px-5 !text-[12px]"
           >
             {isSaving ? (
               <>

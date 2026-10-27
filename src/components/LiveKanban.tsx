@@ -357,7 +357,7 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
   return (
     <div className="flex-1 flex flex-col bg-slate-950 text-slate-100 min-h-0">
       {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b border-slate-800 bg-slate-900/60">
+      <div className="flex items-center justify-between p-4 border-b border-[var(--separator-soft)] bg-[var(--bg-secondary)]">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-600 flex items-center justify-center">
             <Radio className="w-5 h-5 text-white" />
@@ -406,7 +406,7 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
       </div>
 
       {/* Status bar */}
-      <div className="flex items-center gap-3 px-4 py-2 bg-slate-900/30 border-b border-slate-800/60 text-[10px]">
+      <div className="flex items-center gap-3 px-4 py-2 bg-white/[0.03] border-b border-[var(--separator-soft)] text-[11px]">
         <div className="flex items-center gap-1.5">
           <span
             className={`w-2 h-2 rounded-full ${
@@ -475,9 +475,9 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
               return (
                 <div
                   key={stage.id}
-                  className={`w-72 rounded-xl border ${stage.borderClass} ${stage.bgClass} flex flex-col`}
+                  className={`w-72 rounded-[20px] ${stage.bgClass} flex flex-col shadow-[var(--shadow-card)] transition-shadow hover:shadow-[var(--shadow-card-hover)]`}
                 >
-                  <div className={`px-3 py-2 border-b ${stage.borderClass} flex items-center justify-between`}>
+                  <div className={`px-3.5 py-2.5 border-b border-[var(--separator-soft)] flex items-center justify-between`}>
                     <span className={`text-xs font-semibold ${stage.headerClass}`}>
                       {stage.title}
                     </span>
@@ -495,18 +495,18 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
                         <div
                           key={lead.id}
                           onClick={() => setSelectedLeadId(lead.id)}
-                          className={`p-2.5 rounded-lg cursor-pointer border transition-all ${
+                          className={`p-3 rounded-[14px] cursor-pointer transition-all shadow-[var(--shadow-control)] ${
                             selectedLeadId === lead.id
-                              ? 'bg-emerald-900/40 border-emerald-500/60 ring-1 ring-emerald-400/30'
-                              : 'bg-slate-900/60 border-slate-700/60 hover:border-slate-600'
+                              ? 'bg-emerald-500/16 ring-1 ring-emerald-400/40'
+                              : 'bg-[var(--bg-tertiary)] hover:bg-[var(--bg-elevated)]'
                           }`}
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="min-w-0 flex-1">
-                              <p className="text-xs font-semibold text-white truncate">{lead.name}</p>
-                              <p className="text-[10px] text-slate-500 font-mono">{lead.phone}</p>
+                              <p className="text-[13px] font-semibold text-[var(--label-primary)] truncate">{lead.name}</p>
+                              <p className="text-[11px] text-[var(--label-secondary)] font-mono">{lead.phone}</p>
                               {lead.mainComplaint && (
-                                <p className="text-[10px] text-slate-400 truncate mt-0.5">
+                                <p className="text-[11px] text-[var(--label-secondary)] truncate mt-0.5">
                                   {lead.mainComplaint}
                                 </p>
                               )}
@@ -563,8 +563,8 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
         </div>
 
         {/* Chat sidebar */}
-        <div className="w-96 border-l border-slate-800 bg-slate-900/40 flex flex-col">
-          <div className="px-4 py-3 border-b border-slate-800">
+        <div className="w-96 border-l border-[var(--separator-soft)] bg-[var(--bg-secondary)] flex flex-col">
+          <div className="px-4 py-3 border-b border-[var(--separator-soft)]">
             <p className="text-xs font-bold text-white">
               {selectedLead ? selectedLead.name : 'Selecione um lead'}
             </p>
@@ -604,7 +604,7 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
           </div>
 
           {selectedLead && (
-            <div className="p-3 border-t border-slate-800 flex items-end gap-2">
+            <div className="p-3 border-t border-[var(--separator-soft)] flex items-end gap-2">
               <textarea
                 value={draftMsg}
                 onChange={(e) => setDraftMsg(e.target.value)}

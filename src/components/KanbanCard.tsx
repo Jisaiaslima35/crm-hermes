@@ -84,12 +84,12 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
       draggable
       onDragStart={handleDragStart}
       onClick={() => onOpenChat(lead.id)}
-      className={`group relative w-full flex-shrink-0 p-3.5 rounded-xl border transition-all cursor-grab active:cursor-grabbing hover:shadow-xl select-none ${
+      className={`ap-card ap-card-hover group relative w-full flex-shrink-0 p-4 cursor-grab active:cursor-grabbing select-none ${
         isHumanAssumed
-          ? 'bg-gradient-to-b from-amber-950/40 via-slate-900 to-slate-900 border-amber-500/60 shadow-amber-950/20'
+          ? 'bg-gradient-to-b from-amber-950/50 via-amber-950/20 to-slate-900 shadow-[0_1px_2px_rgba(0,0,0,0.4),0_4px_16px_rgba(245,158,11,0.18)]'
           : isUrgent
-          ? 'bg-slate-900/90 border-rose-500/50 hover:border-rose-400 shadow-rose-950/20'
-          : 'bg-slate-900/90 border-slate-800 hover:border-slate-700 hover:bg-slate-850'
+          ? 'bg-slate-900 shadow-[0_1px_2px_rgba(0,0,0,0.4),0_4px_16px_rgba(255,69,58,0.16)]'
+          : ''
       }`}
     >
       {/* Top Header of Card: Handoff status & Priority */}
@@ -101,7 +101,7 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
               e.stopPropagation();
               onToggleHandoff(lead.id);
             }}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-500/50 text-amber-300 text-[10px] font-bold tracking-wide hover:bg-amber-500/30 transition-colors cursor-pointer"
+            className="ap-chip bg-amber-500/18 text-amber-300 hover:bg-amber-500/28 transition-colors cursor-pointer"
             title="IA Pausada! Clique para devolver para a IA"
           >
             <UserCheck className="w-3 h-3 text-amber-400" />
@@ -113,7 +113,7 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
               e.stopPropagation();
               onToggleHandoff(lead.id);
             }}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] font-semibold hover:bg-emerald-500/25 transition-colors cursor-pointer"
+            className="ap-chip bg-emerald-500/16 text-emerald-300 hover:bg-emerald-500/26 transition-colors cursor-pointer"
             title="IA Ativa respondendo! Clique para travar (Kill-switch)"
           >
             <Bot className="w-3 h-3 text-emerald-400" />
@@ -124,23 +124,23 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
         {/* Priority Badge */}
         <div className="flex items-center gap-1.5">
           {lead.priority === 'urgente' && (
-            <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-400 border border-rose-500/40 text-[10px] font-bold flex items-center gap-0.5">
+            <span className="ap-chip bg-rose-500/20 text-rose-300">
               <ShieldAlert className="w-2.5 h-2.5" />
               URGENTE
             </span>
           )}
           {lead.priority === 'alta' && (
-            <span className="px-1.5 py-0.5 rounded bg-orange-500/20 text-orange-400 border border-orange-500/40 text-[10px] font-bold">
+            <span className="ap-chip bg-orange-500/18 text-orange-300">
               ALTA
             </span>
           )}
 
           {/* Insurance Tag */}
           <span
-            className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${
+            className={`ap-chip ${
               lead.insuranceType === 'convenio'
-                ? 'bg-sky-950/60 text-sky-300 border-sky-800/60'
-                : 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60'
+                ? 'bg-sky-500/16 text-sky-300'
+                : 'bg-emerald-500/14 text-emerald-300'
             }`}
           >
             {lead.insuranceType === 'convenio' ? lead.insuranceName || 'Convênio' : 'Particular'}
@@ -149,18 +149,18 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
       </div>
 
       {/* Patient Avatar, Name & Phone */}
-      <div className="flex items-start gap-2.5 mb-2">
+      <div className="flex items-start gap-3 mb-3">
         <img
           src={lead.avatarUrl}
           alt={lead.name}
-          className="w-9 h-9 rounded-full object-cover border border-slate-700 shrink-0"
+          className="w-10 h-10 rounded-full object-cover ring-1 ring-white/10 shrink-0"
         />
         <div className="min-w-0 flex-1">
-          <h4 className="text-xs font-bold text-slate-100 truncate group-hover:text-sky-300 transition-colors">
+          <h4 className="text-[15px] font-semibold text-[var(--label-primary)] truncate group-hover:text-sky-300 transition-colors">
             {lead.name}
           </h4>
-          <p className="text-[11px] text-slate-400 flex items-center gap-1">
-            <Phone className="w-2.5 h-2.5 text-slate-500" />
+          <p className="text-[13px] text-[var(--label-secondary)] flex items-center gap-1 mt-0.5">
+            <Phone className="w-3 h-3 text-[var(--label-tertiary)]" />
             <span>{lead.formattedPhone || formatPhone(lead.phone)}</span>
           </p>
         </div>
@@ -168,15 +168,15 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
 
       {/* Especialidade / Tenant Tag (NOVO - msg 5606) */}
       {(lead.tenantSpecialty || lead.tenantName) && (
-        <div className="flex items-center gap-1 mb-2 flex-wrap">
+        <div className="flex items-center gap-1.5 mb-3 flex-wrap">
           {lead.tenantSpecialty && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-950/60 text-violet-300 border border-violet-800/60">
+            <span className="ap-chip bg-violet-500/16 text-violet-300">
               <Briefcase className="w-2.5 h-2.5" />
               {lead.tenantSpecialty}
             </span>
           )}
           {lead.tenantName && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-800/80 text-slate-300 border border-slate-700/60">
+            <span className="ap-chip bg-white/8 text-[var(--label-secondary)]">
               <Building2 className="w-2.5 h-2.5" />
               <span className="truncate max-w-[140px]">{lead.tenantName}</span>
             </span>
@@ -193,23 +193,23 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
 
         return (
           <>
-            <div className="p-2 rounded-lg bg-slate-950/60 border border-slate-800/80 mb-2.5">
-              <div className="flex items-center gap-1 text-[10px] font-semibold text-slate-400 mb-0.5">
+            <div className="p-3 rounded-[12px] bg-white/[0.045] mb-3">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--label-secondary)] mb-1">
                 {isTourism ? (
                   <>
-                    <Plane className="w-3 h-3 text-teal-400" />
-                    <span>Interesse / Destino do viajante:</span>
+                    <Plane className="w-3.5 h-3.5 text-teal-400" />
+                    <span>Interesse / Destino do viajante</span>
                   </>
                 ) : (
                   <>
-                    <Stethoscope className="w-3 h-3 text-sky-400" />
-                    <span>Queixa / Dor do cliente:</span>
+                    <Stethoscope className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Queixa / Dor do cliente</span>
                   </>
                 )}
               </div>
-              <p className="text-[11px] text-slate-300 leading-snug line-clamp-2">
+              <p className="text-[13px] text-[var(--label-primary)] leading-snug line-clamp-2">
                 {lead.mainComplaint || (
-                  <span className="text-slate-500 italic">
+                  <span className="text-[var(--label-tertiary)] italic">
                     {isTourism ? 'sem destino registrado' : 'sem queixa registrada'}
                   </span>
                 )}
@@ -217,17 +217,17 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
 
               {/* Tags / Sintomas ou Interesses */}
               {lead.detectedSymptoms && lead.detectedSymptoms.length > 0 && (
-                <div className="flex flex-wrap gap-1 mt-1.5 pt-1.5 border-t border-slate-800/60">
+                <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-[var(--separator-soft)]">
                   {lead.detectedSymptoms.slice(0, 3).map((sym, idx) => (
                     <span
                       key={idx}
-                      className="px-1.5 py-0.2 text-[9px] rounded bg-slate-800 text-slate-300 border border-slate-700/60"
+                      className="ap-chip bg-white/8 text-[var(--label-secondary)]"
                     >
                       {sym}
                     </span>
                   ))}
                   {lead.detectedSymptoms.length > 3 && (
-                    <span className="text-[9px] text-slate-500">
+                    <span className="text-[10px] text-[var(--label-tertiary)]">
                       +{lead.detectedSymptoms.length - 3}
                     </span>
                   )}
@@ -244,7 +244,7 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
                     e.stopPropagation();
                     onRegisterTrip?.(lead);
                   }}
-                  className="w-full py-1.5 px-2 rounded-lg bg-teal-600/25 hover:bg-teal-600/40 border border-teal-500/40 text-teal-300 text-[11px] font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  className="w-full py-2 px-3 rounded-[12px] bg-teal-500/16 hover:bg-teal-500/26 text-teal-300 text-[12px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[36px]"
                 >
                   <Plane className="w-3.5 h-3.5 text-teal-400" />
                   <span>✈️ Registrar Nova Viagem</span>
@@ -257,41 +257,41 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
 
       {/* Appointment Slot Info if Scheduled */}
       {lead.appointmentTimeSlot && (
-        <div className="mb-2 p-1.5 rounded bg-teal-950/50 border border-teal-800/50 flex items-center gap-1.5 text-[10px] text-teal-300 font-medium">
-          <CalendarCheck className="w-3 h-3 text-teal-400 shrink-0" />
+        <div className="mb-3 px-3 py-2 rounded-[10px] bg-teal-500/14 flex items-center gap-1.5 text-[11px] text-teal-300 font-medium">
+          <CalendarCheck className="w-3.5 h-3.5 text-teal-400 shrink-0" />
           <span className="truncate">{formatAppointmentSlot(lead.appointmentTimeSlot)}</span>
         </div>
       )}
 
       {/* Follow-up status indicator (NOVO - msg 5601) */}
       {lead.followupCount !== undefined && lead.followupCount > 0 && (
-        <div className="mb-2 px-1.5 py-1 rounded bg-sky-950/40 border border-sky-800/50 flex items-center gap-1.5 text-[10px] text-sky-300">
-          <Tag className="w-3 h-3 text-sky-400 shrink-0" />
+        <div className="mb-3 px-3 py-2 rounded-[10px] bg-sky-500/14 flex items-center gap-1.5 text-[11px] text-sky-300">
+          <Tag className="w-3.5 h-3.5 text-sky-400 shrink-0" />
           <span>Follow-up #{lead.followupCount} enviado</span>
         </div>
       )}
 
       {/* Footer: Silence Radar & Last Interaction */}
-      <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 text-[10px]">
+      <div className="flex items-center justify-between pt-2.5 border-t border-[var(--separator-soft)] text-[11px]">
         {/* Silence indicator */}
         <div
           className={`flex items-center gap-1 ${
             isSilentRadar
-              ? 'text-rose-400 font-bold animate-pulse'
+              ? 'text-rose-400 font-semibold'
               : isCold
-              ? 'text-amber-400 font-bold'
-              : 'text-slate-400'
+              ? 'text-orange-400 font-medium'
+              : 'text-[var(--label-secondary)]'
           }`}
           title={`Tempo sem resposta: ${lead.silenceHours || 0}h${
             isSilentRadar ? ' — Radar de Silêncio (24h+)' : ''
           }`}
         >
           {isSilentRadar ? (
-            <AlertTriangle className="w-3 h-3 text-rose-400" />
+            <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
           ) : isCold ? (
-            <AlertTriangle className="w-3 h-3 text-amber-400" />
+            <AlertTriangle className="w-3.5 h-3.5 text-orange-400" />
           ) : (
-            <Clock className="w-3 h-3 text-slate-500" />
+            <Clock className="w-3.5 h-3.5 text-[var(--label-tertiary)]" />
           )}
           <span>
             {isSilentRadar
@@ -303,9 +303,9 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
         </div>
 
         {/* Interaction time + open hint */}
-        <div className="flex items-center gap-1 text-slate-400 group-hover:text-sky-400 transition-colors">
+        <div className="flex items-center gap-1 text-[var(--label-tertiary)] group-hover:text-sky-400 transition-colors">
           <span title={lead.lastInteractionAt}>{relativeTimeBR(lead.lastInteractionAt)}</span>
-          <ArrowRight className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+          <ArrowRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 transition-opacity" />
         </div>
       </div>
     </div>
