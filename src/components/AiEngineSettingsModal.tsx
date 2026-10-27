@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Cpu,
   Server,
@@ -17,6 +17,9 @@ import {
   Plus,
   Trash2,
   Users,
+  Eye,
+  EyeOff,
+  Lock,
 } from 'lucide-react';
 import {
   Tenant,
@@ -46,6 +49,67 @@ interface AiEngineSettingsModalProps {
   onClose: () => void;
 }
 
+// ---------------------------------------------------------------------------
+// Normalizadores — a grade/follow-up chegam do backend (JSONB) em dois
+// formatos: o atual (`weekly_slots`) e o legado (`days_of_week`).
+// ---------------------------------------------------------------------------
+
+function normalizeScheduleRules(raw: any): ScheduleRules {
+  if (raw && Array.isArray(raw.weekly_slots) && raw.weekly_slots.length > 0) {
+    return {
+      enabled: raw.enabled !== false,
+      weekly_slots: raw.weekly_slots,
+      timezone: raw.timezone || 'America/Fortaleza',
+      slot_duration_minutes: raw.slot_duration_minutes || 30,
+    };
+  }
+  if (raw && Array.isArray(raw.days_of_week) && raw.days_of_week.length > 0) {
+    const startTime = raw.time_slots?.[0] || '18:00';
+    const endTime = raw.time_slots?.[raw.time_slots.length - 1] || '20:00';
+    return {
+      enabled: raw.enabled !== false,
+      weekly_slots: raw.days_of_week.map((d: number) => ({
+        day_of_week: d,
+        start_time: startTime,
+        end_time: endTime,
+        max_capacity: 6,
+      })),
+      timezone: raw.timezone || 'America/Fortaleza',
+      slot_duration_minutes: raw.slot_duration_minutes || 30,
+    };
+  }
+  return {
+    enabled: true,
+    weekly_slots: [
+      {
+        day_of_week: 2,
+        start_time: '18:00',
+        end_time: '20:00',
+        max_capacity: 6,
+      },
+    ],
+    timezone: 'America/Fortaleza',
+    slot_duration_minutes: 30,
+  };
+}
+
+function normalizeFollowupRules(raw: any): FollowupRules {
+  const r = (raw || {}) as Partial<FollowupRules>;
+  let mins = r.silence_minutes;
+  if (mins === undefined) {
+    if (r.silence_hours !== undefined) {
+      mins = Number(r.silence_hours) * 60;
+    } else {
+      mins = 15;
+    }
+  }
+  return {
+    enabled: r.enabled !== false,
+    silence_minutes: mins,
+    silence_hours: Math.max(1, Math.round(mins / 60)),
+  };
+}
+
 export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
   activeTenant,
   onSaveTenant,
@@ -55,63 +119,28 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     ...activeTenant.aiEngine,
   });
 
-  const [scheduleRules, setScheduleRules] = useState<ScheduleRules>(() => {
-    const raw = activeTenant.scheduleRules || {};
-    if (Array.isArray(raw.weekly_slots) && raw.weekly_slots.length > 0) {
-      return {
-        enabled: raw.enabled !== false,
-        weekly_slots: raw.weekly_slots,
-        timezone: raw.timezone || 'America/Fortaleza',
-        slot_duration_minutes: raw.slot_duration_minutes || 30,
-      };
-    }
-    if (Array.isArray(raw.days_of_week) && raw.days_of_week.length > 0) {
-      const startTime = raw.time_slots?.[0] || '18:00';
-      const endTime = raw.time_slots?.[raw.time_slots.length - 1] || '20:00';
-      return {
-        enabled: raw.enabled !== false,
-        weekly_slots: raw.days_of_week.map((d) => ({
-          day_of_week: d,
-          start_time: startTime,
-          end_time: endTime,
-          max_capacity: 6,
-        })),
-        timezone: raw.timezone || 'America/Fortaleza',
-        slot_duration_minutes: raw.slot_duration_minutes || 30,
-      };
-    }
-    return {
-      enabled: true,
-      weekly_slots: [
-        {
-          day_of_week: 2,
-          start_time: '18:00',
-          end_time: '20:00',
-          max_capacity: 6,
-        },
-      ],
-      timezone: 'America/Fortaleza',
-      slot_duration_minutes: 30,
-    };
-  });
+  const [scheduleRules, setScheduleRules] = useState<ScheduleRules>(() =>
+    normalizeScheduleRules(activeTenant.scheduleRules)
+  );
 
-  const [followupRules, setFollowupRules] = useState<FollowupRules>(() => {
-    const raw = (activeTenant.followupRules || {}) as Partial<FollowupRules>;
-    let mins = raw.silence_minutes;
-    if (mins === undefined) {
-      if (raw.silence_hours !== undefined) {
-        mins = Number(raw.silence_hours) * 60;
-      } else {
-        mins = 15;
-      }
-    }
-    return {
-      enabled: raw.enabled !== false,
-      silence_minutes: mins,
-      silence_hours: Math.max(1, Math.round(mins / 60)),
-    };
-  });
+  const [followupRules, setFollowupRules] = useState<FollowupRules>(() =>
+    normalizeFollowupRules(activeTenant.followupRules)
+  );
 
+  // -------------------------------------------------------------------------
+  // Chave BYOK — o browser NUNCA recebe a chave em claro.
+  //   `byokKeyMasked` = máscara devolvida pelo backend (ex.: sk-abc...wxyz)
+  //   `byokKeyDraft`  = o que o gestor acabou de digitar (fica só em memória
+  //                     enquanto o modal estiver aberto e é enviado por HTTPS)
+  // -------------------------------------------------------------------------
+  const [byokKeyMasked, setByokKeyMasked] = useState<string>(
+    activeTenant.aiEngine.byokKeyMasked || ''
+  );
+  const [byokKeyDraft, setByokKeyDraft] = useState<string>('');
+  const [showKeyDraft, setShowKeyDraft] = useState(false);
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<{
     success: boolean;
@@ -119,9 +148,52 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     message: string;
   } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  // Modelos descobertos via GET /v1/models após Testar Conexão.
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Modelos descobertos via POST /ai-engine/test (descoberta server-side).
   // Quando vazio, o select usa a lista estática de BYOK_PROVIDERS.
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+
+  // Carrega a config do motor direto do backend do tenant: chave MASCARADA
+  // + valores atuais (persona, tom, prompt, grade, follow-up).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setIsLoading(true);
+      setLoadError(null);
+      try {
+        const serverConfig = await deskcommService.fetchAiEngineConfig(activeTenant.id);
+        if (cancelled) return;
+        setConfig((prev) => ({
+          ...prev,
+          mode: (serverConfig.ai_mode as AiEngineMode) || prev.mode,
+          byokProvider: (serverConfig.byok_provider as AiProvider) || prev.byokProvider,
+          byokModel: serverConfig.byok_model || prev.byokModel,
+          personaName: serverConfig.persona_name || prev.personaName,
+          tone: (serverConfig.tone_of_voice as AiEngineConfig['tone']) || prev.tone,
+          systemPrompt: serverConfig.system_prompt ?? prev.systemPrompt,
+          hermesEndpoint: serverConfig.hermes_gateway_url || prev.hermesEndpoint,
+        }));
+        if (serverConfig.schedule_rules) {
+          setScheduleRules(normalizeScheduleRules(serverConfig.schedule_rules));
+        }
+        if (serverConfig.followup_rules) {
+          setFollowupRules(normalizeFollowupRules(serverConfig.followup_rules));
+        }
+        setByokKeyMasked(serverConfig.byok_api_key_masked || '');
+      } catch (err: any) {
+        if (cancelled) return;
+        setLoadError(
+          err?.message ||
+            'Não foi possível carregar a configuração do motor de IA no servidor.'
+        );
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTenant.id]);
 
   const handleAddSlot = () => {
     setScheduleRules((prev) => ({
@@ -168,7 +240,14 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     setTestResult(null);
     setDiscoveredModels([]);
     try {
-      const res = await deskcommService.testAiConnection(config);
+      // Teste SERVER-SIDE: a chave em claro nunca sai do browser para o
+      // provedor. O backend usa a chave cifrada (ou a nova que o gestor
+      // acabou de digitar).
+      const res = await deskcommService.testAiConnection(
+        activeTenant.id,
+        config,
+        byokKeyDraft
+      );
       setTestResult(res);
       if (res.success && res.models && res.models.length > 0) {
         setDiscoveredModels(res.models);
@@ -182,41 +261,70 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
       setTestResult({
         success: false,
         latencyMs: 0,
-        message: 'Erro inesperado ao validar motor de IA.',
+        message: err?.message || 'Erro inesperado ao validar motor de IA.',
       });
     } finally {
       setIsTesting(false);
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     setIsSaving(true);
+    setSaveError(null);
     const mins = followupRules.silence_minutes ?? 15;
     const hours = Math.max(1, Math.round(mins / 60));
-    const updatedTenant: Tenant = {
-      ...activeTenant,
-      aiEngine: {
-        ...config,
-        silenceThresholdHours: hours,
-        autoFollowup: followupRules.enabled,
-      },
-      scheduleRules: {
-        ...scheduleRules,
-        days_of_week: Array.from(
-          new Set((scheduleRules.weekly_slots || []).map((s) => s.day_of_week))
-        ),
-      },
-      followupRules: {
-        enabled: followupRules.enabled,
-        silence_minutes: mins,
-        silence_hours: hours,
-      },
-    };
-    onSaveTenant(updatedTenant);
-    setTimeout(() => {
-      setIsSaving(false);
+    try {
+      // Grava no BACKEND: é ele que cifra a chave BYOK. Se o gestor não
+      // digitou uma chave nova, reenviamos a máscara — o backend mantém a
+      // chave que já tem guardada.
+      const saved = await deskcommService.saveAiEngineConfig(activeTenant.id, {
+        ai_mode: config.mode,
+        byok_provider: config.byokProvider,
+        byok_model: config.byokModel,
+        byok_api_key: byokKeyDraft.trim() || byokKeyMasked || undefined,
+        persona_name: config.personaName,
+        tone_of_voice: config.tone,
+        system_prompt: config.systemPrompt,
+        schedule_rules: scheduleRules,
+        followup_rules: followupRules,
+      });
+
+      const savedMasked = saved.byok_api_key_masked || byokKeyMasked;
+      const updatedTenant: Tenant = {
+        ...activeTenant,
+        aiEngine: {
+          ...config,
+          // A chave BYOK em claro NUNCA entra no objeto Tenant (que pode
+          // ser serializado). Só a versão mascarada.
+          byokKey: '',
+          byokKeyMasked: savedMasked,
+          silenceThresholdHours: hours,
+          autoFollowup: followupRules.enabled,
+        },
+        scheduleRules: {
+          ...scheduleRules,
+          days_of_week: Array.from(
+            new Set((scheduleRules.weekly_slots || []).map((s) => s.day_of_week))
+          ),
+        },
+        followupRules: {
+          enabled: followupRules.enabled,
+          silence_minutes: mins,
+          silence_hours: hours,
+        },
+      };
+      onSaveTenant(updatedTenant);
+      setByokKeyMasked(savedMasked);
+      setByokKeyDraft('');
+      setShowKeyDraft(false);
       onClose();
-    }, 400);
+    } catch (err: any) {
+      setSaveError(
+        err?.message || 'Falha ao salvar as configurações do motor de IA.'
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const selectedProviderData = BYOK_PROVIDERS.find((p) => p.id === config.byokProvider) || BYOK_PROVIDERS[0];
@@ -252,6 +360,22 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
 
         {/* Modal Body */}
         <div className="flex-1 p-5 overflow-y-auto space-y-5">
+          {/* Erros de carregamento (401/403/404/500 do backend) — mensagem
+              clara pro gestor, sem stack trace. */}
+          {(loadError || saveError) && (
+            <div className="flex items-start gap-2 p-3 rounded-xl bg-rose-950/40 border border-rose-800/60 text-[11px] text-rose-200">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+              <span className="leading-relaxed">{saveError || loadError}</span>
+            </div>
+          )}
+
+          {isLoading && (
+            <div className="flex items-center gap-2 p-3 rounded-xl bg-slate-850 border border-slate-800 text-[11px] text-slate-400">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>A carregar a configuração do motor no servidor...</span>
+            </div>
+          )}
+
           {/* Mode Switcher Tabs */}
           <div>
             <label className="text-xs font-bold text-slate-300 block mb-2">
@@ -409,16 +533,53 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
 
               <div>
                 <label className="text-[11px] font-semibold text-slate-300 block mb-1">
-                  API Key da {selectedProviderData.name} (Mascarada)
+                  API Key da {selectedProviderData.name} (mascarada)
                 </label>
-                <input
-                  id="input-byok-key"
-                  type="password"
-                  placeholder="sk-..."
-                  value={config.byokKey}
-                  onChange={(e) => setConfig({ ...config, byokKey: e.target.value })}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white placeholder:text-slate-600 font-mono focus:outline-none focus:border-purple-500"
-                />
+                <div className="relative">
+                  <input
+                    id="input-byok-key"
+                    type={byokKeyDraft ? (showKeyDraft ? 'text' : 'password') : 'text'}
+                    placeholder="sk-..."
+                    value={byokKeyDraft || byokKeyMasked}
+                    onChange={(e) => setByokKeyDraft(e.target.value)}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 pr-10 text-xs text-white placeholder:text-slate-600 font-mono focus:outline-none focus:border-purple-500"
+                  />
+                  {byokKeyDraft && (
+                    <button
+                      type="button"
+                      onClick={() => setShowKeyDraft((v) => !v)}
+                      title={showKeyDraft ? 'Ocultar chave' : 'Mostrar chave'}
+                      aria-label={showKeyDraft ? 'Ocultar chave' : 'Mostrar chave'}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-white transition-colors cursor-pointer"
+                    >
+                      {showKeyDraft ? (
+                        <EyeOff className="w-3.5 h-3.5" />
+                      ) : (
+                        <Eye className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1.5 leading-relaxed">
+                  {byokKeyDraft ? (
+                    <>
+                      A nova chave será enviada por HTTPS ao servidor e gravada{' '}
+                      <strong className="text-slate-300">cifrada</strong>. O
+                      navegador nunca volta a exibi-la.
+                    </>
+                  ) : byokKeyMasked ? (
+                    <>
+                      <Lock className="inline w-3 h-3 -mt-0.5 mr-1" />
+                      Chave guardada no servidor:{' '}
+                      <span className="font-mono text-slate-300">{byokKeyMasked}</span>.
+                      Cole uma nova chave para substituir.
+                    </>
+                  ) : (
+                    'Nenhuma chave guardada no servidor ainda. Cole a chave do provedor para ativar o modo BYOK.'
+                  )}
+                </p>
               </div>
             </div>
           )}
@@ -459,6 +620,16 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
                   <AlertCircle className="w-4 h-4 shrink-0" />
                 )}
                 <span>{testResult.message}</span>
+                {testResult.success && testResult.latencyMs > 0 && (
+                  <span className="text-slate-500 font-mono">
+                    {testResult.latencyMs}ms
+                  </span>
+                )}
+                {testResult.success && discoveredModels.length > 0 && (
+                  <span className="text-slate-500">
+                    · {discoveredModels.length} modelos
+                  </span>
+                )}
               </div>
             )}
           </div>

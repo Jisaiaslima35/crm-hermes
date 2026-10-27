@@ -53,8 +53,11 @@ interface SidebarProps {
 
 // ----------------------------------------------------------------------------
 // Sidebar — RBAC: visão enxuta para a clínica (clinic_admin), visão
-// completa para o super_admin. A "Conectividade & IA" técnica e o
-// "Live CRM (Supabase)" (debug) só aparecem pro super_admin.
+// completa para o super_admin. A secção "Conectividade & IA"
+// (Instâncias WhatsApp + Motor de IA Híbrido) aparece pra qualquer
+// gestor de tenant (super_admin, clinic_admin, admin) — o Motor de IA
+// é do TENANT, não da plataforma. Já o "Live CRM (Supabase)" (debug)
+// e o "Painel Super Admin" continuam exclusivos do super_admin.
 //
 // O card da clínica mostra o nome da persona (Dory, etc.) em vez da marca
 // genérica "Hermes VPS" — pra reforçar que aquilo é o assistente da
@@ -385,11 +388,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
 
-          {/* === CONECTIVIDADE & WHATSAPP (Super Admin e Admin da Clínica) === */}
+          {/* === CONECTIVIDADE & IA (Super Admin e Admin da Clínica) ===
+              O bloco inclui super_admin, clinic_admin e admin — e EXCLUI
+              o attendant_doctor (atendente não gere o motor de IA).
+              O "Motor de IA Híbrido" mora aqui pra que qualquer gestor
+              de tenant aceda à config do SEU motor (multi-tenancy). */}
           {canManageWhatsApp && (
             <>
               <div className="pt-2 px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                {isSuperAdmin ? 'Conectividade & IA' : 'Conectividade'}
+                Conectividade &amp; IA
               </div>
 
               <button
@@ -410,12 +417,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   Evolution
                 </span>
               </button>
-            </>
-          )}
 
-          {/* === VISÃO TÉCNICA — só pro super_admin === */}
-          {isSuperAdmin && (
-            <>
+              {/* Motor de IA & Persona — visível pra qualquer gestor de
+                  tenant (super_admin, clinic_admin, admin). */}
               <button
                 id="nav-ai-settings"
                 onClick={() => setCurrentView('ai_settings')}
@@ -433,7 +437,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   {activeTenant.aiEngine.mode === 'hermes_vps' ? 'VPS' : 'BYOK'}
                 </span>
               </button>
+            </>
+          )}
 
+          {/* === VISÃO TÉCNICA — só pro super_admin === */}
+          {isSuperAdmin && (
+            <>
               <button
                 id="nav-live-crm"
                 onClick={() => setCurrentView('live_crm')}

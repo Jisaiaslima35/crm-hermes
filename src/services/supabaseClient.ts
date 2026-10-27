@@ -22,3 +22,25 @@ export const supabaseConfig = {
   url: supabaseUrl,
   hasAnonKey: Boolean(supabaseAnonKey),
 };
+
+/**
+ * Access token da sessão Supabase atual (mesmo mecanismo usado pelo
+ * useAuth / AuthGuard — nada de auth novo). Retorna null quando não há
+ * sessão (usuário deslogado) ou quando o refresh falha.
+ *
+ * Usado pra autenticar as chamadas autenticadas ao backend do CRM
+ * (header `Authorization: Bearer <token>`).
+ */
+export async function getAccessToken(): Promise<string | null> {
+  try {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) {
+      console.warn('[supabase] getSession falhou:', error.message);
+      return null;
+    }
+    return data.session?.access_token ?? null;
+  } catch (e) {
+    console.warn('[supabase] getSession lançou erro:', e);
+    return null;
+  }
+}

@@ -51,7 +51,18 @@ export interface AiEngineConfig {
   hermesToken: string;
   byokProvider: AiProvider;
   byokModel: string;
+  /**
+   * Chave BYOK em CLARO. NUNCA deve ser preenchida em tempo de leitura
+   * (vem do servidor sempre mascarada) — só existe no input do modal
+   * enquanto o gestor digita uma chave nova, e é enviada direto pro
+   * backend via HTTPS. Não é persistida no Tenant nem no localStorage.
+   */
   byokKey: string;
+  /**
+   * Chave BYOK MASCARADA (ex.: `sk-abc...wxyz`) devolvida pelo backend.
+   * É o único valor da chave que o browser pode conhecer.
+   */
+  byokKeyMasked?: string;
   personaName: string;
   doctorSpecialty: string;
   tone: 'acolhedor' | 'clinico' | 'direto';

@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" fill="none" width="100%" height="100%">
+  <defs>
+    <linearGradient id="esvcBlueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#0369a1" />
+    </linearGradient>
+    <linearGradient id="esvcGreenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+    <linearGradient id="trailGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0" />
+      <stop offset="60%" stop-color="#10b981" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="1" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Flight Path Arc -->
+  <path d="M 28 85 C 38 72, 54 48, 86 36" stroke="url(#trailGrad)" stroke-width="4" stroke-linecap="round" fill="none" />
+  
+  <!-- Icon Background Badge (Dark Navy & Green Border) -->
+  <rect x="18" y="18" width="84" height="84" rx="24" fill="#091428" stroke="#10b981" stroke-width="2.5" />
+  <circle cx="60" cy="60" r="30" fill="#0f2142" />
+
+  <!-- Stylized Airplane -->
+  <g transform="translate(60, 60) rotate(-28)">
+    <!-- Jet Fuselage -->
+    <path d="M 0 -22 L 4 -4 L 4 14 L 0 11 L -4 14 L -4 -4 Z" fill="#ffffff" />
+    <!-- Main Wings -->
+    <path d="M 0 -7 L 22 7 L 21 11 L 3 6 L 0 5 L -3 6 L -21 11 L -22 7 Z" fill="url(#esvcGreenGrad)" />
+    <!-- Tail Wing -->
+    <path d="M 0 10 L 9 17 L 8 19 L 0 16 L -8 19 L -9 17 Z" fill="#38bdf8" />
+  </g>
+
+  <!-- Small Soaring Stars/Accents -->
+  <circle cx="86" cy="30" r="2.5" fill="#34d399" filter="url(#glow)" />
+  <circle cx="28" cy="85" r="2" fill="#38bdf8" />
+
+  <!-- Brand Typography -->
+  <text x="122" y="65" font-family="'Plus Jakarta Sans', 'Inter', system-ui, sans-serif" font-weight="900" font-size="44" fill="#ffffff" letter-spacing="1.5">
+    ESVC
+  </text>
+  <text x="262" y="65" font-family="'Plus Jakarta Sans', 'Inter', system-ui, sans-serif" font-weight="800" font-size="44" fill="#10b981" letter-spacing="2">
+    TURISMO
+  </text>
+  
+  <!-- Subtitle Tagline -->
+  <rect x="124" y="78" width="168" height="20" rx="6" fill="#0b1b36" stroke="#1e3a8a" stroke-width="1" />
+  <text x="134" y="92" font-family="'Plus Jakarta Sans', 'Inter', system-ui, sans-serif" font-weight="700" font-size="10" fill="#38bdf8" letter-spacing="2.5">
+    AGÊNCIA DE VIAGENS
+  </text>
+
+  <!-- Green Accent Dot -->
+  <circle cx="282" cy="88" r="3" fill="#10b981" />
+</svg>

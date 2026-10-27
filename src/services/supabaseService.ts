@@ -1,4 +1,4 @@
-import { supabase } from './supabaseClient';
+import { supabase, getAccessToken } from './supabaseClient';
 export { supabase };
 import type {
   Tenant,
@@ -6,6 +6,7 @@ import type {
   LeadMessage,
   PipelineStage,
   HandoffState,
+  AiEngineMode,
 } from '../types';
 
 // ============================================================================
@@ -28,7 +29,12 @@ export interface DbTenant {
   persona_name?: string | null;
   tone_of_voice?: string | null;
   byok_provider?: string | null;
+  // Coluna LEGADA (cleartext). O frontend NUNCA escreve aqui — a chave
+  // viva fica cifrada no backend (byok_api_key_encrypted). Lemos apenas
+  // pra derivar a máscara de exibição.
   byok_api_key?: string | null;
+  // Máscara oficial devolvida pelo backend (GET /tenants/{id}/ai-engine).
+  byok_api_key_masked?: string | null;
   byok_model?: string | null;
   // Interruptor Mestre de Plantão IA (migration 20260915)
   // Pode vir null/undefined em tenants pré-migração — default true no mapper.
@@ -86,6 +92,17 @@ function formatPhone(digits: string): string {
   return digits;
 }
 
+/**
+ * Mascara um segredo para exibição (`sk-abc...wxyz`). Nunca devolve o
+ * valor completo — é usada apenas no cliente, sobre chaves legadas.
+ */
+export function maskSecret(raw: string | null | undefined): string {
+  const v = (raw || '').trim();
+  if (!v) return '';
+  if (v.length <= 10) return v.slice(0, 2) + '*'.repeat(Math.max(0, v.length - 2));
+  return `${v.slice(0, 6)}...${v.slice(-4)}`;
+}
+
 function dbTenantToTenant(row: DbTenant): Tenant {
   return {
     id: row.id,
@@ -105,7 +122,10 @@ function dbTenantToTenant(row: DbTenant): Tenant {
       hermesToken: '',
       byokProvider: (row.byok_provider as any) || 'gemini',
       byokModel: row.byok_model || '',
-      byokKey: row.byok_api_key || '',
+      // A chave BYOK em claro NUNCA entra no objeto Tenant (ele vai pro
+      // localStorage em fluxos legados e pra UI). Só a máscara circula.
+      byokKey: '',
+      byokKeyMasked: row.byok_api_key_masked || maskSecret(row.byok_api_key),
       personaName: row.persona_name || 'Persona',
       doctorSpecialty: row.specialty,
       tone: (row.tone_of_voice as any) || 'acolhedor',
@@ -317,6 +337,8 @@ export async function patchLead(input: {
 }
 
 // Upsert de subset de colunas de tenant (campos opcionais ignorados se ausentes).
+// ATENÇÃO: a chave BYOK NÃO passa por aqui — ela é gravada (cifrada) pelo
+// backend no endpoint PUT /tenants/{tenant_id}/ai-engine. Ver `saveAiEngineConfig`.
 export async function upsertTenantMeta(input: {
   id: string;
   name: string;
@@ -330,7 +352,6 @@ export async function upsertTenantMeta(input: {
   persona_name?: string;
   tone_of_voice?: string;
   byok_provider?: string;
-  byok_api_key?: string;
   byok_model?: string;
   schedule_rules?: any;
   followup_rules?: any;
@@ -350,7 +371,6 @@ export async function upsertTenantMeta(input: {
   if (input.persona_name !== undefined) payload.persona_name = input.persona_name;
   if (input.tone_of_voice !== undefined) payload.tone_of_voice = input.tone_of_voice;
   if (input.byok_provider !== undefined) payload.byok_provider = input.byok_provider;
-  if (input.byok_api_key !== undefined) payload.byok_api_key = input.byok_api_key;
   if (input.byok_model !== undefined) payload.byok_model = input.byok_model;
   if (input.schedule_rules !== undefined) payload.schedule_rules = input.schedule_rules;
   if (input.followup_rules !== undefined) payload.followup_rules = input.followup_rules;
@@ -602,6 +622,169 @@ export interface EvolutionCreateResult {
 const crmWebhookBase =
   (import.meta.env.VITE_CRM_WEBHOOK_URL as string | undefined) ||
   'https://crm-webhook.automacaojs.us';
+
+// ============================================================================
+// Motor de IA Híbrido — API autenticada do backend (FastAPI)
+//
+// A config do motor é propriedade do TENANT e vive no backend. O browser
+// só enxerga a chave BYOK MASCARADA (`byok_api_key_masked`); a chave em
+// claro trafega por HTTPS no corpo do PUT e é cifrada pelo servidor.
+// Nada de chave em claro no localStorage, no objeto Tenant ou na tabela
+// `tenants`.
+//
+//   GET  /tenants/{tenant_id}/ai-engine        → config (chave mascarada)
+//   PUT  /tenants/{tenant_id}/ai-engine        → grava (cifra a chave)
+//   POST /tenants/{tenant_id}/ai-engine/test   → teste server-side do BYOK
+//
+// Todos exigem `Authorization: Bearer <access_token da sessão Supabase>`.
+// ============================================================================
+
+export interface AiEngineApiConfig {
+  ai_mode?: AiEngineMode;
+  byok_provider?: string;
+  byok_model?: string;
+  byok_api_key_masked?: string;
+  persona_name?: string;
+  tone_of_voice?: string;
+  system_prompt?: string;
+  schedule_rules?: any;
+  followup_rules?: any;
+  hermes_gateway_url?: string;
+  ai_auto_reply_enabled?: boolean;
+}
+
+export interface AiEngineApiUpdate {
+  ai_mode?: AiEngineMode;
+  byok_provider?: string;
+  byok_model?: string;
+  /**
+   * Chave em claro — só para SUBSTITUIR a chave guardada. Se vier
+   * vazia/ausente/igual à máscara, o backend mantém a que já tem.
+   */
+  byok_api_key?: string;
+  persona_name?: string;
+  tone_of_voice?: string;
+  system_prompt?: string;
+  schedule_rules?: any;
+  followup_rules?: any;
+}
+
+export interface AiEngineTestResult {
+  ok: boolean;
+  latency_ms?: number;
+  models?: string[];
+  message?: string;
+}
+
+/** Erro de comunicação com o backend do motor de IA (traz o status HTTP). */
+export class AiEngineApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'AiEngineApiError';
+    this.status = status;
+  }
+}
+
+function aiEngineErrorMessage(status: number, body: any): string {
+  const detail =
+    (typeof body?.detail === 'string' && body.detail) ||
+    (typeof body?.message === 'string' && body.message) ||
+    (typeof body?.error === 'string' && body.error) ||
+    '';
+  if (status === 401) {
+    return detail || 'Sessão expirada ou não autenticada. Faça login novamente.';
+  }
+  if (status === 403) {
+    return detail || 'Sem permissão: esta configuração pertence a outra organização.';
+  }
+  if (status === 404) {
+    return 'Backend do Motor de IA indisponível (endpoint /ai-engine não encontrado).';
+  }
+  if (status === 400) {
+    return detail || 'Requisição recusada pelo backend do Motor de IA.';
+  }
+  return detail || `Falha ao falar com o backend do Motor de IA (HTTP ${status}).`;
+}
+
+async function aiEngineRequest<T>(
+  path: string,
+  opts: { method?: string; body?: unknown } = {}
+): Promise<T> {
+  const token = await getAccessToken();
+  if (!token) {
+    throw new AiEngineApiError(
+      'Sessão não autenticada. Faça login novamente para gerir o Motor de IA.',
+      401
+    );
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${crmWebhookBase}${path}`, {
+      method: opts.method || 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch {
+    throw new AiEngineApiError(
+      'Backend do Motor de IA inacessível. Verifique a rede e tente novamente.',
+      0
+    );
+  }
+  const raw = await res.text();
+  let json: any = null;
+  try {
+    json = raw ? JSON.parse(raw) : null;
+  } catch {
+    json = null;
+  }
+  if (!res.ok) {
+    throw new AiEngineApiError(aiEngineErrorMessage(res.status, json), res.status);
+  }
+  return (json ?? {}) as T;
+}
+
+/** Lê a config do motor do tenant (chave BYOK sempre mascarada). */
+export async function fetchAiEngineConfig(
+  tenantId: string
+): Promise<AiEngineApiConfig> {
+  const json = await aiEngineRequest<{ ok?: boolean; config?: AiEngineApiConfig }>(
+    `/tenants/${encodeURIComponent(tenantId)}/ai-engine`
+  );
+  return json?.config ?? {};
+}
+
+/**
+ * Grava a config do motor no backend. A chave em claro (quando enviada)
+ * é cifrada pelo servidor; a resposta traz a chave MASCARADA.
+ */
+export async function saveAiEngineConfig(
+  tenantId: string,
+  payload: AiEngineApiUpdate
+): Promise<AiEngineApiConfig> {
+  const json = await aiEngineRequest<{ ok?: boolean; config?: AiEngineApiConfig }>(
+    `/tenants/${encodeURIComponent(tenantId)}/ai-engine`,
+    { method: 'PUT', body: payload }
+  );
+  return json?.config ?? {};
+}
+
+/**
+ * Testa a conexão com o provedor BYOK no SERVIDOR (a chave em claro nunca
+ * sai do backend quando o gestor não digita uma nova).
+ */
+export async function testAiEngineConnection(
+  tenantId: string,
+  payload: { byok_provider?: string; byok_model?: string; byok_api_key?: string }
+): Promise<AiEngineTestResult> {
+  return aiEngineRequest<AiEngineTestResult>(
+    `/tenants/${encodeURIComponent(tenantId)}/ai-engine/test`,
+    { method: 'POST', body: payload }
+  );
+}
 
 export interface KanbanStageRow {
   id: string;

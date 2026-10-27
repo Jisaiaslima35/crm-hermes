@@ -15,20 +15,13 @@ import {
   LeadMessage,
   InternalNote,
   AiEngineConfig,
+  AiEngineMode,
 } from '../types';
 import * as liveStore from './liveStore';
 import * as remote from './supabaseService';
 
 const STORAGE_KEY_TENANTS = 'deskcomm_tenants_v1';
 const STORAGE_KEY_LEADS = 'deskcomm_leads_v1';
-
-// Endpoints base para validação de conexão BYOK via GET /models.
-// Espelha a tabela _BROADCAST_PROVIDERS do webhook (webhook_server.py).
-const BYOK_BASE_URLS: Record<string, string> = {
-  openai: 'https://api.openai.com/v1',
-  openrouter: 'https://openrouter.ai/api/v1',
-  gemini: 'https://generativelanguage.googleapis.com/v1beta/openai',
-};
 
 // ---------------------------------------------------------------------------
 // Helpers de migração: na primeira inicialização, se liveStore está vazio mas
@@ -144,6 +137,26 @@ export function normalizePhone(raw: string): string {
   return digits.length >= 10 ? digits : '5500000000000';
 }
 
+/**
+ * Higieniza seeds legadas: a chave BYOK em claro NUNCA deve sobreviver
+ * no objeto Tenant (que pode ser serializado pro localStorage). Fica
+ * só a máscara — a chave de verdade vive cifrada no backend.
+ */
+function sanitizeTenantSecrets(tenants: Tenant[]): Tenant[] {
+  return tenants.map((t) => {
+    const legacyKey = t.aiEngine?.byokKey || '';
+    if (!legacyKey) return t;
+    return {
+      ...t,
+      aiEngine: {
+        ...t.aiEngine,
+        byokKey: '',
+        byokKeyMasked: t.aiEngine.byokKeyMasked || remote.maskSecret(legacyKey),
+      },
+    };
+  });
+}
+
 function ensureBootstrapped(): void {
   if (_bootstrapped) return;
   _bootstrapped = true;
@@ -153,9 +166,9 @@ function ensureBootstrapped(): void {
     if (rawT) {
       const parsed = JSON.parse(rawT) as Tenant[];
       const seed = parsed.length ? parsed : INITIAL_TENANTS;
-      liveStore.setTenants(seed);
+      liveStore.setTenants(sanitizeTenantSecrets(seed));
     } else {
-      liveStore.setTenants(INITIAL_TENANTS);
+      liveStore.setTenants(sanitizeTenantSecrets(INITIAL_TENANTS));
     }
     if (rawL) {
       const parsed = JSON.parse(rawL) as Lead[];
@@ -193,7 +206,9 @@ class DeskcommService {
   public updateTenant(updatedTenant: Tenant): Tenant {
     liveStore.upsertTenant(updatedTenant);
     // Persistência best-effort no Supabase (subset das colunas relevantes
-    // ao motor IA: config completa de persona, tom, system_prompt, BYOK).
+    // ao motor IA: config completa de persona, tom, system_prompt).
+    // A CHAVE BYOK NÃO VAI AQUI — ela é gravada (cifrada) pelo backend no
+    // endpoint PUT /tenants/{id}/ai-engine. Ver `saveAiEngineConfig`.
     remote
       .upsertTenantMeta({
         id: updatedTenant.id,
@@ -207,13 +222,42 @@ class DeskcommService {
         persona_name: updatedTenant.aiEngine.personaName,
         tone_of_voice: updatedTenant.aiEngine.tone,
         byok_provider: updatedTenant.aiEngine.byokProvider,
-        byok_api_key: updatedTenant.aiEngine.byokKey,
         byok_model: updatedTenant.aiEngine.byokModel,
         schedule_rules: updatedTenant.scheduleRules,
         followup_rules: updatedTenant.followupRules,
       })
       .catch((e) => console.warn('[deskcommService] upsertTenant falhou:', e));
     return updatedTenant;
+  }
+
+  // ---------- MOTOR DE IA (config do tenant, gravada pelo backend) ----------
+
+  /** Lê a config do motor no backend (chave BYOK sempre mascarada). */
+  public async fetchAiEngineConfig(
+    tenantId: string
+  ): Promise<remote.AiEngineApiConfig> {
+    return remote.fetchAiEngineConfig(tenantId);
+  }
+
+  /**
+   * Grava a config do motor via PUT /tenants/{id}/ai-engine.
+   * O backend cifra a chave BYOK e devolve a versão mascarada.
+   */
+  public async saveAiEngineConfig(
+    tenantId: string,
+    payload: {
+      ai_mode: AiEngineMode;
+      byok_provider: string;
+      byok_model: string;
+      byok_api_key?: string;
+      persona_name: string;
+      tone_of_voice: string;
+      system_prompt: string;
+      schedule_rules: any;
+      followup_rules: any;
+    }
+  ): Promise<remote.AiEngineApiConfig> {
+    return remote.saveAiEngineConfig(tenantId, payload);
   }
 
   // ---------- LEADS ----------
@@ -501,8 +545,19 @@ class DeskcommService {
     return updated;
   }
 
+  /**
+   * Testa a conexão do motor.
+   *
+   * - Modo A (Hermes VPS): health check do endpoint da VPS. Não envolve
+   *   segredo nenhum, então continua no browser.
+   * - Modo B (BYOK): teste SERVER-SIDE via POST /tenants/{id}/ai-engine/test.
+   *   A chave em claro NÃO vai pro provedor pelo browser — o backend usa a
+   *   chave cifrada que já tem, ou a nova que o gestor acabou de digitar.
+   */
   public async testAiConnection(
-    config: AiEngineConfig
+    tenantId: string,
+    config: AiEngineConfig,
+    byokKeyDraft?: string
   ): Promise<{
     success: boolean;
     latencyMs: number;
@@ -545,53 +600,38 @@ class DeskcommService {
       }
     }
 
-    // Modo B (BYOK): GET {baseUrl}/models com Bearer API key
-    if (!config.byokKey || config.byokKey.length < 8) {
-      return {
-        success: false,
-        latencyMs: 0,
-        message: 'API Key BYOK inválida ou muito curta.',
-      };
-    }
-    const baseUrl = BYOK_BASE_URLS[config.byokProvider];
-    if (!baseUrl) {
-      return {
-        success: false,
-        latencyMs: 0,
-        message: `Provedor BYOK '${config.byokProvider}' sem endpoint conhecido.`,
-      };
-    }
-    const t0 = performance.now();
+    // Modo B (BYOK): teste no servidor. A chave só vai no corpo se o
+    // gestor tiver digitado uma nova — caso contrário o backend usa a
+    // que já está cifrada.
+    const payload: {
+      byok_provider?: string;
+      byok_model?: string;
+      byok_api_key?: string;
+    } = {
+      byok_provider: config.byokProvider,
+      byok_model: config.byokModel,
+    };
+    const draft = (byokKeyDraft || '').trim();
+    if (draft) payload.byok_api_key = draft;
+
     try {
-      const r = await fetch(baseUrl + '/models', {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${config.byokKey}`,
-        },
-      });
-      const latencyMs = Math.round(performance.now() - t0);
-      if (!r.ok) {
-        return {
-          success: false,
-          latencyMs,
-          message: `Falha na conexão: chave inválida ou endpoint inacessível (HTTP ${r.status}).`,
-        };
-      }
-      const data = await r.json();
-      const models = Array.isArray(data?.data)
-        ? data.data.map((m: any) => String(m.id)).filter(Boolean)
-        : [];
+      const res = await remote.testAiEngineConnection(tenantId, payload);
+      const models = Array.isArray(res.models) ? res.models : [];
+      const ok = res.ok !== false;
       return {
-        success: true,
-        latencyMs,
-        message: `Conexão validada. ${models.length} modelos encontrados.`,
+        success: ok,
+        latencyMs: typeof res.latency_ms === 'number' ? res.latency_ms : 0,
+        message:
+          res.message ||
+          (ok ? 'Conexão validada no servidor.' : 'Falha ao validar a conexão.'),
         models,
       };
     } catch (e: any) {
       return {
         success: false,
-        latencyMs: Math.round(performance.now() - t0),
-        message: `Falha na conexão: chave inválida ou endpoint inacessível (${e?.message || 'erro de rede'}).`,
+        latencyMs: 0,
+        message:
+          e?.message || 'Falha ao testar o motor de IA no servidor. Tente novamente.',
       };
     }
   }
