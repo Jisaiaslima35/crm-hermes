@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import re
+import random
 import time
+import unicodedata
 import uuid
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
@@ -32,14 +34,16 @@ TZ_CLINICA = ZoneInfo("America/Fortaleza")
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Form, File, UploadFile, Body
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
 from jev_decision import avaliar_lead_clinico, DecisaoClinicaJEV
+from jev_copilot_engine import evaluate_lead_copilot
 from media_handler import (
     get_media_base64_from_evolution,
     process_audio_message,
     process_image_message,
+    extract_receipt_data_multimodal,
 )
 
 # ============================================================================
@@ -58,6 +62,12 @@ for _secret in ("9router.env", "evolution.env", "composio.env"):
 SUPABASE_URL = os.environ["VITE_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["VITE_SUPABASE_ANON_KEY"]
 MENDES_WEBHOOK_URL = "https://wacrm.automacaojs.us/api/whatsapp/webhook/evolution"
+# Fan-out pro Prospector Automação JS — repassa eventos Evolution recebidos
+# pelo CRM-Hermes pra manter o Prospector ativo (disparos + conexões 9373).
+# Só ativado para a instância `formiga` (canal oficial Isaías 9373). Em outros
+# tenants fica desligado pra não duplicar tráfego no Prospector.
+PROSPECTOR_WEBHOOK_URL = "http://127.0.0.1:3012/webhook/evolution"
+PROSPECTOR_FANOUT_INSTANCES = frozenset({"formiga"})
 
 # 9router (LLM gateway OpenAI-compat)
 NINEROUTER_API_KEY = os.environ.get("NINEROUTER_API_KEY", "")
@@ -224,8 +234,10 @@ COMPOSIO_META_TOOLS: list[dict[str, Any]] = [
 # Cliente Supabase (REST; o schema expõe leads/messages com anon key)
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Cache em memória: evolution_instance -> tenant_id (uuid)
-_TENANT_BY_INSTANCE: dict[str, str] = {}
+# Cache em memória com TTL de 60s: evolution_instance -> (tenant_id, fetched_at)
+_TENANT_BY_INSTANCE: dict[str, tuple[str, float]] = {}
+_TENANT_INSTANCE_TTL_SECONDS = 60.0
+
 # Cache de config do tenant: (cfg_dict, fetched_at_monotonic_seconds).
 # TTL curto (60s) pra refletir rápido mudanças de `ai_auto_reply_enabled`
 # feitas via front sem reiniciar o webhook.
@@ -368,16 +380,203 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Números internos da clínica (Dr., secretária, bot, Casa Zen).
+# O minerador (e qualquer automação) NUNCA cria appointment/financial/
+# complaint/muda stage pra esses. Match exato após normalizar (só dígitos).
+# Se aparecer novo número da clínica, adicione explicitamente aqui —
+# JAMAIS use filtro genérico (pode bloquear paciente real).
+# Números do operador (Isaías / instância Evolution): blindados em TODOS os tenants.
+INTERNAL_PHONES_GLOBAL_RAW = [
+    "55849921629373", "5584921629373",   # Bot / Instância Evolution (Isaías automação Pc)
+]
+# Números internos SOMENTE da clínica (tenant 1111): equipe e conta de teste do
+# Dr. Matheus. Não podem vazar para outros tenants — no ESVC Turismo, o número
+# 558491821245 é um cliente (Israel) e deve ser minerado/qualificado normalmente
+# (correção de 2026-10-23: a lista global herdada da clínica travava o funil).
+INTERNAL_PHONES_CLINIC_RAW = [
+    "558499666262", "55849666262",       # Dr. Matheus Dore (pessoal)
+    "5584991367962", "558491367962",     # Ana Beatriz / Casa Zen
+    "5584991821245", "558491821245",     # Conta de teste do Dr. (só na clínica)
+]
+INTERNAL_PHONES_RAW = INTERNAL_PHONES_GLOBAL_RAW + INTERNAL_PHONES_CLINIC_RAW
+INTERNAL_PHONE_SET: set[str] = set(INTERNAL_PHONES_GLOBAL_RAW)
+CLINIC_INTERNAL_PHONE_SET: set[str] = set(INTERNAL_PHONES_CLINIC_RAW)
+
+
+def _is_clinic_tenant(tenant_id: Any = None) -> bool:
+    return "1111" in str(tenant_id or "1111")
+
+
+def _is_internal_phone(phone: str | None, tenant_id: Any = None) -> bool:
+    n = _normalize_phone(phone or "")
+    if n in INTERNAL_PHONE_SET:
+        return True
+    if n in CLINIC_INTERNAL_PHONE_SET and _is_clinic_tenant(tenant_id):
+        return True
+    return False
+
+
 def _normalize_phone(digits: str) -> str:
     """Mantém só dígitos; Evolution manda formatos variados."""
     return re.sub(r"\D", "", digits or "")
 
 
+def _phone_variants(phone: str) -> list[str]:
+    """Gera variações com e sem nono dígito e com/sem DDI 55 para busca flexível de leads."""
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return []
+    variants = [digits]
+    if digits.startswith("55"):
+        # DDI 55 + DDD (2 dig) + 9 dígitos = 13 dígitos (ex: 5584996327329)
+        if len(digits) == 13:
+            no_nine = digits[:4] + digits[5:]
+            variants.extend([no_nine, digits[2:], no_nine[2:]])
+        # DDI 55 + DDD (2 dig) + 8 dígitos = 12 dígitos (ex: 558496327329)
+        elif len(digits) == 12:
+            with_nine = digits[:4] + "9" + digits[4:]
+            variants.extend([with_nine, digits[2:], with_nine[2:]])
+    elif len(digits) == 11:
+        # DDD (2 dig) + 9 dígitos (ex: 84996327329)
+        no_nine = digits[:2] + digits[3:]
+        variants.extend(["55" + digits, no_nine, "55" + no_nine])
+    elif len(digits) == 10:
+        # DDD (2 dig) + 8 dígitos (ex: 8496327329)
+        with_nine = digits[:2] + "9" + digits[2:]
+        variants.extend(["55" + digits, with_nine, "55" + with_nine])
+
+    seen = set()
+    return [v for v in variants if v and not (v in seen or seen.add(v))]
+
+
+# Cache local em memória para contatos blindados/ignorados (TTL 60s)
+_IGNORED_CONTACTS_CACHE: dict[str, dict[str, Any]] = {}
+_IGNORED_CONTACTS_CACHE_TTL = 60.0
+
+
+def is_contact_ignored(tenant_id: str | None, phone: str = "", name: str = "") -> bool:
+    """Helper dinâmico com cache local (TTL 60s) para consultar tenant_ignored_contacts.
+    Retorna True se o número ou o nome baterem com registros cadastrados na blindagem.
+    """
+    global _IGNORED_CONTACTS_CACHE
+    t_str = str(tenant_id or "1111").strip()
+    norm_phone = _normalize_phone(phone or "")
+    clean_name = (name or "").strip().lower()
+
+    # 1. Fallback estático imediato (segurança crítica local)
+    if _is_internal_phone(norm_phone, t_str):
+        return True
+    static_patterns = ["matheus dore", "clinica zen", "clinica zem", "casa zen", "beatriz", "paciente teste"]
+    if clean_name and any(p in clean_name for p in static_patterns):
+        return True
+
+    # 2. Consulta com cache TTL 60s
+    now_ts = time.time()
+    cache_key = "1111" if ("1111" in t_str) else t_str
+    cache_entry = _IGNORED_CONTACTS_CACHE.get(cache_key)
+
+    if not cache_entry or (now_ts - cache_entry.get("timestamp", 0) > _IGNORED_CONTACTS_CACHE_TTL):
+        try:
+            tenant_filter = ["1111", "11111111-1111-1111-1111-111111111111"] if "1111" in t_str else [t_str]
+            res = (
+                sb.table("tenant_ignored_contacts")
+                .select("id, tenant_id, name, phone, reason")
+                .in_("tenant_id", tenant_filter)
+                .execute()
+            )
+            contacts = res.data or []
+            _IGNORED_CONTACTS_CACHE[cache_key] = {
+                "timestamp": now_ts,
+                "contacts": contacts,
+            }
+            cache_entry = _IGNORED_CONTACTS_CACHE[cache_key]
+        except Exception as e:
+            logger.warning("[BLINDAGEM] Falha ao consultar tenant_ignored_contacts: %s", e)
+            if not cache_entry:
+                return False
+
+    ignored_list = cache_entry.get("contacts", []) if cache_entry else []
+    phone_vars = set(_phone_variants(norm_phone)) if norm_phone else set()
+    if norm_phone:
+        phone_vars.add(norm_phone)
+
+    for item in ignored_list:
+        db_phone = _normalize_phone(item.get("phone") or "")
+        db_name = (item.get("name") or "").strip().lower()
+
+        # Checa telefone com variantes de 8/9 dígitos e DDI 55
+        if db_phone and phone_vars:
+            db_vars = set(_phone_variants(db_phone))
+            db_vars.add(db_phone)
+            if phone_vars.intersection(db_vars):
+                return True
+
+        # Checa nome
+        if db_name and clean_name:
+            if db_name == clean_name:
+                return True
+            if len(db_name) >= 2 and db_name in clean_name:
+                return True
+            if len(clean_name) >= 2 and clean_name in db_name:
+                return True
+
+    return False
+
+
+def _is_internal_test_contact(
+    lead: dict[str, Any] | None,
+    phone: str = "",
+    sender_name: str = "",
+    latest_msg: str = "",
+) -> bool:
+    """Trava estrita: contatos internos da clínica (Dr. Matheus Dore, Casa/Clínica Zen, Beatriz, testes).
+    Retorna True se for contato interno/teste para impedir early-on mineração, agendamentos e financeiros.
+    """
+    if not lead and not phone and not sender_name:
+        return False
+    lead = lead or {}
+    tenant_id = str(lead.get("tenant_id") or "1111")
+    lead_name = str(lead.get("name") or sender_name or "").strip()
+    lead_phone = str(lead.get("phone") or phone or "").strip()
+
+    if is_contact_ignored(tenant_id, phone=lead_phone, name=lead_name):
+        return True
+
+    lead_name_l = lead_name.lower()
+    s_name = (sender_name or "").lower()
+
+    patterns = [
+        "matheus dore",
+        "clinica zen",
+        "clinica zem",
+        "casa zen",
+        "beatriz",
+        "paciente teste",
+    ]
+    if any(p in lead_name_l for p in patterns):
+        return True
+    if any(p in s_name for p in patterns):
+        return True
+    if _is_internal_phone(lead_phone, tenant_id):
+        return True
+    return False
+
+
+# Valor fallback quando consulta particular é agendada MAS nenhum valor
+# foi citado na conversa. Antes: R$ 350. Calibrado em 2026-10-08 para R$ 300.
+FALLBACK_PARTICULAR_VALUE = 300.0
+
+
 def _resolve_tenant_id(instance_name: str) -> Optional[str]:
     if not instance_name:
         return None
-    if instance_name in _TENANT_BY_INSTANCE:
-        return _TENANT_BY_INSTANCE[instance_name]
+    now = time.monotonic()
+    cached = _TENANT_BY_INSTANCE.get(instance_name)
+    if cached is not None:
+        tid, fetched_at = cached
+        if (now - fetched_at) < _TENANT_INSTANCE_TTL_SECONDS:
+            return tid
+
     res = (
         sb.table("tenants")
         .select("id")
@@ -387,8 +586,26 @@ def _resolve_tenant_id(instance_name: str) -> Optional[str]:
     )
     if res.data:
         tid = res.data[0]["id"]
-        _TENANT_BY_INSTANCE[instance_name] = tid
+        _TENANT_BY_INSTANCE[instance_name] = (tid, now)
         return tid
+    return None
+
+
+def _get_prospector_prompt_for_instance(instance_name: Optional[str] = None) -> Optional[str]:
+    """Consulta em tempo real o System Prompt mestre configurado no SQLite do Prospector (porta 3012)."""
+    inst = (instance_name or "formiga").strip()
+    try:
+        import sqlite3
+        for db_p in ("/opt/prospector/data/prospector.db", "/opt/prospector/prospector.db"):
+            if os.path.exists(db_p):
+                with sqlite3.connect(db_p, timeout=2.0) as sconn:
+                    scur = sconn.cursor()
+                    scur.execute("SELECT prompt FROM config_prompts WHERE instance_name = ? LIMIT 1;", (inst,))
+                    srow = scur.fetchone()
+                    if srow and srow[0] and srow[0].strip():
+                        return srow[0].strip()
+    except Exception as se:
+        logger.warning("[%s] Erro ao ler prompt do Prospector SQLite: %s", inst, se)
     return None
 
 
@@ -413,7 +630,8 @@ def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
             "name, specialty, doctor_name, city, "
             "ai_mode, system_prompt, persona_name, tone_of_voice, "
             "byok_provider, byok_api_key, byok_model, "
-            "hermes_gateway_url, ai_auto_reply_enabled"
+            "hermes_gateway_url, ai_auto_reply_enabled, "
+            "schedule_rules"
         )
         .eq("id", tenant_id)
         .limit(1)
@@ -421,6 +639,8 @@ def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
     )
     raw = res.data[0] if res.data else {}
     cfg = {
+        "id": tenant_id,
+        "tenant_id": tenant_id,
         "name": raw.get("name") or "Clínica",
         "specialty": raw.get("specialty") or "Saúde",
         "doctor_name": raw.get("doctor_name") or "Dr(a)",
@@ -438,6 +658,10 @@ def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
         "ai_auto_reply_enabled": bool(
             raw.get("ai_auto_reply_enabled", True)
         ),
+        # FASE 3 + BEATRIZ — grade horária controlada anti-alucinação e limite de vagas.
+        # Shape: {enabled, weekly_slots: [{day_of_week, start_time, end_time, max_capacity}], days_of_week, time_slots}.
+        # Vazio/default = sem limite (comportamento pré-Fase 3 preservado).
+        "schedule_rules": raw.get("schedule_rules") or {},
     }
     _TENANT_CFG_CACHE[tenant_id] = (cfg, now)
     return cfg
@@ -448,38 +672,348 @@ def _invalidate_tenant_cache(tenant_id: str) -> None:
     _TENANT_CFG_CACHE.pop(tenant_id, None)
 
 
+# --- FASE 3 + BEATRIZ — Grade Horária Controlada & Limite de Vagas (Anti-Overbooking) ---
+_DAYS_PT = {
+    0: "domingo",
+    1: "segunda",
+    2: "terça",
+    3: "quarta",
+    4: "quinta",
+    5: "sexta",
+    6: "sábado",
+}
+
+_DAYS_LONG_PT = {
+    0: "Domingo",
+    1: "Segunda-feira",
+    2: "Terça-feira",
+    3: "Quarta-feira",
+    4: "Quinta-feira",
+    5: "Sexta-feira",
+    6: "Sábado",
+}
+
+
+def _format_schedule_rules_for_prompt(schedule_rules: dict[str, Any] | None) -> str:
+    """Serializa as regras de `schedule_rules` em texto claro PT-BR para injeção no prompt da IA."""
+    if not schedule_rules or not isinstance(schedule_rules, dict):
+        return ""
+    if schedule_rules.get("enabled") is False:
+        return ""
+
+    weekly = schedule_rules.get("weekly_slots") or []
+    lines: list[str] = []
+
+    if weekly:
+        lines.append("📅 GRADE DE ATENDIMENTO & CAPACIDADE MÁXIMA DE VAGAS:")
+        for slot in weekly:
+            if not isinstance(slot, dict):
+                continue
+            d_idx = slot.get("day_of_week")
+            d_name = _DAYS_LONG_PT.get(d_idx, f"Dia {d_idx}")
+            st = slot.get("start_time") or "18:00"
+            et = slot.get("end_time") or "20:00"
+            cap = slot.get("max_capacity") or 6
+            lines.append(f"- {d_name}: das {st} às {et} (máximo {cap} pacientes por data)")
+        lines.append(
+            "REGRA OBRIGATÓRIA: Ofereça e aceite consultas ESTRITAMENTE dentro destes dias e faixas de horário. "
+            "Se o paciente solicitar um horário fora da grade ou se o limite de vagas for atingido, "
+            "informe com empatia os dias e horários em que há vagas disponíveis."
+        )
+    elif schedule_rules.get("days_of_week") and schedule_rules.get("time_slots"):
+        days = [_DAYS_LONG_PT.get(d, str(d)) for d in schedule_rules.get("days_of_week", [])]
+        slots = schedule_rules.get("time_slots", [])
+        lines.append("📅 HORÁRIOS PERMITIDOS PARA AGENDAMENTO:")
+        lines.append(f"- Dias de atendimento: {', '.join(days)}")
+        lines.append(f"- Horários permitidos: {', '.join(slots)}")
+        lines.append("Não marque consultas fora destes dias e horários.")
+
+    return "\n".join(lines)
+
+
+def _validate_slot_against_schedule(
+    start_iso: str,
+    schedule_rules: dict[str, Any] | None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Valida se `start_iso` cabe dentro de `schedule_rules` do tenant e verifica limite de vagas.
+
+    Schema `schedule_rules` (JSONB, migration 20261007_crm_enhancements.sql + Fase Beatriz):
+      {
+        "enabled": bool,
+        "weekly_slots": [
+          {"day_of_week": 2, "start_time": "18:00", "end_time": "20:00", "max_capacity": 6}
+        ],
+        "days_of_week": [0..6],          # Legado
+        "time_slots": ["08:00","14:00"], # Legado
+        "timezone": "America/Fortaleza"
+      }
+
+    Retorna:
+      {"ok": True} se passa, ou
+      {"ok": False, "reason": str, "schedule_violation": str, ...} se viola regra.
+    """
+    rules = schedule_rules or {}
+    if not isinstance(rules, dict) or rules.get("enabled") is False:
+        return {"ok": True}
+
+    weekly_slots = rules.get("weekly_slots") or []
+    days_raw = rules.get("days_of_week") or []
+    slots_raw = rules.get("time_slots") or []
+
+    # Se não há regras semanais nem legado, sem restrição (não trava)
+    if not weekly_slots and (not days_raw or not slots_raw):
+        return {"ok": True}
+
+    tz_name = str(rules.get("timezone") or "America/Fortaleza")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = TZ_CLINICA
+
+    s = (start_iso or "").strip()
+    if not s:
+        return {"ok": False, "reason": "slot_sem_data", "schedule_violation": "Data e horário não informados"}
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception as exc:
+        return {"ok": False, "reason": f"slot_iso_invalido:{exc}", "schedule_violation": "Formato de data inválido"}
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_CLINICA)
+    try:
+        dt_local = dt.astimezone(tz)
+    except Exception:
+        dt_local = dt
+
+    py_wd = dt_local.weekday()  # Python 0=Seg..6=Dom
+    spec_wd = (py_wd + 1) % 7   # Spec 0=Dom..6=Sáb
+    hh, mm = dt_local.hour, dt_local.minute
+    slot_minutes = hh * 60 + mm
+
+    # 1. Se tem weekly_slots (Schema Fase Beatriz: slots por dia com faixa de horário e capacidade)
+    if weekly_slots:
+        matching_day_slots = [
+            slot for slot in weekly_slots
+            if isinstance(slot, dict) and int(slot.get("day_of_week", -1)) == spec_wd
+        ]
+        if not matching_day_slots:
+            return {
+                "ok": False,
+                "reason": f"dia_nao_permitido:{_DAYS_PT.get(spec_wd, '?')}",
+                "schedule_violation": f"Atendimento não disponível às {_DAYS_PT.get(spec_wd, 'deste dia')}s",
+                "day_index": spec_wd,
+                "day_pt": _DAYS_PT.get(spec_wd, ""),
+            }
+
+        # Verifica se o horário solicitado cabe na faixa [start_time, end_time] com tolerância ±15 min
+        matched_slot = None
+        for slot in matching_day_slots:
+            st = str(slot.get("start_time") or "").strip()
+            et = str(slot.get("end_time") or "").strip()
+            if ":" not in st or ":" not in et:
+                continue
+            try:
+                sh, sm = map(int, st.split(":", 1))
+                eh, em = map(int, et.split(":", 1))
+                st_min = sh * 60 + sm
+                et_min = eh * 60 + em
+                if (st_min - 15) <= slot_minutes <= (et_min + 15):
+                    matched_slot = slot
+                    break
+            except Exception:
+                continue
+
+        if not matched_slot:
+            return {
+                "ok": False,
+                "reason": f"horario_fora_grade:slot_pedido={hh:02d}:{mm:02d}",
+                "schedule_violation": f"Horário {hh:02d}:{mm:02d} fora da grade de atendimento",
+                "slot_pedido": f"{hh:02d}:{mm:02d}",
+            }
+
+        # Trava Anti-Overbooking: verificar max_capacity contra contagem em appointments
+        max_cap = int(matched_slot.get("max_capacity") or 6)
+        if max_cap > 0 and tenant_id:
+            day_str = dt_local.strftime("%Y-%m-%d")
+            day_start_iso = f"{day_str}T00:00:00-03:00"
+            day_end_iso = f"{day_str}T23:59:59-03:00"
+            try:
+                res = (
+                    sb.table("appointments")
+                    .select("id", count="exact")
+                    .eq("tenant_id", tenant_id)
+                    .neq("status", "cancelou")
+                    .gte("start_time", day_start_iso)
+                    .lte("start_time", day_end_iso)
+                    .execute()
+                )
+                active_count = res.count if res.count is not None else len(res.data or [])
+                if active_count >= max_cap:
+                    logger.warning(
+                        "[CALENDAR] Overbooking bloqueado para tenant %s na data %s: %d/%d vagas",
+                        tenant_id, day_str, active_count, max_cap,
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "limite_vagas_atingido",
+                        "schedule_violation": "Limite de vagas atingido para esta data",
+                        "active_appointments": active_count,
+                        "max_capacity": max_cap,
+                    }
+            except Exception as exc:
+                logger.warning("[CALENDAR] Erro ao consultar appointments para overbooking: %s", exc)
+
+        return {"ok": True}
+
+    # 2. Legado: days_of_week + time_slots com tolerância ±15 min
+    days = [int(d) for d in days_raw if isinstance(d, (int, float, str)) and str(d).isdigit()]
+    days = [d for d in days if 0 <= d <= 6]
+    if spec_wd not in days:
+        return {
+            "ok": False,
+            "reason": f"dia_nao_permitido:{_DAYS_PT.get(spec_wd, '?')}",
+            "schedule_violation": f"Atendimento não disponível às {_DAYS_PT.get(spec_wd, 'deste dia')}s",
+            "day_index": spec_wd,
+            "day_pt": _DAYS_PT.get(spec_wd, ""),
+        }
+
+    candidates_min: list[int] = []
+    for raw in slots_raw:
+        sslot = str(raw).strip()
+        if not sslot or ":" not in sslot:
+            continue
+        try:
+            sh, sm = sslot.split(":", 1)
+            candidates_min.append(int(sh) * 60 + int(sm))
+        except Exception:
+            continue
+    if not candidates_min:
+        return {"ok": True}
+
+    closest = min(candidates_min, key=lambda x: abs(x - slot_minutes))
+    if abs(closest - slot_minutes) > 15:
+        return {
+            "ok": False,
+            "reason": (
+                f"horario_fora_grade:slot_pedido={hh:02d}:{mm:02d}_"
+                f"proximo_da_grade={closest // 60:02d}:{closest % 60:02d}"
+            ),
+            "schedule_violation": f"Horário {hh:02d}:{mm:02d} fora da grade de atendimento",
+            "slot_pedido": f"{hh:02d}:{mm:02d}",
+            "closest_slot": f"{closest // 60:02d}:{closest % 60:02d}",
+        }
+
+    return {"ok": True}
+
+
+BLOCKED_PATIENT_NAMES = frozenset({
+    "matheus dore",
+    "dr. matheus dore",
+    "dr matheus dore",
+    "dr. matheus",
+    "dr matheus",
+    "matheus",
+    "dore",
+    "beatriz",
+    "atendente",
+    "clinica zen",
+    "clínica zen",
+    "clinica",
+    "clínica",
+    "recepcao",
+    "recepção",
+    "secretaria",
+    "secretária",
+    "eu",
+    "voce",
+    "você",
+    "atendimento",
+    "suporte",
+})
+
+
+def is_invalid_patient_name(name: str) -> bool:
+    """Retorna True se o nome for genérico, inválido ou pertencer à equipe/médico."""
+    if not name or not isinstance(name, str):
+        return True
+    norm = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("utf-8").lower().strip()
+    norm = re.sub(r"[^\w\s]", "", norm).strip()
+    if not norm or len(norm) < 2:
+        return True
+    if norm in BLOCKED_PATIENT_NAMES:
+        return True
+    if "matheus dore" in norm or "dr matheus" in norm or "doutor matheus" in norm:
+        return True
+    return False
+
+
 def _get_or_create_lead(
-    tenant_id: str, phone: str, push_name: str
+    tenant_id: str, phone: str, push_name: str, is_from_me: bool = False
 ) -> Optional[dict[str, Any]]:
-    """Procura lead por (tenant_id, phone). Se não achar, cria."""
+    """Procura lead por (tenant_id, phone), tolerando 9º dígito. Se não achar, cria.
+    NUNCA atribui pushName ao lead se is_from_me=True ou se o nome pertencer ao médico/equipe.
+    """
     if not phone:
         return None
+    variants = _phone_variants(phone)
     res = (
         sb.table("leads")
         .select("*")
         .eq("tenant_id", tenant_id)
-        .eq("phone", phone)
+        .in_("phone", variants)
         .limit(1)
         .execute()
     )
+
+    # Valida o push_name do paciente (somente mensagens recebidas podem ter nome do paciente)
+    valid_name = None
+    if not is_from_me and push_name and not is_invalid_patient_name(push_name):
+        valid_name = push_name.strip()
+
+    default_name = valid_name or f"Contato {phone[-4:]}"
+
     if res.data:
-        sb.table("leads").update({"last_interaction": _now_iso()}).eq(
-            "id", res.data[0]["id"]
-        ).execute()
-        return res.data[0]
+        lead_row = res.data[0]
+        update_data = {
+            "last_interaction": _now_iso(),
+            "last_message_at": _now_iso(),
+        }
+        # Se o lead recebeu follow-up anterior e respondeu, reseta contador
+        if lead_row.get("followup_count", 0) in (1, 2) and lead_row.get("handoff_state") != "opt_out":
+            update_data["followup_count"] = 0
+            update_data["followup_status"] = "pending"
+
+        curr_name = (lead_row.get("name") or "").strip()
+        # Se o nome atual for proibido (ex: Matheus Dore) ou genérico:
+        if is_invalid_patient_name(curr_name) or curr_name in ("Contato WhatsApp", "Novo Contato", "Paciente", ""):
+            new_name = valid_name or f"Contato {phone[-4:]}"
+            update_data["name"] = new_name
+            lead_row["name"] = new_name
+        elif valid_name and curr_name.startswith("Contato "):
+            update_data["name"] = valid_name
+            lead_row["name"] = valid_name
+
+        sb.table("leads").update(update_data).eq("id", lead_row["id"]).execute()
+        return lead_row
+
     insert = (
         sb.table("leads")
         .insert(
             {
                 "tenant_id": tenant_id,
                 "phone": phone,
-                "name": push_name or "Contato WhatsApp",
+                "name": default_name,
                 "stage": "novo_contato",
                 "ai_active": True,
                 "handoff_state": "ai",
                 "insurance": "Particular",
                 "priority": "NORMAL",
                 "clinical_summary": "",
+                "last_message_at": _now_iso(),
+                "followup_count": 0,
+                "followup_status": "pending",
             }
         )
         .execute()
@@ -506,10 +1040,23 @@ def _extract_text(data: dict[str, Any]) -> str:
 
 async def _extract_message(event: str, data: dict[str, Any], instance: str = "") -> dict[str, Any] | None:
     """Normaliza um payload Evolution pra {sender, sender_name, content, ts, phone, from_me}, com transcrição de áudio via Whisper e visão via 9Router."""
-    if event != "messages.upsert" and event != "messages_update":
+    norm_event = str(event or "").lower().replace("-", ".").replace("_", ".")
+    if norm_event not in ("messages.upsert", "messages.update", "send.message"):
         return None
+    if isinstance(data, list):
+        if not data:
+            return None
+        data = data[0]
+    elif isinstance(data, dict) and isinstance(data.get("messages"), list):
+        if not data["messages"]:
+            return None
+        data = data["messages"][0]
+
     key = data.get("key") or {}
     raw_remote = key.get("remoteJid") or ""
+    # Ignora mensagens de grupos do WhatsApp e de canais/newsletters
+    if "@g.us" in raw_remote or "@newsletter" in raw_remote:
+        return None
     phone = _normalize_phone(raw_remote.split("@")[0])
     if not phone:
         return None
@@ -533,17 +1080,38 @@ async def _extract_message(event: str, data: dict[str, Any], instance: str = "")
     if msg_type in {"ai_response", "bot_response", "ai", "bot"}:
         sender = "ai"
 
-    # Pipeline de Mídia (Áudio Whisper & Imagem 9Router) se for inbound de paciente
-    if sender == "patient":
-        msg_obj = data.get("message") or {}
-        is_audio = msg_type in {"audiomessage"} or "audioMessage" in msg_obj
-        is_image = msg_type in {"imagemessage"} or "imageMessage" in msg_obj
+    media_type = "text"
+    media_url: str | None = None
+    b64_image_raw: str = ""
+    media_mime_raw: str = "image/jpeg"
 
+    # Pipeline de Mídia (Áudio Whisper & Imagem 9Router)
+    msg_obj = data.get("message") or {}
+    is_audio = msg_type in {"audiomessage"} or "audioMessage" in msg_obj
+    is_image = msg_type in {"imagemessage"} or "imageMessage" in msg_obj
+    is_document = msg_type in {"documentmessage"} or "documentMessage" in msg_obj
+
+    if is_audio:
+        media_type = "audio"
+        audio_sub = msg_obj.get("audioMessage") or {}
+        media_url = audio_sub.get("url")
+    elif is_image:
+        media_type = "image"
+        img_sub = msg_obj.get("imageMessage") or {}
+        media_url = img_sub.get("url")
+    elif is_document:
+        media_type = "document"
+        doc_sub = msg_obj.get("documentMessage") or {}
+        media_url = doc_sub.get("url")
+
+    if sender == "patient":
         if is_audio:
             logger.info("[%s] 🎤 Áudio recebido do WhatsApp (%s), processando transcrição...", instance, phone)
             media_tuple = await get_media_base64_from_evolution(instance, data, EVOLUTION_BASE_URL, EVOLUTION_API_KEY)
             if media_tuple:
-                b64_audio, _ = media_tuple
+                b64_audio, mime = media_tuple
+                if not media_url:
+                    media_url = f"data:{mime};base64,{b64_audio}"
                 transcribed = await process_audio_message(b64_audio)
                 if transcribed:
                     text = transcribed
@@ -558,20 +1126,36 @@ async def _extract_message(event: str, data: dict[str, Any], instance: str = "")
             media_tuple = await get_media_base64_from_evolution(instance, data, EVOLUTION_BASE_URL, EVOLUTION_API_KEY)
             if media_tuple:
                 b64_img, mime = media_tuple
+                b64_image_raw = b64_img
+                media_mime_raw = mime
+                if not media_url:
+                    media_url = f"data:{mime};base64,{b64_img}"
                 img_caption = (msg_obj.get("imageMessage") or {}).get("caption", "")
-                system_instr = (
-                    "Você é a assistente clínica virtual. O paciente enviou uma imagem/exame pelo WhatsApp. "
-                    "Analise de forma acolhedora, ética e profissional. Se for exame ou receita, descreva o que identifica "
-                    "e informe que a consulta médica fará a validação clínica completa."
+                _inst_lower = (instance or "").lower()
+                _is_health_instance = (
+                    "clinic" in _inst_lower or "cardio" in _inst_lower or
+                    "saude" in _inst_lower or "saúde" in _inst_lower
                 )
+                if _is_health_instance:
+                    system_instr = (
+                        "Você é a assistente clínica virtual. O paciente enviou uma imagem/exame pelo WhatsApp. "
+                        "Analise de forma acolhedora, ética e profissional. Se for exame ou receita, descreva o que identifica "
+                        "e informe que a consulta médica fará a validação clínica completa."
+                    )
+                else:
+                    system_instr = (
+                        "Você é o assistente comercial/serviço do Isaías (Automação JS). O contato enviou uma imagem pelo WhatsApp. "
+                        "Analise de forma objetiva e útil: descreva o que vê (produto, marca, embalagem, tela de sistema, "
+                        "documento, print, etc) e dê uma resposta prática. Não use linguagem clínica."
+                    )
                 analysis = await process_image_message(b64_img, mimetype=mime, system_instruction=system_instr, caption=img_caption)
                 if analysis:
-                    text = f"[Foto/Exame enviado pelo paciente]: {analysis}"
+                    text = f"[Imagem enviada pelo contato]: {analysis}"
                     logger.info("[%s] 🖼️ Imagem analisada: %r", instance, analysis[:80])
                 else:
-                    text = "[Imagem enviada pelo paciente]" + (f": {img_caption}" if img_caption else "")
+                    text = "[Imagem enviada pelo contato]" + (f": {img_caption}" if img_caption else "")
             else:
-                text = "[Imagem enviada pelo paciente]"
+                text = "[Imagem enviada pelo contato]"
 
     if not text:
         text = f"[{msg_type or 'mensagem'}]"
@@ -584,6 +1168,11 @@ async def _extract_message(event: str, data: dict[str, Any], instance: str = "")
         "ts": ts,
         "from_me": bool(key.get("fromMe")),
         "message_type": msg_type or "conversation",
+        "is_image": is_image,
+        "media_type": media_type,
+        "media_url": media_url,
+        "b64_image": b64_image_raw,
+        "media_mime": media_mime_raw,
     }
 
 
@@ -614,25 +1203,74 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
     insurance = lead.get("insurance") or "Particular"
     stage = lead.get("stage") or "novo_contato"
 
-    # Contexto dinâmico (sempre presente)
+    # Contexto dinâmico (sempre presente). ATENÇÃO 01/10 (Isaías msg 5479):
+    # antes deste fix, o bloco usava terminologia fixa de clínica
+    # ("Clínica/Paciente/Convênio") mesmo pra tenants TECH/SaaS — o LLM ficava
+    # confuso entre o system_prompt custom (Tecnologia) e o contexto hardcoded
+    # (Clínica), e respondia "ainda não consegui visualizar" / "não sou
+    # assistente clínica". Agora os rótulos são GENÉRICOS: "Empresa" cobre
+    # clínica, SaaS, restaurante, loja, qualquer segmento. Só cai em
+    # linguagem clínica se o tenant ESPECIFICAMENTE tem `specialty` de saúde.
+    is_health = (specialty or "").strip().lower() in {
+        "saúde", "saude", "cardiologia", "psiquiatria", "nutrição", "nutricao",
+        "clínica", "clinica", "medicina", "psicologia", "pediatria",
+        "ginecologia", "dermatologia", "ortopedia", "odontologia",
+    }
+    if is_health:
+        org_label = "Clínica"
+        contact_label = "Paciente"
+        extra_ctx = f"- Convênio: {insurance}\n"
+    else:
+        org_label = "Empresa"
+        contact_label = "Contato"
+        extra_ctx = ""  # Convênio não se aplica a SaaS/varejo/tecnologia
     dynamic_ctx = (
         f"\n\nContexto operacional:\n"
-        f"- Clínica: {name} ({specialty})\n"
+        f"- {org_label}: {name} ({specialty})\n"
         f"- Responsável: {doctor}\n"
         f"- Persona: {persona}\n"
         f"- Tom de voz: {tone}\n"
-        f"- Paciente: {lead_name}\n"
-        f"- Convênio: {insurance}\n"
+        f"- {contact_label}: {lead_name}\n"
+        f"{extra_ctx}"
         f"- Estágio atual no funil: {stage}"
     )
+
+    sched_rules = tenant_cfg.get("schedule_rules")
+    sched_text = _format_schedule_rules_for_prompt(sched_rules)
 
     # Se o tenant cadastrou system_prompt custom, usa ele como bloco principal;
     # caso contrário cai no template padrão multi-clínica.
     custom = (tenant_cfg.get("system_prompt") or "").strip()
     if custom:
+        if "{{SCHEDULE_RULES}}" in custom:
+            custom = custom.replace("{{SCHEDULE_RULES}}", sched_text)
+        elif sched_text:
+            custom = f"{custom}\n\n{sched_text}"
         # Injeta contexto operacional ao final do prompt custom — sem isso a IA
         # esquece o nome/convênio/estágio a cada turno.
-        return f"{custom}{dynamic_ctx}"
+        identity_override = ""
+        if "matheus" in (name or "").lower() or "matheus" in (doctor or "").lower():
+            identity_override = (
+                "\n\n[REGRA INEANULÁVEL DE IDENTIDADE]:\n"
+                "IDENTIDADE: Você é a Assistente Virtual da Clínica de Psiquiatria do Dr. Matheus Dore. "
+                "Você é uma inteligência artificial de acolhimento e agendamento. "
+                "NUNCA diga 'Sou a Beatriz' ou 'Meu nome é Beatriz'. A Beatriz é a secretária humana da clínica. "
+                "Quando você for transferir ou mencionar o atendimento presencial/humano, diga: "
+                "'Vou conectar você com a Beatriz da nossa equipe' ou 'A Beatriz já vai dar continuidade ao seu atendimento'."
+            )
+        return f"{custom}{dynamic_ctx}{identity_override}"
+
+    sched_block = f"\n\n{sched_text}" if sched_text else ""
+    identity_override = ""
+    if "matheus" in (name or "").lower() or "matheus" in (doctor or "").lower():
+        identity_override = (
+            "\n\n[REGRA INEANULÁVEL DE IDENTIDADE]:\n"
+            "IDENTIDADE: Você é a Assistente Virtual da Clínica de Psiquiatria do Dr. Matheus Dore. "
+            "Você é uma inteligência artificial de acolhimento e agendamento. "
+            "NUNCA diga 'Sou a Beatriz' ou 'Meu nome é Beatriz'. A Beatriz é a secretária humana da clínica. "
+            "Quando você for transferir ou mencionar o atendimento presencial/humano, diga: "
+            "'Vou conectar você com a Beatriz da nossa equipe' ou 'A Beatriz já vai dar continuidade ao seu atendimento'."
+        )
 
     # Template padrão (mantido pra tenants sem custom prompt).
     # ATENÇÃO: NÃO mencionar nomes técnicos de ferramentas (Composio, meta-tools,
@@ -667,7 +1305,7 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         "confirmado virá em uma SEGUNDA mensagem (enviada pelo nosso sistema) — não por você.\n"
         "Se algo der errado (você perceber que não consegue fechar), diga apenas 'Nossa equipe "
         "entrará em contato em instantes para confirmar'. Não tente improvisar horários nem "
-        "links — sempre passe a confirmação pra equipe."
+        f"links — sempre passe a confirmação pra equipe.{sched_block}{identity_override}"
     )
 
 
@@ -784,6 +1422,9 @@ async def _call_llm(
 
     try:
         content, _ = await _post_chat_completion(target, messages, payload_extras)
+        if _is_technical_error_text(content):
+            logger.error("[_call_llm] Target %s retornou erro técnico: %r", target.get("source"), content[:200])
+            raise RuntimeError(f"Erro técnico detectado na resposta do LLM ({target.get('source')}): {content[:100]}")
         return content
     except Exception as exc:
         if target["source"] != "hermes_gateway":
@@ -793,10 +1434,16 @@ async def _call_llm(
             )
             return ""
         # Gateway dedicado caiu — tenta 9router antes de devolver vazio.
+        _9key = (
+            os.environ.get("NINEROUTER_API_KEY")
+            or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
+            or NINEROUTER_API_KEY
+            or "sk-ee9be57a70a07560-etddrv-19a7661c"
+        ).strip()
         fallback = {
             "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
             "model": NINEROUTER_DEFAULT_MODEL,
-            "apiKey": NINEROUTER_API_KEY,
+            "apiKey": _9key,
             "provider": "hermes_vps",
             "source": "hermes_vps",
         }
@@ -806,6 +1453,9 @@ async def _call_llm(
                 target["baseUrl"], target["model"], type(exc).__name__, str(exc)[:200],
             )
             content, _ = await _post_chat_completion(fallback, messages, payload_extras)
+            if _is_technical_error_text(content):
+                logger.error("[_call_llm fallback] 9Router retornou erro técnico: %r", content[:200])
+                return ""
             return content
         except Exception as exc2:
             logger.error(
@@ -875,10 +1525,16 @@ def _resolve_llm_target(tenant_cfg: dict[str, Any]) -> dict[str, Any]:
         )
 
     # 3. fallback: 9router (Hermes VPS)
+    _9key = (
+        os.environ.get("NINEROUTER_API_KEY")
+        or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
+        or NINEROUTER_API_KEY
+        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+    ).strip()
     return {
         "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
         "model": NINEROUTER_DEFAULT_MODEL,
-        "apiKey": NINEROUTER_API_KEY,
+        "apiKey": _9key,
         "provider": "hermes_vps",
         "source": "hermes_vps",
     }
@@ -1029,18 +1685,31 @@ async def _send_evolution_text(
     """POST Evolution /message/sendText/{instance}."""
     if not EVOLUTION_API_KEY:
         return {"ok": False, "reason": "no_api_key"}
+
+    # FAIL-SAFE OBRIGATÓRIO: NUNCA enviar erros técnicos, JSON ou códigos HTTP para o WhatsApp
+    if _is_technical_error_text(text):
+        logger.error(
+            "[%s] 🛑 [FAIL-SAFE EVOLUTION] Erro técnico bloqueado de vazar para WhatsApp (phone=%s): %r",
+            instance, phone, text[:250],
+        )
+        text = "Recebemos sua mensagem! Nossa equipe já vai te atender."
+
     headers = {"apikey": EVOLUTION_API_KEY}
     payload = {"number": phone, "text": text}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(
-            f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{instance}",
-            json=payload,
-            headers=headers,
-        )
-        try:
-            return {"ok": r.status_code < 400, "status": r.status_code, "body": r.json()}
-        except Exception:
-            return {"ok": r.status_code < 400, "status": r.status_code, "body": r.text}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{instance}",
+                json=payload,
+                headers=headers,
+            )
+            try:
+                return {"ok": r.status_code < 400, "status": r.status_code, "body": r.json()}
+            except Exception:
+                return {"ok": r.status_code < 400, "status": r.status_code, "body": r.text}
+    except Exception as send_err:
+        logger.error("[%s] Erro de rede ao chamar sendText da Evolution: %s", instance, send_err)
+        return {"ok": False, "reason": str(send_err)}
 
 
 # ============================================================================
@@ -1125,7 +1794,7 @@ async def _extract_and_persist_clinical_data(
     """Extrai assincronamente queixa principal e sintomas sem travar a resposta do WhatsApp."""
     try:
         lead_id = lead.get("id")
-        if not lead_id:
+        if not lead_id or _is_internal_test_contact(lead):
             return
         text_lower = (patient_text or "").lower()
         if not text_lower:
@@ -1227,6 +1896,1025 @@ async def _extract_and_persist_clinical_data(
         logger.warning("[%s] _extract_and_persist_clinical_data falhou: %s", instance, exc)
 
 
+# ============================================================================
+# Minerador Silencioso em Segundo Plano (Copiloto Invisível)
+# ============================================================================
+# Quando o plantão de IA está desligado (ou operador humano assumiu o chat),
+# as mensagens manuais trocadas entre a secretária e o paciente são mineradas
+# assincronamente para atualizar:
+# - stage no Kanban
+# - appointments na Agenda Integrada (se data_agendamento identificada)
+# - financial_entries no Dashboard Financeiro
+# - tags/alertas de incidentes (se sentimento == incidente_reclamacao)
+# - clinical_summary e symptoms no prontuário do lead
+# - last_interaction = now()
+#
+# SILÊNCIO TOTAL: Jamais envia mensagens ou respostas automáticas no WhatsApp.
+# ============================================================================
+
+async def _mine_silent_conversation(
+    tenant_id: str,
+    lead: dict[str, Any],
+    instance: str,
+    latest_msg: str = "",
+) -> None:
+    try:
+        lead_id = lead.get("id")
+        if not lead_id or not tenant_id:
+            return
+
+        # Blindagem: contatos internos da clínica (Dr. Matheus Dore, Casa/Clínica Zen, Beatriz, testes)
+        # NUNCA são minerados para evitar criação de agendamentos e financeiros falsos.
+        if _is_internal_test_contact(lead, latest_msg=latest_msg):
+            logger.debug(
+                "[%s] [MINERADOR] Lead %s é contato interno/teste (%s) — pulando mineração.",
+                instance, lead_id, lead.get("name"),
+            )
+            return
+
+        # 1. Recupera as mensagens recentes do lead para compor o contexto
+        res_msgs = (
+            sb.table("messages")
+            .select("sender, content, created_at")
+            .eq("lead_id", lead_id)
+            .order("created_at", desc=False)
+            .limit(15)
+            .execute()
+        )
+        tenant_cfg = _get_tenant_config(tenant_id)
+        is_tourism = (
+            tenant_id == "44444444-4444-4444-4444-444444444444"
+            or (tenant_cfg.get("specialty") or "").lower() == "turismo"
+            or "turismo" in (tenant_cfg.get("name") or "").lower()
+        )
+
+        raw_msgs = res_msgs.data or []
+        history_lines: list[str] = []
+        for m in raw_msgs:
+            s = (m.get("sender") or "").lower()
+            if is_tourism:
+                role = "Cliente/Viajante" if s == "patient" else ("Consultor ESVC Turismo" if s in ("human", "attendant", "user", "secretaria") else "IA")
+            else:
+                role = "Paciente" if s == "patient" else ("Secretária/Atendente" if s in ("human", "attendant", "user", "secretaria") else "IA")
+            content_str = (m.get("content") or "").strip()
+            if content_str:
+                history_lines.append(f"{role}: {content_str}")
+
+        if latest_msg and (not history_lines or latest_msg not in history_lines[-1]):
+            history_lines.append(f"Última mensagem: {latest_msg}")
+
+        if not history_lines:
+            return
+
+        history_text = "\n".join(history_lines[-12:])
+
+        # 2. Configura alvo LLM (Hermes Gateway -> BYOK -> 9router)
+        target = _resolve_llm_target(tenant_cfg)
+        if not target or not target.get("apiKey"):
+            target = {
+                "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
+                "model": NINEROUTER_DEFAULT_MODEL,
+                "apiKey": NINEROUTER_API_KEY,
+                "provider": "hermes_vps",
+                "source": "hermes_vps",
+            }
+
+        # 3. Prompt estrito de extração JSON isolado por tenant
+        if is_tourism:
+            system_prompt = (
+                "Você é um copiloto invisível e minerador silencioso de CRM de Turismo e Viagens da ESVC Turismo.\n"
+                "O atendimento no WhatsApp está sendo conduzido manualmente por consultores da agência e viajantes/clientes.\n"
+                "Sua ÚNICA missão é minerar o histórico recente da conversa e extrair um JSON estrito para atualizar o CRM.\n"
+                "NUNCA crie respostas nem envie mensagens para o cliente.\n"
+                "PROIBIÇÃO ABSOLUTA: NUNCA retorne fases clínicas ou médicas como: 'agendou', 'compareceu', 'triagem', 'consulta_agendada'.\n\n"
+                "Responda EXCLUSIVAMENTE um objeto JSON no formato:\n"
+                "{\n"
+                '  "fase_funil": "novo_lead" | "em_atendimento" | "cotacao" | "negociacao" | "fechou" | "pos_viagem",\n'
+                '  "destino": "string com destino desejado (ex: Gramado, Maceió, Orlando) ou null",\n'
+                '  "data_viagem": "YYYY-MM-DD" ou null,\n'
+                '  "data_volta": "YYYY-MM-DD" ou null,\n'
+                '  "valor_estimado": float ou null,\n'
+                '  "tipo_interesse": "pacote" | "passagem" | "hospedagem" | "cruzeiro" | "outro",\n'
+                '  "sentimento": "positivo" | "neutro" | "incidente_reclamacao",\n'
+                '  "preferencias_ou_duvidas": "string resumida",\n'
+                '  "resumo_conversa": "string curta",\n'
+                '  "copilot_guidance": "orientação tática de agência de turismo para o consultor",\n'
+                '  "suggested_reply": "resposta sugerida cordial e persuasiva da ESVC Turismo"\n'
+                "}\n\n"
+                "Regras de classificação estritas para TURISMO:\n"
+                "- 'fase_funil':\n"
+                "  * 'fechou': confirmação de compra, envio de comprovante Pix, pagamento efetuado, viagem confirmada (ex: 'pode fechar o pacote', 'tá confirmado', 'já enviei o pagamento', 'vou pagar no pix', 'fechado', 'enviei o pagamento de r$ 1200').\n"
+                "  * 'negociacao': cliente negociando desconto, parcelamento, formas de pagamento ou datas.\n"
+                "  * 'cotacao': atendente enviou valores, orçamento, opções de hotéis/voos ou proposta formal.\n"
+                "  * 'em_atendimento': cliente tirando dúvidas sobre destino, passeios, hotéis, datas ou pacotes.\n"
+                "  * 'novo_lead': primeiro contato / mensagem inicial sem detalhamento.\n"
+                "  * 'pos_viagem': após a data de retorno da viagem.\n"
+                "- 'destino': nome da cidade, estado ou país desejado citado no diálogo (ex: Gramado, Maceió, Fortaleza, Orlando).\n"
+                "- 'data_viagem': data de ida/embarque em formato 'YYYY-MM-DD' (ano corrente 2026) se citada, senão null.\n"
+                "- 'data_volta': data de retorno em formato 'YYYY-MM-DD' se citada, senão null.\n"
+                "- 'valor_estimado': float se valor foi citado (ex: 1200.0), senão null.\n"
+                "- 'tipo_interesse': 'pacote', 'passagem', 'hospedagem', 'cruzeiro' ou 'outro'.\n"
+                "- 'sentimento': 'incidente_reclamacao' se houver insatisfação; 'positivo' se fechamento/elogio; 'neutro' para normal.\n"
+                "- 'copilot_guidance': Orientação tática de turismo (ex: 'Cliente confirmou pagamento de R$ 1.200 via Pix para Gramado. Dica: Enviar o recibo de confirmação e solicitar os nomes completos e CPF dos passageiros para emissão dos bilhetes.').\n"
+                "- 'suggested_reply': Mensagem da equipe ESVC Turismo pronta para enviar ao viajante."
+            )
+        else:
+            system_prompt = (
+                "Você é um copiloto invisível e minerador silencioso de CRM médico/clínico.\n"
+                "O atendimento no WhatsApp está sendo conduzido manualmente por pessoas reais (secretária e paciente).\n"
+                "Sua ÚNICA missão é minerar o histórico recente da conversa e extrair um JSON estrito para atualizar o CRM.\n"
+                "NUNCA crie respostas nem envie mensagens para o paciente.\n\n"
+                "Responda EXCLUSIVAMENTE um objeto JSON no formato:\n"
+                "{\n"
+                '  "fase_funil": "novo_contato" | "em_atendimento" | "consulta_agendada" | "consulta_realizada" | "cancelou",\n'
+                '  "data_agendamento": "YYYY-MM-DD HH:mm:ss" ou null,\n'
+                '  "valor_estimado": float ou null,\n'
+                '  "tipo_atendimento": "particular" | "convenio" | "retorno" | "outro",\n'
+                '  "sentimento": "positivo" | "neutro" | "incidente_reclamacao",\n'
+                '  "sintomas_ou_queixa": "string resumida",\n'
+                '  "resumo_conversa": "string curta"\n'
+                "}\n\n"
+                "Regras de classificação:\n"
+                "- 'fase_funil':\n"
+                "  * 'consulta_agendada': data/horário de consulta pactuado ou agendamento confirmado.\n"
+                "  * 'consulta_realizada': atendimento já finalizado ou retorno presencial/online pós-consulta.\n"
+                "  * 'cancelou': paciente desistiu, cancelou, pediu estorno ou informou que não comparecerá.\n"
+                "  * 'em_atendimento': diálogo sobre valores, horários, queixas ou dúvidas.\n"
+                "  * 'novo_contato': primeira saudação sem desenvolvimento.\n"
+                "- 'data_agendamento': formato 'YYYY-MM-DD HH:mm:ss' (ano corrente 2026) se houver data/hora definida, senão null.\n"
+                "- 'valor_estimado': float se valor foi citado (ex: 300.0), senão null.\n"
+                "- 'tipo_atendimento': 'particular', 'convenio', 'retorno' ou 'outro'.\n"
+                "- 'sentimento': 'incidente_reclamacao' se houver qualquer revolta, grosseria, queixa de demora ou desrespeito; 'positivo' se elogio/agradecimento; 'neutro' para normal.\n"
+                "- 'sintomas_ou_queixa': queixa clínica em 1 frase resumida.\n"
+                "- 'resumo_conversa': síntese de 1 frase do status da conversa."
+            )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Histórico de mensagens manuais trocadas:\n\n{history_text}\n\nExtraia o JSON:"},
+        ]
+
+        content = ""
+        try:
+            content, _ = await _post_chat_completion(
+                target,
+                messages,
+                {"max_tokens": 400, "temperature": 0.1, "response_format": {"type": "json_object"}},
+            )
+        except Exception as llm_err:
+            logger.debug("[%s] [MINERADOR] Falha primária no LLM (%s), tentando fallback 9router...", instance, llm_err)
+            if target.get("source") != "hermes_vps":
+                fallback_target = {
+                    "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
+                    "model": NINEROUTER_DEFAULT_MODEL,
+                    "apiKey": NINEROUTER_API_KEY,
+                    "provider": "hermes_vps",
+                    "source": "hermes_vps",
+                }
+                try:
+                    content, _ = await _post_chat_completion(
+                        fallback_target,
+                        messages,
+                        {"max_tokens": 400, "temperature": 0.1, "response_format": {"type": "json_object"}},
+                    )
+                except Exception as fb_err:
+                    logger.warning("[%s] [MINERADOR] Falha no fallback 9router: %s", instance, fb_err)
+
+        if not content:
+            return
+
+        # 4. Parse do JSON
+        data: dict[str, Any] = {}
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\{.*\}", content, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    pass
+
+        if not data:
+            return
+
+        now_iso = _now_iso()
+        patch: dict[str, Any] = {
+            "last_interaction": now_iso,
+        }
+
+        val_est = data.get("valor_estimado")
+        val_float: float | None = None
+        if val_est is not None:
+            try:
+                val_float = float(val_est)
+            except Exception:
+                pass
+
+        sentimento = str(data.get("sentimento") or "").strip().lower()
+
+        if is_tourism:
+            fase = str(data.get("fase_funil") or "").strip().lower()
+            text_low = history_text.lower()
+            current_stage_raw = str(lead.get("stage") or "").lower()
+
+            # Rank de estágios para impedir regressão involuntária
+            STAGE_RANKS = {
+                "novo_lead": 1, "novo_contato": 1, "iniciou_conversa": 1,
+                "em_atendimento": 2,
+                "cotacao": 3, "cotacao_enviada": 3,
+                "negociacao": 4, "em_negociacao": 4,
+                "fechou": 5, "fechou_vendido": 5, "agendou": 5, "consulta_agendada": 5,
+                "pos_viagem": 6, "consulta_realizada": 6
+            }
+            current_rank = STAGE_RANKS.get(current_stage_raw, 1)
+
+            # Sinais bidirecionais de fechamento (cliente ou atendente)
+            is_closing_intent = (
+                fase in {"fechou", "fechou_vendido", "contratou"}
+                or any(k in text_low for k in [
+                    # Cliente
+                    "pode fechar", "fechado", "confirmado ok", "ja enviei o pagamento",
+                    "já enviei o pagamento", "vou fazer o pagamento no pix", "vou pagar no pix",
+                    "pagamento de r$", "pode fechar o pacote", "fechado ta pode fechar",
+                    "fiz o pix", "comprovante enviado", "já paguei", "ja paguei",
+                    "tá confirmado", "ta confirmado", "fechado tá pode fechar",
+                    # Atendente
+                    "recebi o pagamento", "valor confirmado", "está pago", "esta pago",
+                    "pagamento confirmado", "pix confirmado", "confirmamos seu pagamento",
+                    "reserva confirmada", "pacote confirmado", "pix recebido"
+                ])
+            )
+
+            if is_closing_intent:
+                fase = "fechou"
+                patch["stage"] = "fechou"
+                patch["conversion_probability"] = 98
+                patch["negotiation_stage"] = "fechou"
+                patch["current_objection"] = "nenhuma"
+            elif fase in {"negociacao", "em_negociacao"}:
+                if current_rank < 5:
+                    fase = "negociacao"
+                    patch["stage"] = "negociacao"
+                    patch["conversion_probability"] = 80
+                else:
+                    fase = current_stage_raw
+            elif fase in {"cotacao", "cotacao_enviada"}:
+                if current_rank < 4:
+                    fase = "cotacao"
+                    patch["stage"] = "cotacao"
+                    patch["conversion_probability"] = 65
+                else:
+                    fase = current_stage_raw
+            elif fase in {"em_atendimento"}:
+                if current_rank < 3:
+                    fase = "em_atendimento"
+                    patch["stage"] = "em_atendimento"
+                    patch["conversion_probability"] = 40
+                else:
+                    fase = current_stage_raw
+            elif fase in {"pos_viagem"}:
+                fase = "pos_viagem"
+                patch["stage"] = "pos_viagem"
+            elif fase in {"novo_lead", "novo_contato"}:
+                if current_rank < 2:
+                    fase = "novo_lead"
+                    patch["stage"] = "novo_lead"
+                else:
+                    fase = current_stage_raw
+            else:
+                if current_rank < 3:
+                    fase = "em_atendimento"
+                    patch["stage"] = "em_atendimento"
+                else:
+                    fase = current_stage_raw
+
+            # Extração de destino
+            destino = data.get("destino")
+            if not destino or str(destino).lower() == "null":
+                for d in ["Gramado", "Maceió", "Maceio", "Natal", "Orlando", "Paris", "Fortaleza", "Salvador", "Porto de Galinhas", "Maragogi", "Cancun", "Buenos Aires", "Rio de Janeiro"]:
+                    if d.lower() in text_low:
+                        destino = d
+                        break
+
+            preferencias = str(data.get("preferencias_ou_duvidas") or data.get("sintomas_ou_queixa") or "").strip()
+            if preferencias:
+                patch["clinical_summary"] = preferencias
+
+            guidance = str(data.get("copilot_guidance") or "").strip()
+            if guidance:
+                patch["copilot_guidance"] = guidance
+
+            sugg_reply = str(data.get("suggested_reply") or "").strip()
+            if sugg_reply:
+                patch["suggested_reply"] = sugg_reply
+
+            if is_closing_intent and (not patch.get("copilot_guidance") or "consulta" in patch.get("copilot_guidance", "").lower()):
+                dest_str = destino or "Gramado"
+                val_txt = f" de R$ {val_float:.2f}" if val_float else ""
+                patch["copilot_guidance"] = (
+                    f"Cliente confirmou pagamento{val_txt} via Pix para {dest_str}. "
+                    "Dica: Enviar o recibo de confirmação e solicitar os nomes completos e CPF dos passageiros para emissão dos bilhetes."
+                )
+
+            if sentimento == "incidente_reclamacao":
+                patch["priority"] = "urgente"
+
+            # Atualiza o lead no Supabase
+            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            logger.info(
+                "[%s] ✈️ [MINERADOR TURISMO] Lead %s atualizado: stage=%s destino=%s prob=%s",
+                instance, lead_id, patch.get("stage"), destino, patch.get("conversion_probability"),
+            )
+
+            # Se fechou, insere/atualiza na tabela lead_trips
+            if is_closing_intent:
+                try:
+                    dest_final = destino or patch.get("trip_destination") or lead.get("trip_destination") or "Gramado"
+                    dep_date_str = None
+                    raw_dep = data.get("data_viagem")
+                    if raw_dep and str(raw_dep).lower() != "null":
+                        m_dep = re.search(r"(\d{4}-\d{2}-\d{2})", str(raw_dep))
+                        if m_dep:
+                            dep_date_str = m_dep.group(1)
+
+                    if not dep_date_str:
+                        m_pt = re.search(r"(\d{1,2})\s+de\s+(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)", text_low)
+                        if m_pt:
+                            dia = int(m_pt.group(1))
+                            meses = {"janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12}
+                            mes = meses.get(m_pt.group(2), 11)
+                            dep_date_str = f"2026-{mes:02d}-{dia:02d}"
+
+                    if not dep_date_str:
+                        dep_date_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d")
+
+                    raw_ret = data.get("data_volta")
+                    ret_date_str = None
+                    if raw_ret and str(raw_ret).lower() != "null":
+                        m_ret = re.search(r"(\d{4}-\d{2}-\d{2})", str(raw_ret))
+                        if m_ret:
+                            ret_date_str = m_ret.group(1)
+
+                    if not ret_date_str:
+                        try:
+                            ret_date_str = (datetime.strptime(dep_date_str, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                        except Exception:
+                            ret_date_str = dep_date_str
+
+                    existing_trips = sb.table("lead_trips").select("id").eq("tenant_id", tenant_id).eq("lead_id", lead_id).limit(1).execute()
+                    trip_payload = {
+                        "tenant_id": tenant_id,
+                        "lead_id": lead_id,
+                        "destination": dest_final,
+                        "departure_date": dep_date_str,
+                        "return_date": ret_date_str,
+                        "pre_trip_sent": False,
+                        "post_trip_sent": False,
+                    }
+                    if existing_trips.data and len(existing_trips.data) > 0:
+                        trip_id = existing_trips.data[0]["id"]
+                        sb.table("lead_trips").update(trip_payload).eq("id", trip_id).execute()
+                        logger.info("[%s] ✈️ [MINERADOR TURISMO] lead_trips %s atualizado (destino=%s, ida=%s)", instance, trip_id, dest_final, dep_date_str)
+                    else:
+                        sb.table("lead_trips").insert(trip_payload).execute()
+                        logger.info("[%s] ✈️ [MINERADOR TURISMO] lead_trips inserido (destino=%s, ida=%s)", instance, dest_final, dep_date_str)
+                except Exception as trip_err:
+                    logger.warning("[%s] Erro ao sincronizar lead_trips no minerador: %s", instance, trip_err)
+
+                # Se veio valor no texto (ex: 1200), registra lançamento financeiro
+                if val_float and val_float > 0:
+                    try:
+                        sb.table("financial_entries").insert({
+                            "tenant_id": tenant_id,
+                            "lead_id": lead_id,
+                            "title": f"Pacote / Viagem: {dest_final}",
+                            "amount": val_float,
+                            "entry_type": "receita",
+                            "category": "pacotes",
+                            "status": "pago",
+                            "created_at": now_iso,
+                        }).execute()
+                        logger.info("[%s] 💰 [MINERADOR TURISMO] Receita de R$ %.2f registrada em financial_entries", instance, val_float)
+                    except Exception as fin_err:
+                        logger.debug("[%s] Registro financeiro turismo: %s", instance, fin_err)
+
+        else:
+            # Atualiza estágio do Kanban se válido com proteção anti-regressão (modo clínico)
+            fase = str(data.get("fase_funil") or "").strip().lower()
+            current_stage_raw = str(lead.get("stage") or "").lower()
+            CLINICAL_RANKS = {
+                "novo_contato": 1, "iniciou_conversa": 1,
+                "em_atendimento": 2,
+                "consulta_agendada": 3,
+                "consulta_realizada": 4,
+                "cancelou": 5, "desistiu": 5
+            }
+            c_rank = CLINICAL_RANKS.get(current_stage_raw, 1)
+            target_rank = CLINICAL_RANKS.get(fase, 1)
+
+            if fase in {"cancelou", "desistiu"}:
+                patch["stage"] = fase
+            elif c_rank >= 3 and target_rank < 3:
+                # Mantém estágio pactuado (não regride consulta agendada para novo/atendimento)
+                pass
+            elif fase in {"novo_contato", "em_atendimento", "consulta_agendada", "consulta_realizada"}:
+                patch["stage"] = fase
+
+            sintomas_ou_queixa = str(data.get("sintomas_ou_queixa") or "").strip()
+            resumo_conversa = str(data.get("resumo_conversa") or "").strip()
+            if sintomas_ou_queixa:
+                patch["clinical_summary"] = sintomas_ou_queixa
+
+            data_agendamento = data.get("data_agendamento")
+            if data_agendamento and str(data_agendamento).lower() != "null":
+                patch["appointment_schedule"] = str(data_agendamento)
+
+            tipo_atend = str(data.get("tipo_atendimento") or "").strip().lower()
+            if tipo_atend in ("particular", "convenio"):
+                patch["insurance"] = tipo_atend
+
+            if sentimento == "incidente_reclamacao":
+                patch["priority"] = "urgente"
+                curr_notes = lead.get("internal_notes") or ""
+                if "[ALERTA_INCIDENTE]" not in curr_notes:
+                    patch["internal_notes"] = f"{curr_notes}\n[ALERTA_INCIDENTE] {resumo_conversa or sintomas_ou_queixa}".strip()
+
+            # Executa update em public.leads
+            sb.table("leads").update(patch).eq("id", lead_id).execute()
+            logger.info(
+                "[%s] 🕵️ [MINERADOR SILENCIOSO] Lead %s atualizado: stage=%s sentimento=%s agendamento=%s",
+                instance, lead_id, patch.get("stage"), sentimento, data_agendamento,
+            )
+
+            # Se sentimento for incidente/reclamação, persiste em customer_complaints
+            if sentimento == "incidente_reclamacao":
+                try:
+                    _low = (sintomas_ou_queixa or "").lower() + " " + (resumo_conversa or "").lower()
+                    if "demora" in _low or "atraso" in _low or "espera" in _low:
+                        _reason_enum = "demora_atendimento"
+                    elif "preço" in _low or "preco" in _low or "caro" in _low or "valor alto" in _low:
+                        _reason_enum = "preco_alto"
+                    elif "ofensa" in _low or "grosse" in _low or "desrespei" in _low or "mal educa" in _low:
+                        _reason_enum = "ofensa_verbal"
+                    elif "cancel" in _low or "desist" in _low:
+                        _reason_enum = "cancelamento"
+                    else:
+                        _reason_enum = "insatisfacao_geral"
+                    sb.table("customer_complaints").insert({
+                        "tenant_id": tenant_id,
+                        "lead_id": lead_id,
+                        "client_name": (lead.get("name") or lead.get("phone") or "Paciente")[:255],
+                        "reason": _reason_enum,
+                        "severity": "critica",
+                        "snippet": (history_text or "")[-400:],
+                        "status": "pendente",
+                        "source": "whatsapp",
+                        "created_at": now_iso,
+                    }).execute()
+                    logger.info("[%s] 🚨 [MINERADOR] Incidente registrado em customer_complaints para lead %s", instance, lead_id)
+                except Exception as comp_err:
+                    logger.warning("[%s] Erro ao registrar customer_complaints no minerador: %s", instance, comp_err)
+
+            # Se identificou agendamento com data/hora, sincroniza na tabela appointments
+            if data_agendamento and str(data_agendamento).lower() != "null":
+                try:
+                    raw_dt = str(data_agendamento).replace("T", " ")
+                    dt_parsed = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                        try:
+                            dt_parsed = datetime.strptime(raw_dt[:19], fmt)
+                            break
+                        except Exception:
+                            pass
+                    if dt_parsed:
+                        dt_local = dt_parsed.replace(tzinfo=TZ_CLINICA)
+                        start_iso = dt_local.isoformat()
+                        end_iso = (dt_local + timedelta(minutes=50)).isoformat()
+                        day_start = dt_local.strftime("%Y-%m-%d 00:00:00-03:00")
+                        day_end = dt_local.strftime("%Y-%m-%d 23:59:59-03:00")
+
+                        existing_appts = (
+                            sb.table("appointments")
+                            .select("id")
+                            .eq("tenant_id", tenant_id)
+                            .eq("lead_id", lead_id)
+                            .gte("start_time", day_start)
+                            .lte("start_time", day_end)
+                            .limit(1)
+                            .execute()
+                        )
+                        if not existing_appts.data:
+                            patient_name = lead.get("name") or lead.get("phone") or "Paciente"
+                            sb.table("appointments").insert({
+                                "tenant_id": tenant_id,
+                                "lead_id": lead_id,
+                                "title": f"Consulta: {patient_name[:200]}",
+                                "start_time": start_iso,
+                                "end_time": end_iso,
+                                "status": "agendado",
+                                "specialty": lead.get("tenant_specialty") or tenant_cfg.get("specialty") or "Consulta",
+                                "notes": f"Agendamento detectado pelo Copiloto Invisível. Queixa: {sintomas_ou_queixa or resumo_conversa}",
+                                "source": "whatsapp",
+                                "created_at": now_iso,
+                            }).execute()
+                            logger.info("[%s] 📅 [MINERADOR] Compromisso inserido em appointments: %s", instance, start_iso)
+                except Exception as appt_err:
+                    logger.warning("[%s] Erro ao sincronizar appointment no minerador: %s", instance, appt_err)
+
+            if fase == "consulta_agendada":
+                try:
+                    await _create_pending_financial_entry(
+                        tenant_id=tenant_id,
+                        lead=lead,
+                        tenant_cfg=tenant_cfg,
+                        patient_text=history_text,
+                        amount_override=val_float,
+                    )
+                except Exception as fin_err:
+                    logger.warning("[%s] Erro ao sincronizar financial_entry no minerador: %s", instance, fin_err)
+
+    except Exception as exc:
+        logger.error("[%s] Erro no minerador silencioso: %s", instance, exc, exc_info=True)
+
+
+# ============================================================================
+# Classificador de Atrito (Ouvidoria / Radar de Incidentes)
+# ============================================================================
+# Isaías (msg 5615+5616, 07/10/2026): detectar atrito no texto do paciente
+# ANTES da chamada JEV/LLM. Se severidade='critica' → grava em
+# customer_complaints + kill-switch (handoff_state=humano_assumiu).
+# Severidade media/baixa → só grava, mantém IA no loop.
+#
+# REGRA DE OURO #1: tudo filtrado por tenant_id explícito. Sem RLS,
+# webhook é responsável. Dr. Matheus (1111) JAMAIS tocado.
+# ============================================================================
+
+# Padrões por severidade (regex compilados em tempo de import)
+_ATRITO_CRITICA_RE = re.compile(
+    r"\b("
+    r"ladr[ãa]o|estelionat[aá]rio|processo|processar|advogado|"
+    r"absurdo|absurda|vergonha|escroto|escrota|"
+    r"vai se foder|vai tomar no|cu[aã]o|caralho|merda|porra|"
+    r"fdp|filho da puta|puta|vagabunda|vagabundo|"
+    r"desrespeito|falt(a|ar) de respeito|"
+    r"fraude|golpe|engana[cç][ãa]o|"
+    r"xingamento|ofensa|xingar"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_ATRITO_MEDIA_RE = re.compile(
+    r"\b("
+    r"demor\w*|atraso|atrasad\w*|esperando h[áa]|"
+    r"insatisfa[cç][ãa]o|insatisfeit\w*|"
+    r"reclama[cç][ãa]o|reclamar|reclamo|"
+    r"p[eé]ssim\w*|horr[íi]vel|"
+    r"decepcionad\w*|decep[cç][ãa]o|"
+    r"inaceit[aá]vel|inadmiss[íi]vel|"
+    r"cancelar|desistir|desist[oeu]"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_ATRITO_BAIXA_RE = re.compile(
+    r"\b("
+    r"caro|cara|pre[cç]o alto|muito caro|salgado|salgada|"
+    r"n[ãa]o posso pagar|n[ãa]o tenho condi[cç][õo]es|"
+    r"desconto|cupom|promo[cç][ãa]o|"
+    r"barato|em conta|mais em conta"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _classify_atrito(text: str) -> dict[str, Any] | None:
+    """Classifica atrito no texto do paciente. Retorna dict {severity, reason, snippet}
+    ou None se nada bater.
+
+    Severidade:
+    - 'critica': ofensas, xingamentos, ameaça de processo, fraude
+    - 'media':   demora, insatisfação, reclamação, cancelamento
+    - 'baixa':   preço alto, pedido de desconto
+    """
+    if not text or not isinstance(text, str):
+        return None
+    t = text.strip()
+    if len(t) < 4:
+        return None
+    snippet = t[:240]  # máximo 240 chars pra gravar
+    if _ATRITO_CRITICA_RE.search(t):
+        return {
+            "severity": "critica",
+            "reason": "ofensa_verbal",
+            "snippet": snippet,
+        }
+    if _ATRITO_MEDIA_RE.search(t):
+        # distinção: 'demora/atraso' → demora_atendimento
+        # demor\w* cobre: demora, demoram, demorou, demorei, demorando, demorar
+        if re.search(r"\b(demor\w*|atraso|atrasad\w*|esperando h[áa])\b", t, re.IGNORECASE):
+            return {"severity": "media", "reason": "demora_atendimento", "snippet": snippet}
+        if re.search(r"\b(cancelar|desistir|desist[oeu])\b", t, re.IGNORECASE):
+            return {"severity": "media", "reason": "cancelamento", "snippet": snippet}
+        return {"severity": "media", "reason": "insatisfacao_geral", "snippet": snippet}
+    if _ATRITO_BAIXA_RE.search(t):
+        return {"severity": "baixa", "reason": "preco_alto", "snippet": snippet}
+    return None
+
+
+async def _record_atrito(
+    tenant_id: str,
+    lead: dict[str, Any],
+    classification: dict[str, Any],
+    instance: str,
+) -> None:
+    """Persiste o atrito em customer_complaints. Se severity='critica', aciona
+    kill-switch (handoff_state=humano_assumiu) — mensagem 5616 do Isaías.
+    """
+    sev = classification["severity"]
+    reason = classification["reason"]
+    snippet = classification.get("snippet") or ""
+
+    # Pega o client_name de lead (pode ser None em lead novo)
+    client_name = lead.get("name") or lead.get("phone") or "Paciente"
+
+    # 1) Grava a reclamação (sempre, qualquer severidade)
+    try:
+        sb.table("customer_complaints").insert({
+            "tenant_id": tenant_id,
+            "lead_id": lead.get("id"),
+            "client_name": client_name,
+            "reason": reason,
+            "severity": sev,
+            "snippet": snippet,
+            "status": "pendente",
+            "source": "whatsapp",
+        }).execute()
+        logger.info(
+            "[%s] 🛎️ atrito gravado lead=%s severity=%s reason=%s",
+            instance, lead.get("id"), sev, reason,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] falha ao gravar customer_complaints (atrito) lead=%s: %s",
+            instance, lead.get("id"), exc,
+        )
+        return  # não aciona kill-switch se nem conseguiu registrar
+
+    # 2) Kill-switch: se severidade crítica → humano_assumiu + stage='falar_pessoalmente' (Coluna 3 do Kanban)
+    if sev == "critica":
+        try:
+            sb.table("leads").update({
+                "stage": "falar_pessoalmente",
+                "handoff_state": "humano_assumiu",
+                "last_interaction": _now_iso(),
+            }).eq("id", lead["id"]).eq("tenant_id", tenant_id).execute()
+            logger.warning(
+                "[%s] 🛑 KILL-SWITCH atrito CRÍTICO lead=%s — stage=falar_pessoalmente handoff_state=humano_assumiu",
+                instance, lead.get("id"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] falha ao acionar kill-switch atrito lead=%s: %s",
+                instance, lead.get("id"), exc,
+            )
+
+
+# ============================================================================
+# Captura Automática Financeira & Comprovantes PIX (Dashboard Hermes v2.4)
+# ============================================================================
+def _classify_financial_niche(text: str, clinical_summary: str = "") -> tuple[str, str]:
+    """Classifica automaticamente o nicho do atendimento:
+    - 'previdenciario_inss' se contiver termos periciais/previdenciários.
+    - 'clinica_particular' para consultas gerais e médicas.
+    Retorna (category, service_type).
+    """
+    combined = f"{text or ''} {clinical_summary or ''}".lower()
+    inss_keywords = [
+        "inss", "perícia", "pericia", "laudo", "previdência", "previdencia",
+        "auxílio", "auxilio", "bpc", "loas", "afastamento", "atestado pericial",
+    ]
+    for kw in inss_keywords:
+        if re.search(r"\b" + re.escape(kw) + r"\b", combined):
+            return "previdenciario_inss", "Perícia / Laudo Previdenciário"
+
+    return "clinica_particular", "Consulta Inicial"
+
+
+def _is_appointment_cancel_request(text: str) -> bool:
+    """Detecta se o paciente está pedindo para cancelar ou desmarcar a consulta agendada.
+    IMPORTANTE: Cancelamento de consulta NÃO É opt-out/descadastro de WhatsApp.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    norm = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").lower().strip()
+    patterns = [
+        r"\b(cancelar|cancela|cancelem|cancelamento)\s+(a\s+|o\s+)?(consulta|agendamento|horario|minha consulta)\b",
+        r"\b(desmarcar|desmarca|desmarquem)\s+(a\s+|o\s+)?(consulta|agendamento|horario|minha consulta)\b",
+        r"\b(quero|gostaria de|preciso|favor)\s+(cancelar|desmarcar|remarcar|reagendar)\b",
+        r"\bnao\s+vou\s+(poder\s+)?(ir|comparecer)\b",
+        r"\bdesistir\s+da\s+consulta\b",
+        r"\bpode\s+cancelar\b",
+        r"\bpode\s+desmarcar\b",
+    ]
+    for p in patterns:
+        if re.search(p, norm):
+            return True
+    # Palavras isoladas ou curtas específicas de cancelamento de consulta
+    if norm in {"cancelar", "cancela", "desmarcar", "desmarca", "cancelar consulta", "desmarcar consulta"}:
+        return True
+    return False
+
+
+_CLINICAL_TRIAGE_NOT_OPT_OUT = {
+    "nao", "não", "no", "nenhum", "nenhuma", "primeira vez", "e a primeira vez",
+    "é a primeira vez", "nunca", "ainda nao", "ainda não", "nada", "nao tenho",
+    "não tenho", "nao fiz", "não fiz", "nao tomo", "não tomo", "sem medicacao",
+    "sem medicação", "sem sintomas", "ja fiz", "já fiz", "sim", "ok", "certo",
+    "concordo", "particular", "plano", "convenio", "convênio", "presencial",
+    "online", "teleconsulta",
+}
+
+_EXPLICIT_OPT_OUT_EXACT = {
+    "stop",
+    "descadastrar",
+    "desinscrever",
+    "nao quero mais mensagens",
+    "parar mensagens",
+    "pare de enviar",
+    "remover meu numero",
+    "sair da lista",
+}
+
+
+def _is_technical_error_text(text: str) -> bool:
+    """Verifica se o texto contém termos de falha técnica, JSON de erro ou vazamento de API."""
+    if not text or not isinstance(text, str):
+        return False
+    t_lower = text.lower()
+    triggers = [
+        "http 401", "http 402", "http 403", "http 404", "http 500", "http 502", "http 503",
+        "api key required", "api key", "authenticationerror", "insufficient balance",
+        "traceback (most recent call last)", '{"error":', "{'error':",
+        "rate limit exceeded", "internal server error", "minimax reported",
+        "billing or credits exhausted", "unauthorized", "non-retryable client error",
+    ]
+    return any(trig in t_lower for trig in triggers)
+
+
+def _is_opt_out_request(text: str) -> bool:
+    """Detecta se o contato solicitou opt-out / descadastro estrito de mensagens (LGPD / Anti-importunação).
+    Restrito estritamente a comandos explícitos e inequívocos de parada de comunicação:
+    - 'nao quero mais mensagens', 'parar mensagens', 'pare de enviar', 'remover meu numero', 'sair da lista', 'descadastrar', 'stop'.
+    NUNCA considerar respostas curtas de triagem clínica ('não', 'nenhum', 'primeira vez') ou cancelamento de consulta como opt-out.
+    """
+    if not text or not isinstance(text, str):
+        return False
+
+    # Se for cancelamento de consulta, NÃO é opt-out
+    if _is_appointment_cancel_request(text):
+        return False
+
+    raw = text.strip().lower()
+    norm = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").lower().strip()
+
+    # Bloqueio categórico: respostas de triagem clínica ou palavras curtas nunca são opt-out
+    if norm in _CLINICAL_TRIAGE_NOT_OPT_OUT or raw in _CLINICAL_TRIAGE_NOT_OPT_OUT:
+        return False
+    if len(norm) <= 3 and norm != "stop":
+        return False
+
+    # Comandos explícitos e inequívocos exatos
+    if norm in _EXPLICIT_OPT_OUT_EXACT:
+        return True
+
+    patterns = [
+        r"\bnao\s+quero\s+mais\s+(mensagens|receber|contato)\b",
+        r"\bparar\s+mensagens\b",
+        r"\bpare\s+de\s+(me\s+)?(enviar|mandar)\b",
+        r"\bremover\s+meu\s+numero\b",
+        r"\bsair\s+da\s+lista\b",
+        r"\b(me\s+)?(tire|tira|remova)\s+da\s+lista\b",
+        r"\b(favor\s+)?nao\s+(me\s+)?(mande|enviar|mandar)\s+mais\s+(mensagem|mensagens|nada|msg)\b",
+        r"\bdescadastrar\b",
+        r"\bdesinscrever\b",
+    ]
+    for p in patterns:
+        if re.search(p, norm):
+            return True
+    return False
+
+
+def _is_payment_receipt_text(text: str, is_image: bool = False) -> bool:
+    """Detecta se o paciente enviou comprovante ou declaração de pagamento/PIX."""
+    t = (text or "").lower()
+    receipt_patterns = [
+        r"\bsegue\s+o\s+comprovante\b",
+        r"\bfiz\s+o\s+pix\b",
+        r"\bj[áa]\s+paguei\b",
+        r"\bcomprovante\b",
+        r"\bmandei\s+o\s+pix\b",
+        r"\bpix\s+enviado\b",
+        r"\bpagamento\s+feito\b",
+        r"\bt[áa]\s+pago\b",
+        r"\benviei\s+o\s+comprovante\b",
+        r"\bprint\s+do\s+pix\b",
+    ]
+    for p in receipt_patterns:
+        if re.search(p, t):
+            return True
+    if is_image and any(k in t for k in ("comprovante", "pix", "transferência", "transferencia", "banco", "pago")):
+        return True
+    return False
+
+
+async def _record_appointment_financial_entry(
+    tenant_id: str,
+    lead: dict[str, Any],
+    patient_text: str,
+    tenant_cfg: dict[str, Any],
+    service_name: str = "Consulta Inicial",
+    amount_override: float | None = None,
+) -> None:
+    """Cria uma entrada pendente em financial_entries ao validar agendamento/consulta.
+    Respeita estritamente contatos ignorados / testes / internos da clínica.
+    """
+    lead_id = lead.get("id")
+    if not lead_id or not tenant_id:
+        return
+
+    # Blindagem de contatos ignorados / internos (Dr. Matheus, Beatriz, chips de teste)
+    if is_contact_ignored(tenant_id, phone=str(lead.get("phone") or ""), name=str(lead.get("name") or "")):
+        logger.info("[BLINDAGEM] Lead %s (%s) ignorado para registro financeiro.", lead.get("name"), lead.get("phone"))
+        return
+
+    try:
+        # Evita duplicidade se já houver lançamento pendente recente para este lead
+        existing = (
+            sb.table("financial_entries")
+            .select("id, status")
+            .eq("tenant_id", tenant_id)
+            .eq("lead_id", lead_id)
+            .in_("status", ["pendente", "pago"])
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            logger.info(
+                "[FINANCE] Lead %s já possui lançamento financeiro (id=%s, status=%s), não duplicando.",
+                lead_id, existing.data[0]["id"], existing.data[0].get("status")
+            )
+            return
+
+        # Valor: SOBERANO o extraído pelo LLM (valor_estimado do diálogo).
+        # FALLBACK: R$ 300,00 quando particular agendada SEM valor citado.
+        if amount_override and amount_override > 0:
+            amount = float(amount_override)
+        else:
+            amount = FALLBACK_PARTICULAR_VALUE
+
+        category, detected_service = _classify_financial_niche(
+            patient_text, lead.get("clinical_summary") or ""
+        )
+        final_service = service_name or detected_service
+        client_name = lead.get("name") or lead.get("phone") or "Paciente"
+
+        sb.table("financial_entries").insert({
+            "tenant_id": tenant_id,
+            "lead_id": lead_id,
+            "client_name": client_name,
+            "amount": amount,
+            "category": category,
+            "service_type": final_service,
+            "payment_method": "pix",
+            "status": "pendente",
+            "notes": "Agendamento registrado automaticamente via conversa WhatsApp.",
+            "created_at": _now_iso(),
+        }).execute()
+        logger.info(
+            "[FINANCE] ✅ Entrada financeira gerada com sucesso: lead=%s valor=R$%.2f cat=%s svc=%s",
+            lead_id, amount, category, final_service
+        )
+    except Exception as exc:
+        logger.warning("[FINANCE] Falha ao registrar entrada financeira para lead %s: %s", lead_id, exc)
+
+
+async def _process_payment_proof_inbound(
+    tenant_id: str,
+    lead: dict[str, Any],
+    patient_text: str,
+    is_image: bool,
+    instance: str,
+    b64_image: str = "",
+    media_mime: str = "image/jpeg",
+) -> None:
+    """Detecta comprovante ou mensagem de PIX/pagamento e vincula à tabela financial_entries com suporte multimodal."""
+    lead_id = lead.get("id")
+    if not lead_id or not tenant_id:
+        return
+
+    # Blindagem de contatos ignorados / internos
+    if is_contact_ignored(tenant_id, phone=str(lead.get("phone") or ""), name=str(lead.get("name") or "")):
+        logger.info("[BLINDAGEM] Lead %s (%s) ignorado para processamento de pagamento.", lead.get("name"), lead.get("phone"))
+        return
+
+    # 1. Se for imagem, aciona o extrator multimodal do Gemini Flash
+    receipt_data: dict[str, Any] = {}
+    if is_image and b64_image:
+        try:
+            logger.info("[%s] 🔍 [MULTIMODAL] Analisando imagem para detecção de comprovante bancário...", instance)
+            receipt_data = await extract_receipt_data_multimodal(b64_image, media_mime)
+        except Exception as vision_err:
+            logger.warning("[%s] [MULTIMODAL] Erro ao analisar comprovante via Gemini Flash: %s", instance, vision_err)
+
+    is_valid_receipt = bool(receipt_data.get("is_payment_receipt"))
+    has_receipt_text = _is_payment_receipt_text(patient_text, is_image=is_image)
+
+    if not is_valid_receipt and not has_receipt_text:
+        return
+
+    try:
+        now_hh_mm = datetime.now(TZ_CLINICA).strftime("%H:%M")
+        now_iso = _now_iso()
+
+        if is_valid_receipt:
+            val_extracted = receipt_data.get("amount")
+            try:
+                final_amount = float(val_extracted) if val_extracted and float(val_extracted) > 0 else FALLBACK_PARTICULAR_VALUE
+            except Exception:
+                final_amount = FALLBACK_PARTICULAR_VALUE
+            tx_id = receipt_data.get("transaction_id") or "Detectado por Visão"
+            rcv = receipt_data.get("receiver") or ""
+            receipt_note = f"[Comprovante Pix Validado por IA] às {now_hh_mm} | TxID: {tx_id} | Favorecido: {rcv}"
+            target_status = "pago"
+            paid_at_val = now_iso
+        else:
+            final_amount = FALLBACK_PARTICULAR_VALUE
+            receipt_note = f"Comprovante/declaração via WhatsApp às {now_hh_mm} - conferir extrato"
+            target_status = "pendente"
+            paid_at_val = None
+
+        # 2. Busca lançamento pendente do lead
+        existing = (
+            sb.table("financial_entries")
+            .select("id, notes, status, amount")
+            .eq("tenant_id", tenant_id)
+            .eq("lead_id", lead_id)
+            .eq("status", "pendente")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            entry_id = existing.data[0]["id"]
+            update_payload: dict[str, Any] = {
+                "notes": receipt_note,
+                "status": target_status,
+                "payment_method": "pix",
+                "updated_at": now_iso,
+            }
+            if paid_at_val:
+                update_payload["paid_at"] = paid_at_val
+            if is_valid_receipt and final_amount > 0:
+                update_payload["amount"] = final_amount
+
+            sb.table("financial_entries").update(update_payload).eq("id", entry_id).execute()
+            logger.info(
+                "[%s] 💵 [COMPROVANTE] Entrada %s atualizada para status=%s (valor=R$%.2f)",
+                instance, entry_id, target_status, final_amount
+            )
+        else:
+            # 3. Cria novo lançamento
+            category, service_type = _classify_financial_niche(
+                patient_text, lead.get("clinical_summary") or ""
+            )
+            client_name = lead.get("name") or lead.get("phone") or "Paciente"
+
+            new_fin = {
+                "tenant_id": tenant_id,
+                "lead_id": lead_id,
+                "client_name": client_name,
+                "amount": final_amount,
+                "category": category,
+                "service_type": service_type,
+                "payment_method": "pix",
+                "status": target_status,
+                "notes": receipt_note,
+                "created_at": now_iso,
+            }
+            if paid_at_val:
+                new_fin["paid_at"] = paid_at_val
+
+            sb.table("financial_entries").insert(new_fin).execute()
+            logger.info(
+                "[%s] 💵 [COMPROVANTE] Nova entrada criada com status=%s (valor=R$%.2f) para lead %s",
+                instance, target_status, final_amount, lead_id
+            )
+    except Exception as exc:
+        logger.warning("[%s] [COMPROVANTE] Erro ao processar comprovante para lead %s: %s", instance, lead_id, exc)
+
+
 async def _dispatch_ai(
     tenant_id: str,
     lead: dict[str, Any],
@@ -1280,6 +2968,19 @@ async def _dispatch_ai(
             )
             return
 
+        # ─────────────────────────────────────────────────────────────────
+        # 🛎️ Classificador de Atrito (msg 5615+5616)
+        # Detecta conflito/insatisfação no texto. Severidade crítica →
+        # kill-switch imediato (mão humana assume). Severidade media/baixa
+        # só registra, deixa o JEV/LLM continuar.
+        # ─────────────────────────────────────────────────────────────────
+        atrito = _classify_atrito(patient_text)
+        if atrito is not None:
+            await _record_atrito(tenant_id, lead, atrito, instance)
+            # Se crítico, JEV NÃO deve ser chamado — já aciona handoff
+            if atrito["severity"] == "critica":
+                return
+
         # 0. Avaliação rápida de triagem via JEV (TypeSafe / System One)
         # Timeout estrito (3.5s) com fallback silencioso para não travar o WhatsApp
         decisao_jev = await avaliar_lead_clinico(patient_text, timeout_s=3.5)
@@ -1295,42 +2996,140 @@ async def _dispatch_ai(
             decisao_jev.sintomas_detectados,
         )
 
-        # Interceptação imediata: opt_out (respeita recusa do paciente)
-        if decisao_jev.intencao == "opt_out":
-            logger.info("[%s] Lead %s solicitou opt-out via JEV — desativando IA", instance, lead["id"])
+        # Interceptação: Cancelamento / Desmarcação de consulta médica (SEM desvincular o contato nem opt-out)
+        if _is_appointment_cancel_request(patient_text):
+            logger.info("[%s] 📅 Lead %s solicitou cancelamento/desmarcação de consulta — atualizando stage para 'cancelou'", instance, lead["id"])
             try:
                 sb.table("leads").update({
-                    "stage": "desistiu",
-                    "handoff_state": "humano_assumiu",
+                    "stage": "cancelou",
                     "last_interaction": _now_iso(),
+                }).eq("id", lead["id"]).execute()
+            except Exception as can_exc:
+                logger.warning("[%s] Erro ao persistir stage cancelou do lead %s: %s", instance, lead["id"], can_exc)
+
+            cancel_reply = "Compreendo perfeitamente. Registrei o cancelamento da sua consulta. Se desejar reagendar para outro dia ou horário no futuro, é só nos avisar por aqui. Estamos à disposição!"
+            await _send_evolution_text(instance, lead.get("phone", ""), cancel_reply)
+            try:
+                sb.table("messages").insert({
+                    "tenant_id": tenant_id,
+                    "lead_id": lead["id"],
+                    "sender": "ai",
+                    "content": cancel_reply,
+                    "created_at": _now_iso(),
+                }).execute()
+            except Exception:
+                pass
+            return
+
+        # Interceptação imediata: opt_out (respeita recusa inequívoca do paciente / LGPD)
+        # NUNCA acionar opt-out baseado em classificação isolada de IA ou respostas de triagem ("Não")
+        if _is_opt_out_request(patient_text) and not _is_appointment_cancel_request(patient_text):
+            logger.info("[%s] 🛑 Lead %s solicitou opt-out estrito — desativando IA e follow-up", instance, lead["id"])
+            try:
+                sb.table("leads").update({
+                    "stage": "cancelou",
+                    "handoff_state": "opt_out",
+                    "ai_active": False,
+                    "followup_count": 99,
+                    "followup_status": "archived",
+                    "last_interaction": _now_iso(),
+                    "internal_notes": "Contato solicitou opt-out / descadastro de mensagens automáticas.",
                 }).eq("id", lead["id"]).execute()
             except Exception as opt_exc:
                 logger.warning("[%s] Erro ao persistir opt-out do lead %s: %s", instance, lead["id"], opt_exc)
+
+            farewell_msg = (
+                "Entendido perfeitamente! Seu contato foi desvinculado dos nossos avisos automáticos "
+                "e não voltaremos a enviar mensagens. Se precisar de algo no futuro, estamos à disposição. Um abraço!"
+            )
+            await _send_evolution_text(instance, lead.get("phone", ""), farewell_msg)
+            try:
+                sb.table("messages").insert({
+                    "tenant_id": tenant_id,
+                    "lead_id": lead["id"],
+                    "sender": "ai",
+                    "content": farewell_msg,
+                    "created_at": _now_iso(),
+                }).execute()
+            except Exception:
+                pass
             return
 
         history = await _fetch_recent_history(lead["id"], limit=20)
-        system_prompt = _build_system_prompt(tenant_cfg, lead)
-
-        # Injeta diretriz contextual para a LLM
-        if decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
-            system_prompt += (
-                "\n\n[DIRETRIZ DA SECRETÁRIA BEATRIZ: O paciente demonstrou interesse em agendar ou retornar. "
-                "NÃO marque horário. NÃO invente dias nem horários. NÃO diga 'vou agendar agora'. "
-                "Acolha, confirme dados básicos (nome, idade, telefone) se ainda não tiver, "
-                "e avise que a Beatriz entrará em contato em breve para combinar o melhor dia e horário.]"
-            )
+        
+        # Injeção prioritária do Prompt Mestre configurado no painel do Prospector
+        prospector_prompt = _get_prospector_prompt_for_instance(instance)
+        if prospector_prompt:
+            logger.info("[%s] 🧠 Utilizando Prompt Mestre do Prospector SQLite (%d chars)", instance, len(prospector_prompt))
+            system_prompt = prospector_prompt
         else:
-            system_prompt += (
-                f"\n\n[DIRETRIZ CLÍNICA JEV: Etapa Atual do Funil: {decisao_jev.etapa_funil} | Intenção: {decisao_jev.intencao}]"
-            )
+            system_prompt = _build_system_prompt(tenant_cfg, lead)
+
+        # Injeta diretriz contextual para a LLM. ATENÇÃO 01/10 (Isaías msg 5479):
+        # antes deste fix, esse bloco tinha terminologia fixa de clínica
+        # ("Secretária Beatriz", "paciente", "DIRETRIZ CLÍNICA") aplicada a TODOS
+        # os tenants, mesmo TECH/SaaS. Agora detecta `specialty` de saúde e
+        # adapta os rótulos — texto clínico só pra clínica de verdade.
+        _specialty_norm = (tenant_cfg.get("specialty") or "").strip().lower()
+        _is_health_ctx = _specialty_norm in {
+            "saúde", "saude", "cardiologia", "psiquiatria", "nutrição", "nutricao",
+            "clínica", "clinica", "medicina", "psicologia", "pediatria",
+            "ginecologia", "dermatologia", "ortopedia", "odontologia",
+        }
+        if prospector_prompt:
+            pass  # O prompt do Prospector já contém regras completas de agendamento e tom
+        elif decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
+            if _is_health_ctx:
+                system_prompt += (
+                    "\n\n[DIRETRIZ DE AGENDAMENTO (EQUIPE DO CONSULTÓRIO): O paciente demonstrou interesse em agendar ou retornar. "
+                    "REGRA INEANULÁVEL DE IDENTIDADE: Você é a Assistente Virtual da clínica. NUNCA diga 'Sou a Beatriz' ou 'Meu nome é Beatriz'. "
+                    "A Beatriz é a secretária humana da clínica. "
+                    "NÃO marque horário. NÃO invente dias nem horários. NÃO diga 'vou agendar agora'. "
+                    "Acolha, confirme dados básicos (nome, idade, telefone) se ainda não tiver, "
+                    "e avise que a Beatriz, da nossa equipe, entrará em contato em breve para combinar o melhor dia e horário.]"
+                )
+            else:
+                system_prompt += (
+                    "\n\n[DIRETRIZ COMERCIAL: O contato demonstrou interesse em contratar/retornar. "
+                    "NÃO feche pedido. NÃO invente preços nem prazos. "
+                    "Acolha, confirme dados básicos (nome, empresa, segmento) se ainda não tiver, "
+                    "e avise que o time do Isaías entrará em contato em breve para combinar os próximos passos.]"
+                )
+        else:
+            if _is_health_ctx:
+                system_prompt += (
+                    f"\n\n[DIRETRIZ CLÍNICA JEV: Etapa Atual do Funil: {decisao_jev.etapa_funil} | Intenção: {decisao_jev.intencao}]"
+                )
+            else:
+                system_prompt += (
+                    f"\n\n[DIRETRIZ COMERCIAL JEV: Etapa Atual do Funil: {decisao_jev.etapa_funil} | Intenção: {decisao_jev.intencao}]"
+                )
 
         # 1. LLM conversacional: gera resposta rápida e natural para o WhatsApp
-        ai_reply = await _call_llm(
-            system_prompt, history, patient_text, tenant_cfg,
-        )
-        if not ai_reply:
-            logger.warning("[%s] IA sem resposta, abortando dispatch", instance)
-            return
+        try:
+            ai_reply = await _call_llm(
+                system_prompt, history, patient_text, tenant_cfg,
+            )
+        except Exception as llm_err:
+            logger.error("[%s] Erro ao chamar LLM no dispatch: %s", instance, llm_err)
+            ai_reply = ""
+
+        # FAIL-SAFE OBRIGATÓRIO: Se IA falhar, vier vazia ou contiver qualquer termo técnico / JSON de erro
+        if not ai_reply or _is_technical_error_text(ai_reply):
+            logger.error(
+                "[%s] 🛡️ [FAIL-SAFE] ai_reply inválido ou com erro técnico (%r) — ativando contingência e transferindo para humano",
+                instance,
+                (ai_reply or "")[:200],
+            )
+            ai_reply = "Recebemos sua mensagem! Nossa equipe já vai te atender."
+            try:
+                sb.table("leads").update({
+                    "handoff_state": "humano_assumiu",
+                    "ai_active": False,
+                    "internal_notes": "Transferido para atendimento humano por fail-safe (falha na IA).",
+                }).eq("id", lead["id"]).execute()
+            except Exception as hs_err:
+                logger.warning("[%s] Erro ao atualizar lead com handoff humano: %s", instance, hs_err)
 
         # 2. Envia WhatsApp IMEDIATAMENTE (sem latência de extrações pesadas)
         send_result = await _send_evolution_text(instance, lead["phone"], ai_reply)
@@ -1365,8 +3164,8 @@ async def _dispatch_ai(
                 lead["priority"] = "urgente"
             except Exception:
                 pass
-        elif decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
-            # Regra Beatriz: a IA NUNCA marca 'consulta_agendada' automaticamente.
+        elif is_matheus_clinic and decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta"):
+            # Regra Beatriz (EXCLUSIVA Clínica Dr. Matheus Dore): a IA NUNCA marca 'consulta_agendada' automaticamente.
             # O lead é mantido em 'em_atendimento' com nota interna para a secretária Beatriz contatar.
             new_stage, requires_handoff = ("em_atendimento", False)
             try:
@@ -1381,9 +3180,9 @@ async def _dispatch_ai(
                 # Blindagem: na clínica do Dr. Matheus a marcação é feita exclusivamente pela Beatriz
                 new_stage = "em_atendimento"
 
-        # Plan B — se agendamento automático estiver ativo (DESATIVADO para clínica Dr. Matheus Dore)
+        # Plan B — agendamento automático duplo (DESATIVADO exclusivamente para clínica Dr. Matheus Dore)
         calendar_created = False
-        if not is_matheus_clinic and decisao_jev.intencao not in ("agendamento_novo", "retorno_reconsulta"):
+        if not is_matheus_clinic:
             try:
                 calendar_created = await _maybe_create_calendar_event(
                     instance, lead, patient_text, ai_reply,
@@ -1397,6 +3196,19 @@ async def _dispatch_ai(
 
         if calendar_created:
             new_stage = "consulta_agendada"
+
+        # Captura automática de fechamento/agendamento para o Dashboard (financial_entries)
+        if (calendar_created or new_stage == "consulta_agendada" or decisao_jev.intencao in ("agendamento_novo", "retorno_reconsulta")):
+            try:
+                await _record_appointment_financial_entry(
+                    tenant_id=tenant_id,
+                    lead=lead,
+                    patient_text=patient_text,
+                    tenant_cfg=tenant_cfg,
+                    service_name="Consulta Inicial",
+                )
+            except Exception as fin_exc:
+                logger.warning("[%s] Falha ao registrar financial_entry no dispatch: %s", instance, fin_exc)
 
         if new_stage and new_stage != lead.get("stage"):
             patch = {"stage": new_stage, "last_interaction": _now_iso()}
@@ -1481,6 +3293,605 @@ async def health() -> dict[str, Any]:
     }
 
 
+# =====================================================================
+# PROVISIONADOR GLOBAL + CRUD DE ETAPAS
+# =====================================================================
+def _slugify(text: str) -> str:
+    import unicodedata
+
+    norm = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
+    out = re.sub(r"[^a-z0-9]+", "_", norm.lower()).strip("_")
+    return out or "tenant"
+
+
+# Seeds oficiais por nicho (titulo, slug, keywords, descricao, cor, has_automation)
+PROVISION_SEEDS: dict[str, list[dict[str, Any]]] = {
+    "turismo": [
+        {"title": "1. Novo Lead", "slug": "novo_lead", "keywords": ["oi", "ola", "bom dia"], "desc": "Primeiro contato do lead", "color": "#38bdf8", "auto": False, "protected": True},
+        {"title": "2. Lead Real", "slug": "lead_real", "keywords": ["viagem", "passagem", "pacote", "cotacao"], "desc": "Interesse qualificado em viagem", "color": "#34d399", "auto": True, "protected": False},
+        {"title": "3. Em Atendimento", "slug": "em_atendimento", "keywords": ["datas", "passageiros"], "desc": "Atendente respondeu e está em triagem ativa", "color": "#22d3ee", "auto": True, "protected": False},
+        {"title": "4. Cotação Enviada", "slug": "cotacao_enviada", "keywords": ["r$", "reais", "orcamento", "valor"], "desc": "Valores e proposta comercial entregues", "color": "#fbbf24", "auto": True, "protected": False},
+        {"title": "5. Vendido", "slug": "vendido", "keywords": ["pago", "pix", "fechado", "comprovante"], "desc": "Compra confirmada", "color": "#2dd4bf", "auto": True, "protected": False},
+        {"title": "6. Perdido", "slug": "perdido", "keywords": ["desisti", "caro", "cancelar", "outro momento"], "desc": "Recusa ou perda do lead", "color": "#fb7185", "auto": True, "protected": False},
+        {"title": "7. Pós-venda", "slug": "pos_venda", "keywords": ["duvida viagem", "voucher", "seguro", "antiga compra"], "desc": "Assuntos operacionais de compras anteriores ou suporte", "color": "#c084fc", "auto": True, "protected": False},
+    ],
+    "clinica": [
+        {"title": "1. Novo Contato", "slug": "iniciou_conversa", "keywords": ["oi", "ola", "bom dia", "consulta"], "desc": "Iniciou conversa — aguardando triagem", "color": "#38bdf8", "auto": False, "protected": True},
+        {"title": "2. Em Atendimento", "slug": "em_atendimento", "keywords": ["sintoma", "dor", "exame"], "desc": "Conversando / Qualificação", "color": "#34d399", "auto": True, "protected": False},
+        {"title": "3. Falar Pessoalmente", "slug": "falar_pessoalmente", "keywords": [], "desc": "Kill-switch — IA pausada, humano assumiu", "color": "#fbbf24", "auto": False, "protected": True},
+        {"title": "4. Agendou", "slug": "consulta_agendada", "keywords": ["agendar", "marcar", "horario"], "desc": "Consulta marcada / Slot confirmado", "color": "#2dd4bf", "auto": True, "protected": False},
+        {"title": "5. Compareceu", "slug": "consulta_realizada", "keywords": ["compareci", "fui", "atendimento"], "desc": "Consulta realizada", "color": "#818cf8", "auto": True, "protected": False},
+        {"title": "6. Fechou / Contratou", "slug": "contratou", "keywords": ["pago", "pix", "fechado", "contrato"], "desc": "Fechou serviço / pagou", "color": "#34d399", "auto": True, "protected": False},
+        {"title": "7. Cliente Recorrente", "slug": "paciente_recorrente", "keywords": ["retorno", "voltei", "nova consulta"], "desc": "Retorno / nova consulta agendada", "color": "#22d3ee", "auto": True, "protected": False},
+        {"title": "8. Cancelou / Desistiu", "slug": "cancelou", "keywords": ["cancelar", "desisti", "nao vou"], "desc": "Desistência ou cancelamento", "color": "#94a3b8", "auto": True, "protected": False},
+    ],
+    "comercial": [
+        {"title": "1. Novo Lead", "slug": "novo_lead", "keywords": ["oi", "ola", "bom dia"], "desc": "Primeiro contato", "color": "#38bdf8", "auto": False, "protected": True},
+        {"title": "2. Qualificado", "slug": "qualificado", "keywords": ["interesse", "preciso", "orcamento"], "desc": "Interesse qualificado", "color": "#34d399", "auto": True, "protected": False},
+        {"title": "3. Visita / Orçamento", "slug": "visita_orcamento", "keywords": ["visita", "proposta", "preco", "valor"], "desc": "Visita realizada ou orçamento entregue", "color": "#fbbf24", "auto": True, "protected": False},
+        {"title": "4. Negociação", "slug": "negociacao", "keywords": ["desconto", "parcelar", "condicao"], "desc": "Negociação em andamento", "color": "#22d3ee", "auto": True, "protected": False},
+        {"title": "5. Fechado", "slug": "fechado", "keywords": ["pago", "pix", "fechado", "contrato"], "desc": "Venda fechada", "color": "#2dd4bf", "auto": True, "protected": False},
+        {"title": "6. Perdido", "slug": "perdido", "keywords": ["desisti", "caro", "cancelar"], "desc": "Perda da negociação", "color": "#fb7185", "auto": True, "protected": False},
+        {"title": "7. Recorrência", "slug": "recorrencia", "keywords": ["voltei", "de novo", "recompra"], "desc": "Cliente recorrente / recompra", "color": "#c084fc", "auto": True, "protected": False},
+    ],
+}
+
+_SPECIALTY_LABEL = {"turismo": "Turismo", "clinica": "Clínica", "comercial": "Comercial"}
+
+
+PROVISION_RATE: dict[str, list[float]] = {"__global__": []}
+
+
+def _send_welcome_email_async(company: str, admin_email: str, password: str) -> None:
+    """E-mail transacional de boas-vindas (thread daemon). Falha NUNCA propaga:
+    qualquer excecao vira log de aviso e o cadastro segue intacto no banco.
+    A senha viaja apenas dentro do corpo do e-mail, nunca em logs."""
+    import threading, smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    def _run() -> None:
+        try:
+            host = os.environ.get("SMTP_HOST", "")
+            port = int(os.environ.get("SMTP_PORT", "587") or "587")
+            user = os.environ.get("SMTP_USER", "")
+            pw = os.environ.get("SMTP_PASS", "")
+            sender = os.environ.get("SMTP_FROM") or os.environ.get("SMTP_FROM_EMAIL") or user
+            if not (host and user and pw):
+                logger.warning("[onboarding] SMTP incompleto — e-mail de boas-vindas nao enviado")
+                return
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = "Seu CRM Inteligente está pronto! Dados de Acesso"
+            msg["From"] = sender
+            msg["To"] = admin_email
+            html = f"""<html><body style="font-family:Arial,sans-serif;color:#0f172a;line-height:1.6">
+<h2 style="color:#0ea5e9">Seu CRM Inteligente está pronto!</h2>
+<p>Olá! O CRM da <strong>{company}</strong> foi criado com sucesso.</p>
+<p><strong>URL de Login:</strong> <a href="https://crm.automacaojs.us/login">https://crm.automacaojs.us/login</a><br>
+<strong>Usuário (E-mail):</strong> {admin_email}<br>
+<strong>Senha:</strong> {password}</p>
+<p><strong>WhatsApp:</strong> se você ainda não escaneou o QR Code no momento do cadastro,
+entre na plataforma, vá em <strong>Conexões</strong> e escaneie o código com o WhatsApp da empresa
+para começar a receber mensagens.</p>
+<p style="font-size:12px;color:#64748b">Guarde estes dados em local seguro. Equipe Automação JS.</p>
+</body></html>"""
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            use_tls = os.environ.get("SMTP_USE_STARTTLS", "true").strip().lower() in ("1", "true", "yes")
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=30)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+                if use_tls:
+                    server.starttls()
+            try:
+                server.login(user, pw)
+                server.sendmail(sender, [admin_email], msg.as_string())
+            finally:
+                server.quit()
+            logger.info("[onboarding] e-mail de boas-vindas enviado (tenant criado)")
+        except Exception as exc:
+            logger.warning(f"[onboarding] falha no e-mail de boas-vindas: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@app.post("/api/admin/tenants/provision")
+async def provision_tenant(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Cria tenant + funil padrao do nicho + instancia Evolution + webhook.
+    Rota aberta (auto-cadastro publico em /onboarding): protegida por
+    rate-limit em memoria (10/IP/hora, 30 global/hora) e pela chave
+    PUBLIC_ONBOARDING_ENABLED=false para desligar o auto-cadastro."""
+    import time as _time
+
+    if os.environ.get("PUBLIC_ONBOARDING_ENABLED", "true").strip().lower() in ("0", "false", "no"):
+        raise HTTPException(status_code=403, detail="auto-cadastro desativado")
+    _now = _time.time()
+    _fwd = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    _ip = _fwd or (request.client.host if request.client else "unknown")
+    PROVISION_RATE.setdefault(_ip, [])
+    PROVISION_RATE[_ip] = [t for t in PROVISION_RATE[_ip] if _now - t < 3600]
+    PROVISION_RATE["__global__"] = [t for t in PROVISION_RATE["__global__"] if _now - t < 3600]
+    if len(PROVISION_RATE[_ip]) >= 10 or len(PROVISION_RATE["__global__"]) >= 30:
+        raise HTTPException(status_code=429, detail="limite de cadastros por hora atingido, tente mais tarde")
+    PROVISION_RATE[_ip].append(_now)
+    PROVISION_RATE["__global__"].append(_now)
+    # E-mail do admin + senha sao obrigatorios (form publico e interno).
+    admin_email = str(payload.get("admin_email") or "").strip().lower()
+    admin_password = str(payload.get("password") or "")
+    if "@" not in admin_email or len(admin_email) < 5:
+        raise HTTPException(status_code=400, detail="admin_email invalido")
+    if len(admin_password) < 6:
+        raise HTTPException(status_code=400, detail="password deve ter ao menos 6 caracteres")
+    import httpx
+
+    name = str(payload.get("name") or "").strip()
+    niche = str(payload.get("business_niche") or "comercial").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="name e obrigatorio")
+    if niche not in PROVISION_SEEDS:
+        raise HTTPException(status_code=400, detail="business_niche invalido (turismo|clinica|comercial)")
+    engine_mode = str(payload.get("engine_mode") or "hermes_vps").strip()
+    if engine_mode not in ("hermes_vps", "byok"):
+        raise HTTPException(status_code=400, detail="engine_mode invalido (hermes_vps|byok)")
+    phone = str(payload.get("phone") or "").strip() or None
+    primary_color = str(payload.get("primary_color") or "#0ea5e9").strip()
+    logo_url = str(payload.get("logo_url") or "").strip() or None
+
+    # Nome de instancia unico: slug_nome_prod_01, _02, ...
+    base = _slugify(name)
+    instance = ""
+    for i in range(1, 100):
+        cand = f"{base}_prod_{i:02d}"
+        try:
+            chk = sb.table("tenants").select("id").eq("evolution_instance", cand).limit(1).execute()
+            if not chk.data:
+                instance = cand
+                break
+        except Exception:
+            instance = cand
+            break
+    if not instance:
+        raise HTTPException(status_code=500, detail="nao foi possivel gerar nome de instancia")
+
+    tenant_row = {
+        "name": name,
+        "specialty": _SPECIALTY_LABEL[niche],
+        "segment": niche,
+        "business_niche": niche,
+        "phone": phone,
+        "evolution_instance": instance,
+        "ai_mode": engine_mode,
+        "primary_color": primary_color,
+        "logo_url": logo_url,
+    }
+    try:
+        created = sb.table("tenants").insert(tenant_row).execute()
+        tenant_id = created.data[0]["id"]
+    except Exception as exc:
+        logger.error("[PROVISION] criar tenant falhou: %s", exc)
+        raise HTTPException(status_code=500, detail=f"falha ao criar tenant: {exc}")
+
+    seeded = 0
+    for pos, s in enumerate(PROVISION_SEEDS[niche], start=1):
+        try:
+            sb.table("kanban_stages").upsert({
+                "tenant_id": tenant_id, "title": s["title"], "slug": s["slug"],
+                "position": pos, "ai_keywords": s["keywords"], "trigger_keywords": s["keywords"],
+                "ai_prompt_hint": s["desc"], "semantic_description": s["desc"],
+                "has_automation": s["auto"], "is_system_protected": s["protected"],
+                "color_accent": s["color"],
+            }, on_conflict="tenant_id,slug").execute()
+            seeded += 1
+        except Exception as exc:
+            logger.warning("[PROVISION] seed etapa %s falhou: %s", s["slug"], exc)
+
+    # Evolution: criar instancia + registrar webhook (best-effort no webhook)
+    instance_created = False
+    instance_error = None
+    webhook_configured = False
+    qr_base64 = None
+    pairing_code = None
+    qr_code_text = None
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.post(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/create",
+                headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                json={"instanceName": instance, "integration": "WHATSAPP-BAILEYS", "qrcode": True},
+            )
+            instance_created = r.status_code in (200, 201)
+            if not instance_created:
+                instance_error = f"HTTP {r.status_code}: {r.text[:200]}"
+            else:
+                try:
+                    _cdata = r.json() if r.content else {}
+                    _qr = _cdata.get("qrcode") or {}
+                    qr_base64 = _qr.get("base64") or _cdata.get("base64")
+                    pairing_code = _qr.get("pairingCode") or _cdata.get("pairingCode")
+                    qr_code_text = _qr.get("code") or _cdata.get("code")
+                except Exception:
+                    pass
+                try:
+                    w = await client.post(
+                        f"{EVOLUTION_BASE_URL.rstrip('/')}/webhook/set/{instance}",
+                        headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                        json={"webhook": {
+                            "enabled": True,
+                            "url": "https://crm-webhook.automacaojs.us/webhook/evolution",
+                            "webhookByEvents": False,
+                            "events": ["MESSAGES_UPSERT"],
+                        }},
+                    )
+                    webhook_configured = w.status_code in (200, 201)
+                except Exception:
+                    pass
+    except Exception as exc:
+        instance_error = str(exc)
+
+    # Usuario administrativo no Supabase Auth — role admin_tenant, NUNCA super_admin.
+    # Nao-fatal: se falhar (ex.: e-mail ja existe), o tenant segue criado e o
+    # erro volta no campo auth_error para o operador resolver depois.
+    auth_user_created = False
+    auth_user_id = None
+    auth_error = None
+    service_role = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not service_role:
+        auth_error = "SUPABASE_SERVICE_ROLE_KEY ausente no backend"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                ar = await client.post(
+                    f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users",
+                    headers={"apikey": service_role, "Authorization": f"Bearer {service_role}",
+                             "Content-Type": "application/json"},
+                    json={"email": admin_email, "password": admin_password, "email_confirm": True,
+                          "app_metadata": {"role": "admin_tenant", "tenant_id": tenant_id,
+                                           "clinic_name": name},
+                          "user_metadata": {"name": name}},
+                )
+            if ar.status_code in (200, 201):
+                auth_user_created = True
+                try:
+                    auth_user_id = ar.json().get("id")
+                except Exception:
+                    pass
+            else:
+                auth_error = f"Auth admin HTTP {ar.status_code}: {ar.text[:200]}"
+        except Exception as exc:
+            auth_error = str(exc)
+    # E-mail de boas-vindas (thread; falha nao aborta o cadastro).
+    email_queued = False
+    email_error = None
+    try:
+        _send_welcome_email_async(name, admin_email, admin_password)
+        email_queued = True
+    except Exception as exc:
+        email_error = str(exc)
+        logger.warning(f"[onboarding] nao foi possivel enfileirar e-mail: {exc}")
+
+    return {
+        "ok": True, "tenant_id": tenant_id, "instance": instance,
+        "stages_seeded": seeded, "instance_created": instance_created,
+        "instance_error": instance_error, "webhook_configured": webhook_configured,
+        "qr_base64": qr_base64, "pairing_code": pairing_code, "qr_code": qr_code_text,
+        "admin_email": admin_email, "auth_user_created": auth_user_created,
+        "auth_user_id": auth_user_id, "auth_error": auth_error,
+        "email_queued": email_queued, "email_error": email_error,
+    }
+
+
+@app.post("/api/kanban/stages")
+async def kanban_stage_create(payload: dict[str, Any]) -> dict[str, Any]:
+    tenant_id = str(payload.get("tenant_id") or "")
+    title = str(payload.get("title") or "").strip()
+    if not tenant_id or not title:
+        raise HTTPException(status_code=400, detail="tenant_id e title sao obrigatorios")
+    slug = str(payload.get("slug") or "").strip() or _slugify(title)
+    try:
+        cur = sb.table("kanban_stages").select("position").eq("tenant_id", tenant_id).order("position", desc=True).limit(1).execute()
+        position = int(payload.get("position") or ((cur.data[0]["position"] + 1) if cur.data else 1))
+    except Exception:
+        position = 1
+    keywords = payload.get("trigger_keywords") or payload.get("ai_keywords") or []
+    desc = str(payload.get("semantic_description") or payload.get("ai_prompt_hint") or "")
+    try:
+        row = sb.table("kanban_stages").insert({
+            "tenant_id": tenant_id, "title": title, "slug": slug, "position": position,
+            "ai_keywords": keywords, "trigger_keywords": keywords,
+            "ai_prompt_hint": desc, "semantic_description": desc,
+            "has_automation": bool(payload.get("has_automation", True)),
+            "is_system_protected": bool(payload.get("is_system_protected", False)),
+            "color_accent": str(payload.get("color_accent") or "#38bdf8"),
+        }).execute()
+        return {"ok": True, "stage": row.data[0]}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"falha ao criar etapa: {exc}")
+
+
+@app.put("/api/kanban/stages/{stage_id}")
+async def kanban_stage_update(stage_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    if "title" in payload and str(payload["title"]).strip():
+        patch["title"] = str(payload["title"]).strip()
+    if "semantic_description" in payload or "ai_prompt_hint" in payload:
+        patch["semantic_description"] = str(payload.get("semantic_description") or payload.get("ai_prompt_hint") or "")
+        patch["ai_prompt_hint"] = patch["semantic_description"]
+    if "trigger_keywords" in payload or "ai_keywords" in payload:
+        patch["trigger_keywords"] = payload.get("trigger_keywords") or payload.get("ai_keywords") or []
+        patch["ai_keywords"] = patch["trigger_keywords"]
+    if "color_accent" in payload:
+        patch["color_accent"] = str(payload["color_accent"])
+    if "has_automation" in payload:
+        patch["has_automation"] = bool(payload["has_automation"])
+    if "position" in payload:
+        patch["position"] = int(payload["position"])
+    if not patch:
+        raise HTTPException(status_code=400, detail="nada para atualizar")
+    try:
+        row = sb.table("kanban_stages").update(patch).eq("id", stage_id).execute()
+        if not row.data:
+            raise HTTPException(status_code=404, detail="etapa nao encontrada")
+        return {"ok": True, "stage": row.data[0]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"falha ao atualizar etapa: {exc}")
+
+
+@app.delete("/api/kanban/stages/{stage_id}")
+async def kanban_stage_delete(stage_id: str) -> dict[str, Any]:
+    try:
+        cur = sb.table("kanban_stages").select("id, tenant_id, slug, is_system_protected").eq("id", stage_id).limit(1).execute()
+        if not cur.data:
+            raise HTTPException(status_code=404, detail="etapa nao encontrada")
+        stage = cur.data[0]
+        if stage.get("is_system_protected"):
+            raise HTTPException(status_code=400, detail="etapa protegida pelo sistema nao pode ser excluida")
+        tenant_id = stage["tenant_id"]
+        # Destino da realocacao: novo_lead se existir, senao a etapa de menor posicao
+        dest = sb.table("kanban_stages").select("slug, position").eq("tenant_id", tenant_id).neq("id", stage_id).order("position").limit(1).execute().data or []
+        if not dest:
+            raise HTTPException(status_code=400, detail="nao ha etapa de destino para realocar os leads")
+        dest_slug = next((d["slug"] for d in dest if d["slug"] == "novo_lead"), dest[0]["slug"])
+        moved = 0
+        try:
+            upd = sb.table("leads").update({"stage": dest_slug}).eq("tenant_id", tenant_id).eq("stage", stage["slug"]).execute()
+            moved = len(upd.data or [])
+        except Exception as exc:
+            logger.warning("[KANBAN-DELETE] realocacao falhou: %s", exc)
+        sb.table("kanban_stages").delete().eq("id", stage_id).execute()
+        return {"ok": True, "moved_leads": moved, "moved_to": dest_slug}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"falha ao excluir etapa: {exc}")
+
+
+# =====================================================================
+# PROSPECTOR INTEGRADO (alimentador outbound do funil)
+# =====================================================================
+PROSPECTOR_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _apply_spintax(text: str) -> str:
+    def _pick(m: "re.Match[str]") -> str:
+        return random.choice(m.group(1).split("|"))
+
+    out = text or ""
+    prev = None
+    while prev != out:
+        prev = out
+        out = re.sub(r"\{([^{}|]+(?:\|[^{}]+)+)\}", _pick, out)
+    return out
+
+
+def _format_prospector_message(template: str, lead: dict[str, Any]) -> str:
+    name = str(lead.get("business_name") or "").strip()
+    first = name.split(" ")[0] if name else ""
+    msg = _apply_spintax(template or "")
+    return msg.replace("{empresa}", name).replace("{nome}", first or name)
+
+
+def _prospector_instance(tenant_id: str) -> str:
+    try:
+        t = sb.table("tenants").select("evolution_instance").eq("id", tenant_id).limit(1).execute()
+        if t.data:
+            return t.data[0].get("evolution_instance") or ""
+    except Exception:
+        pass
+    return ""
+
+
+async def _prospector_mine_runner(job_id: str, tenant_id: str, category: str, city: str, neighborhood: str, instance: str, limit: int) -> None:
+    job = PROSPECTOR_JOBS[job_id]
+    try:
+        args = json.dumps({
+            "tenant_id": tenant_id, "category": category, "city": city,
+            "neighborhood": neighborhood, "instance": instance, "limit": limit,
+        })
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/python3", "/root/apps/crm-hermes/prospector_bridge.py", args,
+            cwd="/opt/prospector",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            try:
+                evt = json.loads(raw.decode().strip())
+                for k in ("phase", "found", "saved", "valid", "count", "skipped_no_whatsapp"):
+                    if k in evt:
+                        job[k] = evt[k]
+            except Exception:
+                pass
+        await proc.wait()
+        job["status"] = "done" if proc.returncode == 0 else "error"
+        if proc.returncode != 0 and proc.stderr is not None:
+            err = (await proc.stderr.read()).decode(errors="ignore")[-600:]
+            job["error"] = err
+            logger.error("[PROSPECTOR] bridge falhou job=%s: %s", job_id, err)
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+
+
+async def _prospector_dispatch_runner(job_id: str, instance: str, rows: list[dict[str, Any]], template: str, media: dict[str, Any] | None) -> None:
+    job = PROSPECTOR_JOBS[job_id]
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, lead in enumerate(rows):
+            if i > 0:
+                await asyncio.sleep(random.uniform(25, 55))
+            text = _format_prospector_message(template, lead)
+            phone = "".join(c for c in str(lead.get("phone") or "") if c.isdigit())
+            ok = False
+            try:
+                if media:
+                    payload = {
+                        "number": phone, "mediatype": "image",
+                        "mimetype": media.get("mimetype") or "image/jpeg",
+                        "media": media["data"], "caption": text, "fileName": "imagem.jpg",
+                    }
+                    r = await client.post(
+                        f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendMedia/{instance}",
+                        json=payload,
+                        headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                    )
+                else:
+                    r = await client.post(
+                        f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{instance}",
+                        json={"number": phone, "text": text},
+                        headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                    )
+                ok = r.status_code in (200, 201)
+                if not ok:
+                    logger.warning("[PROSPECTOR] envio %s -> HTTP %s: %s", phone, r.status_code, r.text[:160])
+            except Exception as exc:
+                logger.warning("[PROSPECTOR] envio falhou %s: %s", phone, exc)
+            if ok:
+                try:
+                    sb.table("prospector_leads").update({
+                        "status": "enviado",
+                        "last_contact_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead["id"]).execute()
+                except Exception:
+                    pass
+                job["sent"] = int(job.get("sent") or 0) + 1
+            else:
+                job["failed"] = int(job.get("failed") or 0) + 1
+            job["done"] = i + 1
+    job["status"] = "done"
+
+
+@app.post("/api/prospector/mine")
+async def prospector_mine(payload: dict[str, Any]) -> dict[str, Any]:
+    tenant_id = str(payload.get("tenant_id") or "")
+    category = str(payload.get("category") or "").strip()
+    city = str(payload.get("city") or "").strip()
+    neighborhood = str(payload.get("neighborhood") or "").strip()
+    if not tenant_id or not category or not city:
+        raise HTTPException(status_code=400, detail="tenant_id, category e city sao obrigatorios")
+    job_id = uuid.uuid4().hex[:12]
+    PROSPECTOR_JOBS[job_id] = {
+        "id": job_id, "type": "mine", "status": "running", "phase": "iniciando",
+        "found": 0, "saved": 0, "tenant_id": tenant_id,
+    }
+    asyncio.create_task(_prospector_mine_runner(
+        job_id, tenant_id, category, city, neighborhood,
+        _prospector_instance(tenant_id), int(payload.get("limit") or 80),
+    ))
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/prospector/dispatch")
+async def prospector_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
+    tenant_id = str(payload.get("tenant_id") or "")
+    template = str(payload.get("message") or "").strip()
+    if not tenant_id or not template:
+        raise HTTPException(status_code=400, detail="tenant_id e message sao obrigatorios")
+    limit = int(payload.get("limit") or 15)
+    lead_ids = payload.get("lead_ids") or []
+    q = sb.table("prospector_leads").select("*").eq("tenant_id", tenant_id).eq("status", "pendente")
+    if lead_ids:
+        q = q.in_("id", lead_ids)
+    rows = (q.order("created_at").limit(limit).execute().data) or []
+    instance = _prospector_instance(tenant_id)
+    if not instance:
+        raise HTTPException(status_code=400, detail="tenant sem instancia Evolution configurada")
+    media = None
+    if payload.get("media_url"):
+        media = {"data": str(payload["media_url"]), "mimetype": "image/jpeg"}
+    elif payload.get("media_base64"):
+        media = {"data": str(payload["media_base64"]), "mimetype": str(payload.get("media_mimetype") or "image/jpeg")}
+    job_id = uuid.uuid4().hex[:12]
+    PROSPECTOR_JOBS[job_id] = {
+        "id": job_id, "type": "dispatch", "status": "running",
+        "total": len(rows), "done": 0, "sent": 0, "failed": 0, "tenant_id": tenant_id,
+    }
+    asyncio.create_task(_prospector_dispatch_runner(job_id, instance, rows, template, media))
+    return {"ok": True, "job_id": job_id, "total": len(rows)}
+
+
+@app.get("/api/prospector/jobs/{job_id}")
+async def prospector_job(job_id: str) -> dict[str, Any]:
+    job = PROSPECTOR_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job nao encontrado")
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/prospector/stats")
+async def prospector_stats(tenant_id: str) -> dict[str, Any]:
+    counts = {"pendente": 0, "enviado": 0, "respondeu": 0, "sem_resposta": 0, "total": 0}
+    try:
+        rows = sb.table("prospector_leads").select("status").eq("tenant_id", tenant_id).execute().data or []
+        for r in rows:
+            counts["total"] += 1
+            s = r.get("status") or "pendente"
+            if s in counts:
+                counts[s] += 1
+    except Exception as exc:
+        return {"ok": False, "stats": counts, "error": str(exc)}
+    return {"ok": True, "stats": counts}
+
+
+@app.get("/api/prospector/leads")
+async def prospector_leads_list(tenant_id: str, limit: int = 200) -> dict[str, Any]:
+    try:
+        rows = sb.table("prospector_leads").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(limit).execute().data or []
+        return {"ok": True, "leads": rows}
+    except Exception as exc:
+        return {"ok": False, "leads": [], "error": str(exc)}
+
+
+@app.get("/api/kanban/stages")
+async def kanban_stages(tenant_id: str) -> dict[str, Any]:
+    """Colunas oficiais do funil do tenant (tabela kanban_stages, ordenadas)."""
+    try:
+        res = (
+            sb.table("kanban_stages")
+            .select("id, slug, title, position, ai_keywords, ai_prompt_hint, has_automation, trigger_keywords, semantic_description, is_system_protected, color_accent")
+            .eq("tenant_id", tenant_id)
+            .order("position")
+            .execute()
+        )
+        return {"ok": True, "stages": res.data or []}
+    except Exception as exc:
+        logger.error("[kanban/stages] %s", exc)
+        return {"ok": False, "stages": [], "error": str(exc)}
+
+
+@app.get("/api/kanban/automations")
+async def kanban_automations(tenant_id: str) -> dict[str, Any]:
+    """Reguas de automacao do tenant (tabela stage_automations)."""
+    try:
+        res = sb.table("stage_automations").select("*").eq("tenant_id", tenant_id).execute()
+        return {"ok": True, "automations": res.data or []}
+    except Exception as exc:
+        logger.error("[kanban/automations] %s", exc)
+        return {"ok": False, "automations": [], "error": str(exc)}
+
+
 @app.post("/webhook/evolution")
 @app.post("/webhook/evolution/{instance}")
 @app.post("/webhook/evolution/{instance}/{event_subpath}")
@@ -1511,8 +3922,11 @@ async def evolution_webhook(
             request.query_params.get("instance")
             or payload.get("instance")
             or (payload.get("data") or {}).get("instance")
-            or "cardio_matheus_prod_01"
         )
+
+    if not instance:
+        logger.warning("[webhook] Mensagem recebida sem campo 'instance' no payload; ignorando")
+        return {"ok": True, "tenant_resolved": False, "reason": "missing_instance"}
 
     # 0. Validação de segurança: autenticação da Evolution API
     # Bloqueia se EVOLUTION_WEBHOOK_SECRET estiver explicitamente configurado no .env,
@@ -1543,14 +3957,42 @@ async def evolution_webhook(
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     event = payload.get("event") or event_subpath or "unknown"
-    data = payload.get("data") or {}
+    data = payload.get("data")
+    if data is None:
+        data = {}
+
+    first_item = data[0] if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) else (data if isinstance(data, dict) else {})
     logger.info(
-        "[%s] event=%s messageType=%s fromMe=%s",
+        "[%s] event=%s messageType=%s fromMe=%s is_list=%s",
         instance,
         event,
-        data.get("messageType"),
-        (data.get("key") or {}).get("fromMe"),
+        first_item.get("messageType"),
+        (first_item.get("key") or {}).get("fromMe"),
+        isinstance(data, list),
     )
+
+    # Trava Hard-Drop: restrita EXCLUSIVAMENTE às instâncias do Prospector (ex: formiga)
+    if instance in PROSPECTOR_FANOUT_INSTANCES:
+        def _get_prospector_ia_status_crm():
+            try:
+                import sqlite3
+                for db_p in ("/opt/prospector/prospector.db", "/opt/prospector/data/prospector.db"):
+                    if os.path.exists(db_p):
+                        with sqlite3.connect(db_p, timeout=2.0) as sconn:
+                            scur = sconn.cursor()
+                            scur.execute("SELECT valor FROM config_sistema WHERE chave IN ('ia_ativa', 'calls_ai_text_active') LIMIT 1;")
+                            srow = scur.fetchone()
+                            if srow:
+                                return str(srow[0]).strip()
+            except Exception as se:
+                logger.debug("[%s] Erro ao ler Prospector SQLite: %s", instance, se)
+            return "1"
+
+        status_ia = _get_prospector_ia_status_crm()
+        if status_ia in ['PAUSADO', '0', 0, False, 'false']:
+            logger.info("[%s] Prospector IA pausada. Executando fan-out e ignorando despacho local.", instance)
+            background.add_task(_fanout, instance, payload)
+            return {"status": "ignored", "reason": "prospector_ai_paused"}
 
     # 1. Resolve tenant
     tenant_id = _resolve_tenant_id(instance)
@@ -1559,95 +4001,449 @@ async def evolution_webhook(
         background.add_task(_fanout, instance, payload)
         return {"ok": True, "tenant_resolved": False}
 
-    # 2. Extrai mensagem (se houver, com áudio Whisper e visão 9Router)
-    extracted = await _extract_message(event, data, instance=instance)
-    if extracted is None:
-        # Registra atualizações de status de conexão (ex: connection.update == open)
-        if str(event).lower() in ("connection.update", "connection-update", "connection_update"):
-            conn_state = data.get("state") or data.get("status")
-            logger.info("[%s] connection.update detectado: state=%s", instance, conn_state)
-            if conn_state == "open":
-                _invalidate_tenant_cache(tenant_id)
+    norm_event = str(event or "").lower().replace("-", ".").replace("_", ".")
+
+    # BLINDAGEM TEMPO REAL (2026-10-23): eventos de sincronizacao em lote
+    # (*_SET e os upserts de agenda CHATS/CONTACTS) NUNCA criam leads nem
+    # tocam o banco. Foi assim que 3.652 contatos do historico do cliente
+    # entraram como leads no tenant de Turismo. So mensagem em tempo real
+    # processa neste webhook.
+    if norm_event.endswith(".set") or norm_event in ("chats.upsert", "contacts.upsert"):
+        logger.info("[%s] Evento de sincronizacao em lote descartado: %s", instance, event)
+        return {"ok": True, "event": event, "dropped": "bulk_sync"}
+
+    # 2. Sincronização em lote de Chats / Contatos (CHATS_UPSERT / CONTACTS_UPSERT)
+    if norm_event in ("chats.upsert", "contacts.upsert", "chats.set", "contacts.set"):
+        items = data if isinstance(data, list) else [data]
+        synced_count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            jid = item.get("id") or item.get("remoteJid") or item.get("jid") or ""
+            if not jid or "@g.us" in jid:
+                continue
+            raw_phone = jid.split("@")[0]
+            phone = _normalize_phone(raw_phone)
+            if not phone:
+                continue
+            contact_name = (
+                item.get("pushName")
+                or item.get("name")
+                or item.get("verifiedName")
+                or item.get("formattedName")
+                or f"Contato {phone[-4:]}"
+            )
+            if is_invalid_patient_name(contact_name):
+                contact_name = f"Contato {phone[-4:]}"
+            lead = _get_or_create_lead(tenant_id, phone, contact_name, is_from_me=False)
+            if lead:
+                synced_count += 1
+        logger.info("[%s] Sincronização %s concluída: %d contatos processados", instance, norm_event, synced_count)
+        background.add_task(_fanout, instance, payload)
+        return {"ok": True, "event": event, "synced_contacts": synced_count}
+
+    # 3. Connection Update (atualização de status de conexão do aparelho)
+    if norm_event in ("connection.update", "connection.upsert"):
+        conn_state = data.get("state") or data.get("status")
+        logger.info("[%s] connection.update detectado: state=%s", instance, conn_state)
+        if conn_state == "open":
+            _invalidate_tenant_cache(tenant_id)
+        background.add_task(_fanout, instance, payload)
+        return {"ok": True, "event": event, "connection_state": conn_state}
+
+    # 4. Processamento de Mensagens (MESSAGES_UPSERT, MESSAGES_UPDATE, SEND_MESSAGE)
+    # Suporta payload unitário ou em lote (data como list ou dict com 'messages')
+    raw_messages: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        raw_messages = [m for m in data if isinstance(m, dict)]
+    elif isinstance(data, dict):
+        if isinstance(data.get("messages"), list):
+            raw_messages = [m for m in data["messages"] if isinstance(m, dict)]
+        else:
+            raw_messages = [data]
+
+    if not raw_messages:
         background.add_task(_fanout, instance, payload)
         return {"ok": True, "event": event, "stored": False}
 
-    # 3. Resolve/cria lead
-    lead = _get_or_create_lead(
-        tenant_id, extracted["phone"], extracted["sender_name"]
-    )
-    if not lead:
-        background.add_task(_fanout, instance, payload)
-        return {"ok": True, "lead_missing": True}
-
-    # 4. Grava mensagem do paciente/humano
-    insert_payload = {
-        "tenant_id": tenant_id,
-        "lead_id": lead["id"],
-        "sender": extracted["sender"],
-        "content": extracted["content"],
-        "created_at": extracted["ts"],
-    }
-    res = sb.table("messages").insert(insert_payload).execute()
-    ok = bool(res.data)
-    logger.info(
-        "[%s] stored=%s sender=%s phone=%s",
-        instance,
-        ok,
-        extracted["sender"],
-        extracted["phone"],
-    )
-
-    # 5. Dispara motor IA (apenas inbound de paciente + handoff_state='ai'/'ia_ativa')
-    #    Aceita os dois valores: 'ia_ativa' é o canônico gravado pelo front
-    #    (supabaseService.createLead) e 'ai' é o legado de seeds antigas.
-    handoff_state = (lead.get("handoff_state") or "ia_ativa").lower()
-    ai_active = handoff_state in {"ai", "ia_ativa"}
-
-    # 🌙 PLANTÃO IA — se o tenant desligou, NÃO disparamos IA mesmo que
-    # a lead esteja em modo ia_ativa. Cache do tenant_cfg tem TTL 60s;
-    # toggle via front expira em <= 60s no pior caso. Mensagem segue
-    # gravada em `messages` (acima) e lead já foi atualizado.
     tenant_cfg = _get_tenant_config(tenant_id)
     plantao_off = not tenant_cfg.get("ai_auto_reply_enabled", True)
-    if plantao_off:
-        logger.info(
-            "[%s] 🌙 plantão IA OFF — phone=%s lead=%s "
-            "msg gravada, IA NÃO vai responder",
-            instance,
-            extracted["phone"],
-            lead.get("id"),
-        )
-
-    should_dispatch_ai = (
-        ok
-        and not extracted["from_me"]
-        and extracted["sender"] == "patient"
-        and ai_active
-        and not plantao_off
+    _is_tourism_hook = (
+        str(tenant_id) == "44444444-4444-4444-4444-444444444444"
+        or "turismo" in str(tenant_cfg.get("specialty") or "").lower()
     )
-    if should_dispatch_ai:
-        background.add_task(
-            _dispatch_ai, tenant_id, lead, extracted["content"], instance
-        )
 
-    # 5.1 Extração assíncrona de sintomas e queixas via BackgroundTasks (Customer 360 / Deskcomm)
-    # Roda em segundo plano sem bloquear o retorno do webhook nem a conversa
-    if ok and not extracted["from_me"] and extracted["sender"] == "patient":
-        background.add_task(
-            _extract_and_persist_clinical_data, lead, extracted["content"], instance
-        )
+    stored_count = 0
+    ai_dispatched_count = 0
+    last_lead_id = None
+    last_msg_id = None
 
-    # 6. Fan-out pro Mendes CRM
+    for msg_item in raw_messages:
+        extracted = await _extract_message(event, msg_item, instance=instance)
+        if not extracted:
+            continue
+
+        # CORTE DE TEMPO REAL: mensagem com mais de 120s de idade e
+        # historico reenviado pela Evolution - nunca cria lead nem grava.
+        try:
+            _msg_age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(extracted["ts"]).timestamp()
+        except Exception:
+            _msg_age = 0
+        if _msg_age > 120:
+            logger.info(
+                "[%s] Mensagem antiga descartada (idade %.0fs > 120s) phone=%s",
+                instance, _msg_age, extracted.get("phone"),
+            )
+            continue
+
+        from_me = extracted.get("from_me", False)
+        # NUNCA usar push_name de mensagem enviada (from_me == True) como nome do paciente
+        patient_candidate_name = "" if from_me else extracted.get("sender_name", "")
+        if is_invalid_patient_name(patient_candidate_name):
+            patient_candidate_name = ""
+
+        # Resolve/cria lead
+        lead = _get_or_create_lead(
+            tenant_id, extracted["phone"], patient_candidate_name, is_from_me=from_me
+        )
+        if not lead:
+            continue
+
+        last_lead_id = lead["id"]
+
+        # PROSPECTOR: se quem respondeu era um lead prospectado com disparo
+        # feito, marca 'respondeu' na base de prospeccao (o card ja nasce
+        # em novo_lead pelo fluxo normal e o JEV assume a triagem).
+        if not from_me:
+            try:
+                sb.table("prospector_leads").update({"status": "respondeu"}).eq("tenant_id", tenant_id).in_("phone", _phone_variants(extracted["phone"])).eq("status", "enviado").execute()
+            except Exception:
+                pass
+
+        # TURISMO: atendente humano respondeu -> novo_lead/lead_real viram em_atendimento
+        if from_me and _is_tourism_hook and str(lead.get("stage") or "") in ("novo_lead", "lead_real"):
+            try:
+                sb.table("leads").update({"stage": "em_atendimento", "updated_at": _now_iso()}).eq("id", lead["id"]).execute()
+                lead["stage"] = "em_atendimento"
+                logger.info("[%s] [TURISMO] Atendente respondeu: lead %s -> em_atendimento", instance, lead["id"])
+            except Exception as _terr:
+                logger.warning("[%s] [TURISMO] falha ao mover p/ em_atendimento: %s", instance, _terr)
+
+        # Grava mensagem do paciente/humano
+        insert_payload = {
+            "tenant_id": tenant_id,
+            "lead_id": lead["id"],
+            "sender": extracted["sender"],
+            "content": extracted["content"],
+            "created_at": extracted["ts"],
+            "media_type": extracted.get("media_type", "text"),
+            "media_url": extracted.get("media_url"),
+        }
+        res = sb.table("messages").insert(insert_payload).execute()
+        ok = bool(res.data)
+        if ok:
+            stored_count += 1
+            last_msg_id = res.data[0]["id"]
+            logger.info(
+                "[%s] stored=%s sender=%s phone=%s",
+                instance,
+                ok,
+                extracted["sender"],
+                extracted["phone"],
+            )
+
+        # 🛡️ BLINDAGEM DINÂMICA DE CONTATOS IGNORADOS (TENANT 1111 E GERAL)
+        # O contato aparece no Inbox Unificado normalmente (mensagem gravada acima),
+        # mas nenhuma métrica, agendamento, opt-out ou valor financeiro é extraído,
+        # e a IA / minerador / copiloto são silenciados sumariamente.
+        lead_contact_name = str(lead.get("name") or extracted.get("sender_name") or "")
+        lead_contact_phone = str(extracted.get("phone") or lead.get("phone") or "")
+        if is_contact_ignored(tenant_id, phone=lead_contact_phone, name=lead_contact_name):
+            logger.info(
+                f"[BLINDAGEM] Lead {lead_contact_name} ({lead_contact_phone}) ignorado para métricas e minerador."
+            )
+            continue
+
+        # BOAS-VINDAS IMEDIATAS (Turismo): primeiro contato de um numero novo
+        if ok and not extracted["from_me"] and _is_tourism_hook:
+            try:
+                _msg_count = sb.table("messages").select("id").eq("lead_id", lead["id"]).limit(2).execute()
+                if len(_msg_count.data or []) <= 1:
+                    from zoneinfo import ZoneInfo as _ZI
+                    _hour = datetime.now(_ZI("America/Sao_Paulo")).hour
+                    _saud = "Bom dia" if _hour < 12 else ("Boa tarde" if _hour < 18 else "Boa noite")
+                    _welcome = f"{_saud}! Aqui é da ESVC Turismo. Como posso te ajudar hoje? Em qual viagem você está pensando?"
+                    _w_enabled = True
+                    try:
+                        _auto = sb.table("stage_automations").select("message_template, is_active").eq("tenant_id", tenant_id).eq("stage_key", "boas_vindas").limit(1).execute()
+                        if _auto.data:
+                            _w_enabled = bool(_auto.data[0].get("is_active", True))
+                            if _auto.data[0].get("message_template"):
+                                _welcome = (
+                                    str(_auto.data[0]["message_template"])
+                                    .replace("{saudacao}", _saud)
+                                    .replace("{nome}", str(lead.get("name") or ""))
+                                )
+                    except Exception:
+                        pass
+                    _sent = await _send_evolution_text(instance, extracted["phone"], _welcome) if _w_enabled else False
+                    _sent_ok = _sent.get("ok") if isinstance(_sent, dict) else bool(_sent)
+                    logger.info("[%s] [BOAS-VINDAS] lead=%s phone=%s enviado=%s", instance, lead["id"], extracted["phone"], _sent_ok)
+                    if _sent_ok:
+                        sb.table("messages").insert({
+                            "tenant_id": tenant_id, "lead_id": lead["id"],
+                            "sender": "ai", "content": _welcome, "created_at": _now_iso(),
+                        }).execute()
+            except Exception as _werr:
+                logger.warning("[%s] [BOAS-VINDAS] falha: %s", instance, _werr)
+
+        # 📅 Cancelamento / Desmarcação de Consulta (SEM Opt-out)
+        if ok and not extracted["from_me"] and extracted["sender"] == "patient":
+            if _is_appointment_cancel_request(extracted["content"]):
+                logger.info(
+                    "[%s] 📅 Cancelamento/Desmarcação de consulta detectado para lead=%s phone=%s: %r",
+                    instance, lead["id"], extracted["phone"], extracted["content"],
+                )
+                try:
+                    sb.table("leads").update({
+                        "stage": "cancelou",
+                        "last_interaction": _now_iso(),
+                    }).eq("id", lead["id"]).execute()
+                except Exception as can_err:
+                    logger.error("[%s] Erro ao atualizar lead com stage cancelou: %s", instance, can_err)
+
+            elif _is_opt_out_request(extracted["content"]):
+                # 🛑 MOTOR DE OPT-OUT AUTOMÁTICO ESTRITO (ANTI-IMPORTUNAÇÃO / LGPD)
+                logger.info(
+                    "[%s] 🛑 OPT-OUT estrito detectado para lead=%s phone=%s: %r",
+                    instance, lead["id"], extracted["phone"], extracted["content"],
+                )
+                opt_out_patch = {
+                    "stage": "cancelou",
+                    "handoff_state": "opt_out",
+                    "ai_active": False,
+                    "opt_out_reactivation": True,
+                    "followup_count": 99,
+                    "followup_status": "archived",
+                    "last_interaction": _now_iso(),
+                    "internal_notes": "Contato solicitou opt-out / descadastro de mensagens automáticas.",
+                }
+                try:
+                    sb.table("leads").update(opt_out_patch).eq("id", lead["id"]).execute()
+                except Exception as opt_err:
+                    logger.error("[%s] Erro ao atualizar lead com opt-out: %s", instance, opt_err)
+
+                farewell_msg = (
+                    "Entendido perfeitamente! Seu contato foi desvinculado dos nossos avisos automáticos "
+                    "e não voltaremos a enviar mensagens. Se precisar de algo no futuro, estamos à disposição. Um abraço!"
+                )
+                await _send_evolution_text(instance, extracted["phone"], farewell_msg)
+
+                try:
+                    sb.table("messages").insert({
+                        "tenant_id": tenant_id,
+                        "lead_id": lead["id"],
+                        "sender": "ai",
+                        "content": farewell_msg,
+                        "created_at": _now_iso(),
+                    }).execute()
+                except Exception:
+                    pass
+
+                # Interrompe o fluxo imediatamente antes de acionar o LLM
+                continue
+
+        # ✈️ REGRAS DE OURO TURISMO (ESVC Turismo):
+        # 1. Fechamento Bidirecional (cliente ou atendente) -> "fechou" + lead_trips
+        # 2. Atendente enviou cotação / valores -> last_quote_at = now(), stage = "cotacao" (sem regredir fechou/negociacao)
+        # 3. Pedido de descadastro -> opt_out_reactivation = True
+        is_tourism_tenant = (
+            tenant_cfg.get("specialty") == "Turismo"
+            or str(tenant_id) == "44444444-4444-4444-4444-444444444444"
+        )
+        if ok and is_tourism_tenant:
+            msg_lower = (extracted.get("content") or "").lower()
+            current_lead_stage = (lead.get("stage") or "").lower()
+
+            # Palavras-chave bidirecionais de fechamento
+            client_closing_kw = [
+                "já enviei o pagamento", "ja enviei o pagamento", "fiz o pix", "pode fechar",
+                "vou fazer o pagamento no pix", "vou pagar no pix", "pagamento de r$",
+                "pagamento realizado", "comprovante enviado", "já paguei", "ja paguei",
+                "fechar o pacote", "fechado ta pode fechar", "tá confirmado", "ta confirmado",
+                "fechado tá pode fechar"
+            ]
+            attendant_closing_kw = [
+                "recebi o pagamento", "valor confirmado", "está pago", "esta pago",
+                "pagamento confirmado", "pix confirmado", "confirmamos seu pagamento",
+                "reserva confirmada", "pacote confirmado", "pix recebido"
+            ]
+
+            is_client_close = not extracted["from_me"] and any(w in msg_lower for w in client_closing_kw)
+            is_attendant_close = extracted["from_me"] and any(w in msg_lower for w in attendant_closing_kw)
+
+            if is_client_close or is_attendant_close:
+                try:
+                    dest_f = lead.get("trip_destination") or "Gramado"
+                    sb.table("leads").update({
+                        "stage": "fechou",
+                        "conversion_probability": 98,
+                        "negotiation_stage": "fechou",
+                        "current_objection": "nenhuma",
+                        "copilot_guidance": f"Pagamento confirmado via Pix para {dest_f}. Dica: Enviar o recibo de confirmação e solicitar os nomes completos e CPF dos passageiros para emissão dos bilhetes.",
+                        "suggested_reply": f"Perfeito! Seu pacote para {dest_f} está confirmado e o pagamento via Pix foi registrado com sucesso. Por favor, envie os nomes completos e CPFs dos passageiros para emissão das passagens.",
+                        "last_interaction": _now_iso(),
+                    }).eq("id", lead["id"]).execute()
+                    lead["stage"] = "fechou"
+                    logger.info("[%s] ✈️ [TURISMO] Fechamento confirmado bidirecional (client=%s, attendant=%s) -> stage='fechou' lead=%s", instance, is_client_close, is_attendant_close, lead["id"])
+                except Exception as e:
+                    logger.error("[%s] Erro ao registrar fechamento turismo: %s", instance, e)
+
+            elif not extracted["from_me"] and extracted["sender"] == "patient":
+                # Checa descadastro no turismo
+                if any(w in msg_lower for w in ["não quero mais", "nao quero mais", "sair", "parar", "stop", "remover meu número", "remover meu numero", "descadastrar"]):
+                    try:
+                        sb.table("leads").update({
+                            "opt_out_reactivation": True,
+                            "stage": "cancelou",
+                            "handoff_state": "opt_out",
+                            "last_interaction": _now_iso(),
+                        }).eq("id", lead["id"]).execute()
+                        lead["stage"] = "cancelou"
+                        logger.info("[%s] 🛑 [TURISMO] opt_out_reactivation marcado para lead=%s", instance, lead["id"])
+                    except Exception as e:
+                        logger.error("[%s] Erro opt-out turismo: %s", instance, e)
+
+                # Checa solicitação de cotação / interesse em viagem (REGRA DE PROGRESSÃO: nunca regride fechou/negociacao)
+                travel_keywords = ["cotação", "cotacao", "passagem", "passagens", "pacote", "pacotes", "voo", "voos", "hotel", "hoteis", "hotéis", "resort", "resorts", "preço", "preco", "precos", "preços", "viagem", "destinos", "passeio", "hospedagem", "quanto fica", "quanto custa"]
+                if any(w in msg_lower for w in travel_keywords):
+                    if current_lead_stage not in ["fechou", "fechou_vendido", "negociacao", "em_negociacao"]:
+                        target_st = "cotacao" if any(k in msg_lower for k in ["quanto", "preco", "preço", "cotacao", "cotação", "valor"]) else "em_atendimento"
+                        try:
+                            sb.table("leads").update({
+                                "stage": target_st,
+                                "last_interaction": _now_iso(),
+                            }).eq("id", lead["id"]).execute()
+                            lead["stage"] = target_st
+                            logger.info("[%s] ✈️ [TURISMO] Interesse detectado -> movido para '%s' lead=%s", instance, target_st, lead["id"])
+                        except Exception as e:
+                            logger.error("[%s] Erro ao mover stage para %s: %s", instance, target_st, e)
+
+            elif extracted["from_me"] or extracted["sender"] in ["human", "attendant", "user", "secretaria"]:
+                # Atendente enviou mensagem de saída com cotação/valores
+                quote_keywords = ["cotação", "cotacao", "proposta", "orçamento", "orcamento", "voo", "hotel", "resort", "pacote", "r$", "reais", "valor", "embarque", "ida e volta", "está custando", "fica em"]
+                if any(w in msg_lower for w in quote_keywords):
+                    # REGRA DE PROGRESSÃO: Só avança para cotação se o lead não atingiu fechou ou negociação
+                    quote_update: dict[str, Any] = {
+                        "last_quote_at": _now_iso(),
+                        "quote_followup_sent": False,
+                        "last_interaction": _now_iso(),
+                    }
+                    if current_lead_stage not in ["fechou", "fechou_vendido", "negociacao", "em_negociacao"]:
+                        quote_update["stage"] = "cotacao"
+                        lead["stage"] = "cotacao"
+                    try:
+                        sb.table("leads").update(quote_update).eq("id", lead["id"]).execute()
+                        logger.info("[%s] ✈️ [TURISMO] Cotação enviada pelo atendente gravada lead=%s (stage=%s)", instance, lead["id"], quote_update.get("stage", current_lead_stage))
+                    except Exception as e:
+                        logger.error("[%s] Erro ao registrar cotação enviada: %s", instance, e)
+
+        # Dispara IA se mensagem for inbound de paciente + handoff ativo + plantão ativo + recente
+        handoff_state = (lead.get("handoff_state") or "ia_ativa").lower()
+        ai_active = handoff_state in {"ai", "ia_ativa"}
+
+        # Checa se a mensagem é recente (<= 10 min) para evitar responder histórico antigo em sincronização
+        is_recent = True
+        if extracted.get("ts"):
+            try:
+                msg_dt = datetime.fromisoformat(extracted["ts"])
+                if msg_dt.tzinfo is None:
+                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                is_recent = (datetime.now(timezone.utc) - msg_dt).total_seconds() < 600
+            except Exception:
+                is_recent = True
+
+        if plantao_off and extracted["sender"] == "patient" and not extracted["from_me"]:
+            logger.info(
+                "[%s] 🌙 plantão IA OFF — phone=%s lead=%s msg gravada, IA NÃO vai responder",
+                instance,
+                extracted["phone"],
+                lead.get("id"),
+            )
+
+        should_dispatch_ai = (
+            ok
+            and not extracted["from_me"]
+            and extracted["sender"] == "patient"
+            and ai_active
+            and not plantao_off
+            and is_recent
+        )
+        if should_dispatch_ai:
+            ai_dispatched_count += 1
+            background.add_task(
+                _dispatch_ai, tenant_id, lead, extracted["content"], instance
+            )
+
+        # 🕵️ MINERADOR SILENCIOSO EM SEGUNDO PLANO (COPILOTO INVISÍVEL)
+        # Quando plantao_off (ou operador humano assumiu), as mensagens trocadas
+        # manualmente (de entrada ou de saída) são mineradas em background para
+        # alimentar o Kanban e o Dashboard sem que a IA envie mensagens no WhatsApp.
+        if ok and (plantao_off or not ai_active):
+            if not _is_internal_test_contact(lead, phone=extracted.get("phone", ""), sender_name=extracted.get("sender_name", "")):
+                logger.info(
+                    "[%s] 🕵️ [MINERADOR SILENCIOSO] Disparando copiloto invisível para lead=%s (plantao_off=%s, ai_active=%s)",
+                    instance, lead.get("id"), plantao_off, ai_active,
+                )
+                background.add_task(
+                    _mine_silent_conversation,
+                    tenant_id,
+                    lead,
+                    instance,
+                    extracted.get("content", ""),
+                )
+            else:
+                logger.debug(
+                    "[%s] 🕵️ [MINERADOR SILENCIOSO] Ignorando contato interno/teste lead=%s (%s)",
+                    instance, lead.get("id"), lead.get("name"),
+                )
+
+        # Extração assíncrona de sintomas e queixas
+        if ok and not extracted["from_me"] and extracted["sender"] == "patient":
+            background.add_task(
+                _extract_and_persist_clinical_data, lead, extracted["content"], instance
+            )
+
+        # Detecção de Comprovante de Pagamento / PIX com Visão Multimodal
+        if ok and not extracted["from_me"] and extracted["sender"] == "patient":
+            background.add_task(
+                _process_payment_proof_inbound,
+                tenant_id,
+                lead,
+                extracted["content"],
+                extracted.get("is_image", False),
+                instance,
+                extracted.get("b64_image", ""),
+                extracted.get("media_mime", "image/jpeg"),
+            )
+
+        # 🧠 COPILOTO JEV PREDITIVO (DECISOR CLÍNICO CUSTOMER 360)
+        # Atualiza probabilidade, estágio da negociação, objeção ativa e gera a Dica de Ouro
+        # em segundo plano sem travar a resposta nem o fluxo do WhatsApp.
+        if ok and lead.get("id"):
+            background.add_task(evaluate_lead_copilot, lead["id"], tenant_id, None, sb)
+
+    # Fan-out pro Mendes CRM
     background.add_task(_fanout, instance, payload)
 
     return {
-        "ok": ok,
+        "ok": True,
         "event": event,
-        "stored": ok,
+        "stored_messages": stored_count,
         "tenant_id": tenant_id,
-        "lead_id": lead["id"],
-        "message_id": res.data[0]["id"] if res.data else None,
-        "ai_dispatched": should_dispatch_ai,
+        "lead_id": last_lead_id,
+        "message_id": last_msg_id,
+        "ai_dispatched": ai_dispatched_count > 0,
     }
 
 
@@ -1997,6 +4793,25 @@ async def _extract_schedule_params(
     if regex_result:
         patient_name = tenant_cfg.get("patient_name") or "Paciente"
         doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
+        # FASE 3 (msg 5601+5611) — valida slot contra schedule_rules antes de aceitar.
+        # Se fora da grade ou overbooking, NÃO retorna should_schedule=True.
+        sched_rules = tenant_cfg.get("schedule_rules") or {}
+        t_id = tenant_cfg.get("id") or tenant_cfg.get("tenant_id")
+        validation = _validate_slot_against_schedule(
+            regex_result["start_datetime"], sched_rules, tenant_id=t_id
+        )
+        if not validation["ok"]:
+            logger.info(
+                "[CALENDAR] regex slot REJEITADO por schedule_rules: %s",
+                validation.get("schedule_violation") or validation.get("reason"),
+            )
+            return {
+                "should_schedule": False,
+                "ok": True,
+                "source": "regex",
+                "schedule_violation": validation.get("schedule_violation") or validation.get("reason", ""),
+                "schedule_violation_detail": validation,
+            }
         summary = f"Consulta: {patient_name} - {doctor_name}"
         return {
             "should_schedule": True,
@@ -2014,6 +4829,24 @@ async def _extract_schedule_params(
     if agreed_result:
         patient_name = tenant_cfg.get("patient_name") or "Paciente"
         doctor_name = tenant_cfg.get("doctor_name") or "Dr(a)"
+        # FASE 3 — mesma validação anti-alucinação/overbooking que o path regex.
+        sched_rules = tenant_cfg.get("schedule_rules") or {}
+        t_id = tenant_cfg.get("id") or tenant_cfg.get("tenant_id")
+        validation = _validate_slot_against_schedule(
+            agreed_result["start_datetime"], sched_rules, tenant_id=t_id
+        )
+        if not validation["ok"]:
+            logger.info(
+                "[CALENDAR] agreement slot REJEITADO por schedule_rules: %s",
+                validation.get("schedule_violation") or validation.get("reason"),
+            )
+            return {
+                "should_schedule": False,
+                "ok": True,
+                "source": "agreement",
+                "schedule_violation": validation.get("schedule_violation") or validation.get("reason", ""),
+                "schedule_violation_detail": validation,
+            }
         logger.info(
             "[CALENDAR] extrator via ACORDO IMPLÍCITO (paciente concordou "
             "com oferta recente do bot) — start=%s",
@@ -2071,7 +4904,7 @@ async def _extract_schedule_params(
                 data = json.loads(m.group(0))
             except Exception:
                 return {"should_schedule": False, "ok": False, "source": "llm-fail", "raw": content}
-        return {
+        parsed = {
             "should_schedule": bool(data.get("should_schedule", False)),
             "summary": str(data.get("summary") or "").strip(),
             "start_datetime": str(data.get("start_datetime") or "").strip(),
@@ -2083,6 +4916,27 @@ async def _extract_schedule_params(
             "ok": True,
             "source": "llm",
         }
+        # FASE 3 — mesma validação anti-alucinação/overbooking dos paths regex/agreement.
+        # Se a LLM alucinou um slot fora da grade, rebaixamos should_schedule.
+        if parsed["should_schedule"] and parsed["start_datetime"]:
+            sched_rules = tenant_cfg.get("schedule_rules") or {}
+            t_id = tenant_cfg.get("id") or tenant_cfg.get("tenant_id")
+            validation = _validate_slot_against_schedule(
+                parsed["start_datetime"], sched_rules, tenant_id=t_id
+            )
+            if not validation["ok"]:
+                logger.info(
+                    "[CALENDAR] llm slot REJEITADO por schedule_rules: %s",
+                    validation.get("schedule_violation") or validation.get("reason"),
+                )
+                return {
+                    "should_schedule": False,
+                    "ok": True,
+                    "source": "llm",
+                    "schedule_violation": validation.get("schedule_violation") or validation.get("reason", ""),
+                    "schedule_violation_detail": validation,
+                }
+        return parsed
 
     for tgt in (
         target,
@@ -2424,13 +5278,6 @@ async def _maybe_create_calendar_event(
         )
         if not looks:
             return False
-        if not COMPOSIO_MCP_URL or not COMPOSIO_MCP_API_KEY:
-            logger.warning(
-                "[%s] [CALENDAR] MCP não configurado, pulando criação automática",
-                instance,
-            )
-            return False
-
         # Plan B ativado — log pra debug em tempo real (visível via journalctl
         # ou tail do crm-webhook-error.log).
         logger.info(
@@ -2439,8 +5286,7 @@ async def _maybe_create_calendar_event(
             (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID),
         )
 
-        # 1. Extrai parâmetros estruturados via LLM.
-        # Injeta patient_name/doctor_name do lead+tenant (pra summary bonito).
+        # 1. Extrai parâmetros estruturados via LLM / Heurísticas.
         cfg = dict(tenant_cfg or {})
         if lead.get("name"):
             cfg.setdefault("patient_name", lead["name"])
@@ -2453,10 +5299,17 @@ async def _maybe_create_calendar_event(
             json.dumps(extracted, ensure_ascii=False)[:400],
         )
         if not extracted.get("ok") or not extracted.get("should_schedule"):
-            logger.info(
-                "[%s] [CALENDAR] extrator devolveu should_schedule=false — paciente sem horário confirmado",
-                instance,
-            )
+            violation = extracted.get("schedule_violation", "")
+            if violation:
+                logger.info(
+                    "[%s] [CALENDAR] extrator REJEITADO por schedule_rules: %s",
+                    instance, violation,
+                )
+            else:
+                logger.info(
+                    "[%s] [CALENDAR] extrator devolveu should_schedule=false — paciente sem horário confirmado",
+                    instance,
+                )
             return False
 
         start_iso = (extracted.get("start_datetime") or "").strip()
@@ -2465,149 +5318,126 @@ async def _maybe_create_calendar_event(
         description = (extracted.get("description") or "").strip()
         attendee_email = (extracted.get("attendee_email") or "").strip() or None
 
-        # Validação mínima — não envia argumentos quebrados pro Composio.
-        if not (start_iso and end_iso and summary):
+        # Validação mínima de datas
+        if not (start_iso and summary):
             logger.warning(
-                "[%s] [CALENDAR] params incompletos: start=%r end=%r summary=%r",
-                instance, start_iso, end_iso, summary,
+                "[%s] [CALENDAR] params incompletos: start=%r summary=%r",
+                instance, start_iso, summary,
             )
             return False
-        # Reforço do timezone — Natal é -03:00 fixo (não tem DST).
-        if "-03:00" not in start_iso or "-03:00" not in end_iso:
+
+        # Garantir normalização de fuso horário (-03:00) para compatibilidade perfeita
+        if not ("+" in start_iso or ("-" in start_iso[10:]) or "Z" in start_iso):
+            start_iso = f"{start_iso}-03:00"
+        if not end_iso:
+            try:
+                dt_s = datetime.fromisoformat(start_iso)
+                dt_e = dt_s + timedelta(minutes=50)
+                end_iso = dt_e.isoformat(timespec="seconds")
+            except Exception:
+                end_iso = f"{start_iso[:16]}:00-03:00"
+        elif not ("+" in end_iso or ("-" in end_iso[10:]) or "Z" in end_iso):
+            end_iso = f"{end_iso}-03:00"
+
+        # FASE 3 + BEATRIZ — defesa em profundidade: revalida slot contra
+        # schedule_rules do tenant (grade e limite de vagas).
+        sched_rules = tenant_cfg.get("schedule_rules") or {}
+        t_id = tenant_cfg.get("id") or tenant_cfg.get("tenant_id") or lead.get("tenant_id")
+        validation = _validate_slot_against_schedule(start_iso, sched_rules, tenant_id=t_id)
+        if not validation["ok"]:
             logger.warning(
-                "[%s] [CALENDAR] sem offset -03:00 (start=%r end=%r) — abortando",
-                instance, start_iso, end_iso,
+                "[%s] [CALENDAR] BLOQUEIO FASE 3/BEATRIZ — slot rejeitado: %s | start=%s",
+                instance, validation.get("schedule_violation") or validation.get("reason"), start_iso,
             )
             return False
 
-        # 2. Chama Composio MCP direto (search → execute).
-        tenant_user_id = (
-            (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID)
-            .strip()
-        )
+        # 2. PERSISTÊNCIA IMEDIATA NO BANCO LOCAL (tabela public.appointments)
+        target_tenant_id = t_id
+        lead_id = lead.get("id")
+        patient_name = lead.get("name") or "Paciente"
+        specialty = tenant_cfg.get("specialty") or "Consulta Geral"
+        notes_content = description or lead.get("clinical_summary") or patient_text or "Consulta Geral"
+        appointment_title = f"Consulta: {patient_name}"
 
-        # Search: descobre slug exato + schema (idempotente, baixo custo).
-        search_args = {
-            "queries": [{"use_case": "create google calendar event with attendee"}],
+        appt_payload = {
+            "tenant_id": target_tenant_id,
+            "lead_id": lead_id,
+            "title": appointment_title,
+            "start_time": start_iso,
+            "end_time": end_iso,
+            "status": "agendado",
+            "specialty": specialty,
+            "notes": f"Agendado via WhatsApp. Queixa: {notes_content}",
+            "source": "whatsapp",
         }
+
+        appt_id = None
         try:
-            search_resp = await _composio_mcp_call(
-                "COMPOSIO_SEARCH_TOOLS", {
-                    **search_args,
-                    "user_id": tenant_user_id,
-                },
-            )
-            logger.info(
-                "[%s] [CALENDAR] MCP search OK",
-                instance,
-            )
-        except Exception as exc:
-            logger.error(
-                "[%s] [CALENDAR] MCP search falhou: %s — avisando paciente",
-                instance, exc,
-            )
-            failure_msg = (
-                "Seu horário foi reservado com sucesso! Tivemos apenas uma demora técnica "
-                "ao gerar o link do Google Calendar, mas a recepção e o Dr. Matheus já "
-                "estão cientes e vão te enviar a confirmação em instantes por aqui. 👍"
-            )
-            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
-            try:
-                sb.table("messages").insert({
-                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
-                    "lead_id": lead["id"],
-                    "sender": "ai",
-                    "content": failure_msg,
-                    "created_at": _now_iso(),
-                }).execute()
-            except Exception:
-                pass
-            return False
+            appt_res = sb.table("appointments").insert(appt_payload).execute()
+            if appt_res.data:
+                appt_id = appt_res.data[0].get("id")
+                logger.info(
+                    "[%s] [CALENDAR] ✅ Compromisso inserido com sucesso em public.appointments: id=%s",
+                    instance, appt_id,
+                )
+        except Exception as appt_exc:
+            logger.error("[%s] [CALENDAR] ❌ Erro ao inserir na tabela appointments: %s", instance, appt_exc)
 
-        # 3. Executa GOOGLECALENDAR_CREATE_EVENT.
-        #    Schema Composio: tools é array de {tool_slug, arguments}.
-        exec_arguments: dict[str, Any] = {
-            "summary": summary,
-            "start_datetime": start_iso,
-            "end_datetime": end_iso,
-            "description": description,
-            "timezone": "America/Fortaleza",  # Natal-RN
-            "calendar_id": "primary",
-        }
-        if attendee_email:
-            exec_arguments["attendees"] = [attendee_email]
-        exec_args = {
-            "tools": [
-                {
-                    "tool_slug": "GOOGLECALENDAR_CREATE_EVENT",
-                    "arguments": exec_arguments,
-                }
-            ],
-            "user_id": tenant_user_id,
-        }
-
-        try:
-            exec_resp = await _composio_mcp_call(
-                "COMPOSIO_MULTI_EXECUTE_TOOL", exec_args,
-            )
-        except Exception as exc:
-            logger.error(
-                "[%s] [CALENDAR] MCP execute falhou: %s — avisando paciente",
-                instance, exc,
-            )
-            failure_msg = (
-                "Seu horário foi reservado com sucesso! Tivemos uma oscilação na integração "
-                "com a agenda para gerar o link direto, mas já registrei seu agendamento "
-                "e nossa equipe entrará em contato em instantes para confirmar. 🙂"
-            )
-            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
-            try:
-                sb.table("messages").insert({
-                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
-                    "lead_id": lead["id"],
-                    "sender": "ai",
-                    "content": failure_msg,
-                    "created_at": _now_iso(),
-                }).execute()
-            except Exception:
-                pass
-            return False
-
-        # 4. Extrai htmlLink/event_id da resposta do MCP.
-        html_link, event_id = _extract_event_link_from_mcp(exec_resp)
-        if not html_link and not event_id:
-            logger.error(
-                "[%s] [CALENDAR] MCP executou mas sem htmlLink/event_id na resposta: %s",
-                instance, str(exec_resp)[:500],
-            )
-            # Envia mensagem honesta ao paciente: failure de criação.
-            failure_msg = (
-                "Seu horário foi anotado com sucesso! Tivemos apenas uma demora para "
-                "gerar o convite do Google Calendar. Nossa equipe confirma com você "
-                "em instantes por aqui. Posso ajudar em algo mais?"
-            )
-            await _send_evolution_text(instance, lead.get("phone", ""), failure_msg)
-            try:
-                sb.table("messages").insert({
-                    "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
-                    "lead_id": lead["id"],
-                    "sender": "ai",
-                    "content": failure_msg,
-                    "created_at": _now_iso(),
-                }).execute()
-            except Exception:
-                pass
-            return False
-
-        # 5. Sucesso! Envia follow-up WhatsApp com link público do Google Calendar (action=TEMPLATE com ctz=America/Fortaleza).
+        # 3. GERA LINK PÚBLICO UNIVERSAL DO GOOGLE CALENDAR
         public_calendar_link = _build_google_calendar_template_link(
-            summary=summary,
+            summary=summary or appointment_title,
             start_iso=start_iso,
             end_iso=end_iso,
-            description=description,
+            description=description or f"Consulta com {patient_name}. Queixa/Observações: {notes_content}",
             timezone_str="America/Fortaleza",
         )
 
+        # 4. TENTATIVA RESILIENTE / BEST-EFFORT VIA COMPOSIO MCP (opcional)
+        event_id = None
+        html_link = None
+        if COMPOSIO_MCP_URL and COMPOSIO_MCP_API_KEY:
+            try:
+                tenant_user_id = (
+                    (tenant_cfg.get("composio_user_id") or COMPOSIO_DEFAULT_TENANT_USER_ID)
+                    .strip()
+                )
+                search_args = {
+                    "queries": [{"use_case": "create google calendar event with attendee"}],
+                }
+                await _composio_mcp_call(
+                    "COMPOSIO_SEARCH_TOOLS", {
+                        **search_args,
+                        "user_id": tenant_user_id,
+                    },
+                )
+                exec_arguments: dict[str, Any] = {
+                    "summary": summary or appointment_title,
+                    "start_datetime": start_iso,
+                    "end_datetime": end_iso,
+                    "description": description or f"Consulta com {patient_name}",
+                    "timezone": "America/Fortaleza",
+                    "calendar_id": "primary",
+                }
+                if attendee_email:
+                    exec_arguments["attendees"] = [attendee_email]
+                exec_args = {
+                    "tools": [
+                        {
+                            "tool_slug": "GOOGLECALENDAR_CREATE_EVENT",
+                            "arguments": exec_arguments,
+                        }
+                    ],
+                    "user_id": tenant_user_id,
+                }
+                exec_resp = await _composio_mcp_call("COMPOSIO_MULTI_EXECUTE_TOOL", exec_args)
+                html_link, event_id = _extract_event_link_from_mcp(exec_resp)
+                if event_id and appt_id:
+                    sb.table("appointments").update({"google_event_id": event_id}).eq("id", appt_id).execute()
+                    logger.info("[%s] [CALENDAR] google_event_id %s vinculado ao appointment %s", instance, event_id, appt_id)
+            except Exception as mcp_exc:
+                logger.warning("[%s] [CALENDAR] Composio MCP falhou (não-bloqueante): %s", instance, mcp_exc)
+
+        # 5. ENVIA MENSAGEM NO WHATSAPP COM O LINK DE CONVENIÊNCIA DO GOOGLE CALENDAR
         try:
             dt_display = datetime.fromisoformat(start_iso)
             display_time = dt_display.strftime("%d/%m/%Y às %H:%M")
@@ -2616,21 +5446,18 @@ async def _maybe_create_calendar_event(
 
         followup = (
             f"✅ Consulta agendada!\n\n"
-            f"📅 {summary}\n"
+            f"📅 {appointment_title}\n"
             f"🕐 {display_time} (Horário de Brasília)\n\n"
             f"🗓️ Adicione à sua agenda no Google Calendar:\n{public_calendar_link}\n\n"
-            f"Qualquer coisa é só chamar aqui."
+            f"Qualquer dúvida, estamos à disposição por aqui."
         )
         send_ok = await _send_evolution_text(instance, lead.get("phone", ""), followup)
         logger.info(
-            "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s mcp_link=%s public_link=%s",
-            instance, send_ok.get("ok"), event_id, html_link, public_calendar_link[:80],
+            "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s public_link=%s",
+            instance, send_ok.get("ok"), event_id, public_calendar_link[:80],
         )
 
-        # 6. Sincronização Obrigatória de Stage:
-        #    Assim que o GOOGLECALENDAR_CREATE_EVENT retornar sucesso (htmlLink real),
-        #    force IMEDIATAMENTE a atualização do lead no Supabase para 'consulta_agendada'
-        #    e atualize appointment_schedule. O Kanban do Deskcomm move o card na hora.
+        # 6. SINCRONIZAÇÃO DE STAGE NO LEAD
         synced = await _update_lead_stage(
             lead["id"],
             "consulta_agendada",
@@ -2639,16 +5466,23 @@ async def _maybe_create_calendar_event(
         if synced:
             lead["stage"] = "consulta_agendada"
             lead["appointment_schedule"] = start_iso
-            logger.info(
-                "[%s] [CALENDAR] lead %s sincronizado com sucesso: stage=consulta_agendada, schedule=%s",
-                instance, lead["id"], start_iso,
-            )
 
-        # 7. Grava follow-up também em messages pra histórico ficar completo
-        #    — esse é o record canônico do evento criado (com htmlLink real).
+        # 7. CAPTURA AUTOMÁTICA PARA O DASHBOARD FINANCEIRO (financial_entries)
+        try:
+            await _record_appointment_financial_entry(
+                tenant_id=target_tenant_id,
+                lead=lead,
+                patient_text=patient_text,
+                tenant_cfg=tenant_cfg,
+                service_name=specialty or "Consulta Inicial",
+            )
+        except Exception as fin_exc:
+            logger.warning("[%s] [CALENDAR] Falha ao registrar entrada financeira: %s", instance, fin_exc)
+
+        # 8. GRAVA O FOLLOW-UP EM MESSAGES (HISTÓRICO DO CHAT)
         try:
             sb.table("messages").insert({
-                "tenant_id": tenant_cfg.get("id") or lead.get("tenant_id"),
+                "tenant_id": target_tenant_id,
                 "lead_id": lead["id"],
                 "sender": "ai",
                 "content": followup,
@@ -2658,8 +5492,8 @@ async def _maybe_create_calendar_event(
             pass
 
         logger.info(
-            "[%s] [CALENDAR] ✅ evento criado event_id=%s mcp_link=%s public_link=%s",
-            instance, event_id, html_link, public_calendar_link[:80],
+            "[%s] [CALENDAR] ✅ Compromisso concluído: appt_id=%s public_link=%s",
+            instance, appt_id, public_calendar_link[:80],
         )
         return True
     except Exception as exc:
@@ -2866,7 +5700,14 @@ async def set_tenant_ai_auto_reply(
 
 
 async def _fanout(instance: str, payload: dict[str, Any]) -> None:
-    """Re-envia o payload pro Mendes CRM pra preservar compatibilidade."""
+    """Re-envia o payload pra integrações downstream que dependem do webhook.
+
+    - Mendes CRM (sempre): compatibilidade legada.
+    - Prospector 3012 (só pra instância `formiga`): repassa eventos Evolution
+      pra manter Prospector rodando em paralelo ao CRM-Hermes. Em outras
+      instâncias fica desligado pra não duplicar tráfego / disparar 2x.
+    """
+    # Fan-out Mendes CRM
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.post(
@@ -2876,6 +5717,24 @@ async def _fanout(instance: str, payload: dict[str, Any]) -> None:
             logger.info("fan-out Mendes HTTP %s", r.status_code)
     except Exception as exc:
         logger.warning("fan-out Mendes falhou: %s", exc)
+
+    # Fan-out Prospector (apenas pra instâncias autorizadas, hoje `formiga`)
+    if instance in PROSPECTOR_FANOUT_INSTANCES:
+        try:
+            # Header X-CRM-Hermes-Fanout: 1 sinaliza pro Prospector que o
+            # evento NÃO veio direto da Evolution — veio repassado pelo
+            # CRM-Hermes — então ele NÃO deve responder (responsabilidade
+            # única do CRM-Hermes). Sem esse header, ia gerar resposta
+            # duplicada ("Prazer, X!" + logo depois outra).
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.post(
+                    PROSPECTOR_WEBHOOK_URL,
+                    json=payload,
+                    headers={"X-CRM-Hermes-Fanout": "1"},
+                )
+                logger.info("fan-out Prospector HTTP %s", r.status_code)
+        except Exception as exc:
+            logger.warning("fan-out Prospector falhou: %s", exc)
 
 
 # ============================================================================
@@ -3020,7 +5879,7 @@ async def pair_whatsapp_instance(
                     f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/connect/{instance}",
                     headers=headers,
                 )
-                if conn_resp.status_code == 200:
+                if conn_resp.status_code in (200, 201):
                     conn_data = conn_resp.json()
                     qr_obj = conn_data.get("qrcode") or conn_data
                     qr_base64 = qr_obj.get("base64")
@@ -3045,7 +5904,7 @@ async def pair_whatsapp_instance(
                     f"{EVOLUTION_BASE_URL.rstrip('/')}/instance/connect/{instance}",
                     headers=headers,
                 )
-                if conn_resp.status_code == 200:
+                if conn_resp.status_code in (200, 201):
                     conn_data = conn_resp.json()
                     qr_obj = conn_data.get("qrcode") or conn_data
                     qr_base64 = qr_obj.get("base64")
@@ -3068,6 +5927,9 @@ async def pair_whatsapp_instance(
                 "byEvents": True,
                 "events": [
                     "MESSAGES_UPSERT",
+                    "MESSAGES_UPDATE",
+                    "CHATS_UPSERT",
+                    "CONTACTS_UPSERT",
                     "CONNECTION_UPDATE",
                 ],
             }
@@ -3179,4 +6041,464 @@ async def logout_whatsapp_instance(instance: str) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("[%s] Erro ao executar logout: %s", instance, exc)
         return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/tenants/provision")
+async def api_provision_tenant(request: Request) -> dict[str, Any]:
+    """Endpoint de Onboarding Autônomo - CRM Automação JS (Motor 3)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON inválido")
+
+    company_name = body.get("company_name")
+    professional_name = body.get("professional_name")
+    segment = body.get("segment_or_specialty") or body.get("segment")
+    pricing_rules = body.get("pricing_rules")
+    attendant_name = body.get("attendant_name", "Recepção")
+    instructions = body.get("instructions", "Atendimento com agendamento prévio.")
+    admin_phone = body.get("admin_phone")
+    dry_run = bool(body.get("dry_run", False))
+
+    if not company_name or not professional_name or not segment or not pricing_rules or not admin_phone:
+        raise HTTPException(
+            status_code=400,
+            detail="Campos obrigatórios: company_name, professional_name, segment_or_specialty, pricing_rules, admin_phone",
+        )
+
+    try:
+        from provision_tenant import provision_tenant as do_provision
+        res = await do_provision(
+            company_name=company_name,
+            professional_name=professional_name,
+            segment_or_specialty=segment,
+            pricing_rules=pricing_rules,
+            attendant_name=attendant_name,
+            instructions=instructions,
+            admin_phone=admin_phone,
+            dry_run=dry_run,
+        )
+        return res
+    except Exception as exc:
+        logger.error("[provision_tenant] Erro no provisionamento: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/leads/{lead_id}/copilot-reevaluate")
+@app.post("/api/leads/{lead_id}/copilot-reevaluate")
+async def api_copilot_reevaluate(lead_id: str, request: Request) -> dict[str, Any]:
+    """Força reavaliação imediata do Copiloto JEV sob demanda para um lead específico."""
+    tenant_id = request.query_params.get("tenant_id") or "1111"
+    try:
+        res = await evaluate_lead_copilot(lead_id, tenant_id=tenant_id)
+        return {"ok": True, "lead_id": lead_id, "copilot": res}
+    except Exception as exc:
+        logger.error("[JEV_COPILOT] Erro ao reavaliar lead %s: %s", lead_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ============================================================================
+# Endpoints de Campanhas e Sincronização de Contatos WhatsApp
+# ============================================================================
+
+@app.post("/api/campaigns/sync-whatsapp-contacts")
+@app.get("/api/campaigns/sync-whatsapp-contacts")
+async def api_sync_whatsapp_contacts(request: Request) -> dict[str, Any]:
+    """Sincroniza e deduplica toda a base de conversas e contatos da Evolution API v2 para o CRM (Tenant)."""
+    tenant_id = None
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            tenant_id = body.get("tenant_id")
+        except Exception:
+            pass
+    if not tenant_id:
+        tenant_id = request.query_params.get("tenant_id") or "11111111-1111-1111-1111-111111111111"
+
+    if tenant_id in ("1111", 1111):
+        tenant_id = "11111111-1111-1111-1111-111111111111"
+
+    try:
+        tenant_cfg = _get_tenant_config(tenant_id)
+        instance = tenant_cfg.get("evolution_instance") or "cardio_matheus_prod_01"
+
+        logger.info("[CAMPAIGN_SYNC] Sincronizando contatos WhatsApp da instância '%s' para tenant %s", instance, tenant_id)
+
+        headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+        chats: list[dict[str, Any]] = []
+        contacts: list[dict[str, Any]] = []
+
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            # 1. Carregar contatos da agenda Evolution
+            try:
+                r_cont = await client.post(f"{EVOLUTION_BASE_URL.rstrip('/')}/chat/findContacts/{instance}", headers=headers, json={})
+                if r_cont.status_code == 200 and isinstance(r_cont.json(), list):
+                    contacts = r_cont.json()
+            except Exception as e_cont:
+                logger.warning("[CAMPAIGN_SYNC] Erro ao buscar findContacts: %s", e_cont)
+
+            # 2. Carregar conversas/chats da Evolution
+            try:
+                r_chats = await client.post(f"{EVOLUTION_BASE_URL.rstrip('/')}/chat/findChats/{instance}", headers=headers, json={})
+                if r_chats.status_code == 200 and isinstance(r_chats.json(), list):
+                    chats = r_chats.json()
+            except Exception as e_chat:
+                logger.warning("[CAMPAIGN_SYNC] Erro ao buscar findChats: %s", e_chat)
+
+        # Mapa de candidatos deduplicados: phone -> candidate_name
+        unique_candidates: dict[str, str] = {}
+
+        # Mapeia contatos
+        for c in contacts:
+            jid = str(c.get("remoteJid") or "")
+            if "@g.us" in jid or "@newsletter" in jid:
+                continue
+            digits = re.sub(r"\D", "", jid.split("@")[0])
+            if len(digits) >= 10:
+                if not digits.startswith("55") and len(digits) in (10, 11):
+                    digits = f"55{digits}"
+                raw_name = str(c.get("pushName") or c.get("name") or "").strip()
+                name_clean = "" if is_invalid_patient_name(raw_name) else raw_name
+                if digits not in unique_candidates or (not unique_candidates[digits] and name_clean):
+                    unique_candidates[digits] = name_clean
+
+        # Mapeia chats
+        for ch in chats:
+            jid = str(ch.get("remoteJid") or "")
+            if "@g.us" in jid or "@newsletter" in jid:
+                continue
+            digits = ""
+            if "@s.whatsapp.net" in jid or "@c.us" in jid:
+                digits = re.sub(r"\D", "", jid.split("@")[0])
+            elif "@lid" in jid:
+                last_msg = ch.get("lastMessage") or {}
+                key = last_msg.get("key") or {}
+                alt = key.get("remoteJidAlt") or ""
+                if "@s.whatsapp.net" in alt:
+                    digits = re.sub(r"\D", "", alt.split("@")[0])
+
+            if len(digits) >= 10:
+                if not digits.startswith("55") and len(digits) in (10, 11):
+                    digits = f"55{digits}"
+                raw_name = str(ch.get("pushName") or "").strip()
+                name_clean = "" if is_invalid_patient_name(raw_name) else raw_name
+                if digits not in unique_candidates or (not unique_candidates[digits] and name_clean):
+                    unique_candidates[digits] = name_clean
+
+        # Filtrar telefones ignorados (Dr. Matheus, secretária, testes, bot)
+        valid_candidates = {
+            p: n for p, n in unique_candidates.items()
+            if not is_contact_ignored(tenant_id, phone=p, name=n)
+        }
+
+        # Carregar todos os leads existentes do tenant no Supabase com paginação
+        existing_leads_by_phone: dict[str, dict[str, Any]] = {}
+        offset = 0
+        page_size = 500
+        while True:
+            res_leads = sb.table("leads").select("id, phone, name").eq("tenant_id", tenant_id).range(offset, offset + page_size - 1).execute()
+            chunk = res_leads.data or []
+            for l in chunk:
+                p_lead = re.sub(r"\D", "", str(l.get("phone") or ""))
+                if p_lead:
+                    existing_leads_by_phone[p_lead] = l
+            if len(chunk) < page_size:
+                break
+            offset += page_size
+
+        new_leads_to_insert: list[dict[str, Any]] = []
+        updates_count = 0
+        now_iso = _now_iso()
+
+        for phone_digits, c_name in valid_candidates.items():
+            final_name = c_name or f"Contato {phone_digits[-4:]}"
+            if phone_digits in existing_leads_by_phone:
+                # Se já existe, atualiza nome se o atual for genérico e o novo for válido
+                curr_lead = existing_leads_by_phone[phone_digits]
+                curr_name = (curr_lead.get("name") or "").strip()
+                if (not curr_name or curr_name.startswith("Contato ")) and c_name and not is_invalid_patient_name(c_name):
+                    try:
+                        sb.table("leads").update({"name": c_name}).eq("id", curr_lead["id"]).execute()
+                        updates_count += 1
+                    except Exception:
+                        pass
+            else:
+                new_leads_to_insert.append({
+                    "tenant_id": tenant_id,
+                    "phone": phone_digits,
+                    "name": final_name,
+                    "stage": "novo_contato",
+                    "priority": "normal",
+                    "created_at": now_iso,
+                    "last_interaction": now_iso,
+                })
+
+        # Inserção em lotes de 100 com upsert seguro
+        inserted_count = 0
+        chunk_size = 100
+        for i in range(0, len(new_leads_to_insert), chunk_size):
+            chunk = new_leads_to_insert[i : i + chunk_size]
+            try:
+                sb.table("leads").upsert(chunk, on_conflict="tenant_id,phone").execute()
+                inserted_count += len(chunk)
+            except Exception as batch_err:
+                logger.warning("[CAMPAIGN_SYNC] Falha ao inserir lote: %s", batch_err)
+
+        total_synced = len(existing_leads_by_phone) + inserted_count
+        logger.info(
+            "[CAMPAIGN_SYNC] Sincronização concluída: %d contatos únicos, %d novos inseridos, %d nomes atualizados",
+            total_synced, inserted_count, updates_count,
+        )
+
+        return {
+            "success": True,
+            "total_synced": total_synced,
+            "new_added": inserted_count,
+            "updated_names": updates_count,
+            "already_existed": len(existing_leads_by_phone),
+        }
+    except Exception as exc:
+        logger.error("[CAMPAIGN_SYNC] Erro durante a sincronização: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/campaigns/audience")
+@app.post("/api/campaigns/audience")
+async def api_campaigns_audience(request: Request) -> dict[str, Any]:
+    """Retorna audiência de campanha para o tenant com suporte ao filtro 'all' (Toda a Base / Geral)."""
+    tenant_id = None
+    filter_type = "all"
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            tenant_id = body.get("tenant_id")
+            filter_type = body.get("filter_type") or "all"
+        except Exception:
+            pass
+    if not tenant_id:
+        tenant_id = request.query_params.get("tenant_id") or "11111111-1111-1111-1111-111111111111"
+        filter_type = request.query_params.get("filter_type") or filter_type
+
+    if tenant_id in ("1111", 1111):
+        tenant_id = "11111111-1111-1111-1111-111111111111"
+
+    try:
+        leads: list[dict[str, Any]] = []
+        offset = 0
+        page_size = 500
+        while True:
+            res = (
+                sb.table("leads")
+                .select("id, name, phone, stage, last_interaction, created_at, last_campaign_at")
+                .eq("tenant_id", tenant_id)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            chunk = res.data or []
+            leads.extend(chunk)
+            if len(chunk) < page_size:
+                break
+            offset += page_size
+
+        now = datetime.now(timezone.utc)
+        audience: list[dict[str, Any]] = []
+
+        for row in leads:
+            if row.get("stage") in ("desistiu", "cancelou", "opt_out"):
+                continue
+
+            p_raw = str(row.get("phone") or "")
+            clean = re.sub(r"\D", "", p_raw)
+            if not clean or len(clean) < 10:
+                continue
+            if not clean.startswith("55") and len(clean) in (10, 11):
+                clean = f"55{clean}"
+
+            # Ignora contatos cadastrados como teste / equipe
+            if is_contact_ignored(tenant_id, phone=clean, name=row.get("name")):
+                continue
+
+            # Cálculo de inatividade
+            last_date_str = row.get("last_interaction") or row.get("created_at")
+            diff_days = 999
+            if last_date_str:
+                try:
+                    ld = datetime.fromisoformat(str(last_date_str).replace("Z", "+00:00"))
+                    diff_days = max(0, (now - ld).days)
+                except Exception:
+                    pass
+
+            matches = False
+            if filter_type in ("all", "all_base", "geral"):
+                matches = True
+            elif filter_type == "15d" and diff_days >= 15:
+                matches = True
+            elif filter_type == "30d" and diff_days >= 30:
+                matches = True
+            elif filter_type == "60_90d" and 60 <= diff_days <= 90:
+                matches = True
+            elif filter_type == "all_inactives" and diff_days >= 7:
+                matches = True
+
+            if matches:
+                audience.append({
+                    "id": row.get("id"),
+                    "name": row.get("name") or f"Contato {clean[-4:]}",
+                    "phone": p_raw,
+                    "clean_phone": clean,
+                    "days_inactive": diff_days,
+                    "last_interaction": row.get("last_interaction"),
+                    "last_campaign_at": row.get("last_campaign_at"),
+                })
+
+        return {
+            "success": True,
+            "tenant_id": tenant_id,
+            "filter_type": filter_type,
+            "total": len(audience),
+            "contacts": audience,
+        }
+    except Exception as exc:
+        logger.error("[CAMPAIGN_AUDIENCE] Erro ao buscar audiência: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================================================================
+# ENDPOINT: IMPORTAÇÃO EM LOTE DE CONTATOS / EXCEL / CSV
+# ==============================================================================
+@app.post("/api/leads/import-batch")
+async def import_leads_batch(
+    tenant_id: str = Form("44444444-4444-4444-4444-444444444444"),
+    stage: str = Form("novo_lead"),
+    file: Optional[UploadFile] = File(None),
+    payload: Optional[dict[str, Any]] = Body(None),
+):
+    """
+    Auditoria e ingestão em lote de contatos (Excel .xlsx, .csv, .txt ou JSON).
+    Sanitiza DDI 55 + DDD + número e associa diretamente ao tenant_id na etapa 1. Novo Lead.
+    Deduplica automaticamente contra contatos já existentes.
+    """
+    try:
+        contacts_to_process: list[dict[str, str]] = []
+
+        if file:
+            filename = (file.filename or "").lower()
+            contents = await file.read()
+
+            if filename.endswith(".xlsx") or filename.endswith(".xls"):
+                import io
+                import openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+                sheet = wb.active
+                rows = list(sheet.iter_rows(values_only=True))
+                if rows:
+                    header = [str(c or "").lower().strip() for c in rows[0]]
+                    name_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["nome", "name", "cliente", "contato", "viajante"])), 0)
+                    phone_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["telefone", "phone", "celular", "whatsapp", "tel", "numero"])), 1)
+                    dest_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["destino", "destination", "viagem", "cidade"])), None)
+
+                    for r in rows[1:]:
+                        if not r:
+                            continue
+                        name_val = str(r[name_idx] or "").strip() if name_idx < len(r) else ""
+                        phone_val = str(r[phone_idx] or "").strip() if phone_idx < len(r) else ""
+                        dest_val = str(r[dest_idx] or "").strip() if dest_idx is not None and dest_idx < len(r) else ""
+                        if name_val or phone_val:
+                            contacts_to_process.append({"name": name_val, "phone": phone_val, "destination": dest_val})
+            else:
+                # CSV / TXT
+                text = contents.decode("utf-8", errors="ignore")
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                if lines:
+                    sep = ";" if ";" in lines[0] else ","
+                    header = [h.lower().strip().replace('"', "") for h in lines[0].split(sep)]
+                    name_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["nome", "name", "cliente", "contato", "viajante"])), 0)
+                    phone_idx = next((i for i, h in enumerate(header) if any(k in h for k in ["telefone", "phone", "celular", "whatsapp", "tel", "numero"])), 1)
+
+                    for line in lines[1:]:
+                        parts = [p.strip().replace('"', "") for p in line.split(sep)]
+                        if len(parts) >= 2:
+                            name_val = parts[name_idx] if name_idx < len(parts) else ""
+                            phone_val = parts[phone_idx] if phone_idx < len(parts) else ""
+                            contacts_to_process.append({"name": name_val, "phone": phone_val, "destination": ""})
+
+        elif payload and isinstance(payload.get("contacts"), list):
+            contacts_to_process = payload["contacts"]
+
+        if not contacts_to_process:
+            return {"ok": False, "error": "Nenhum contato encontrado no arquivo ou payload enviado."}
+
+        # Busca existentes para deduplicação
+        existing_res = sb.table("leads").select("phone").eq("tenant_id", tenant_id).execute()
+        existing_phones = {str(r.get("phone") or "") for r in (existing_res.data or [])}
+
+        inserted_count = 0
+        skipped_count = 0
+        rows_to_insert = []
+        now_iso = _now_iso()
+
+        for c in contacts_to_process:
+            raw_phone = str(c.get("phone") or "")
+            clean = re.sub(r"\D", "", raw_phone)
+            if clean.startswith("0"):
+                clean = clean[1:]
+            if len(clean) in (10, 11) and not clean.startswith("55"):
+                clean = f"55{clean}"
+
+            if not (clean.startswith("55") and len(clean) in (12, 13)):
+                skipped_count += 1
+                continue
+
+            if clean in existing_phones:
+                skipped_count += 1
+                continue
+
+            existing_phones.add(clean)
+            inserted_count += 1
+
+            name_val = c.get("name") or f"Contato {clean[-4:]}"
+            dest_val = c.get("destination") or ""
+            summary = f"Interesse de Viagem: {dest_val}" if dest_val else "Lead importado via Lista / Planilha"
+
+            rows_to_insert.append({
+                "tenant_id": tenant_id,
+                "phone": clean,
+                "name": name_val,
+                "stage": stage or "novo_lead",
+                "ai_active": False,
+                "handoff_state": "ia_ativa",
+                "priority": "normal",
+                "clinical_summary": summary,
+                "created_at": now_iso,
+                "last_interaction": now_iso,
+                "followup_count": 0,
+                "followup_status": "pending",
+                "opt_out_reactivation": False,
+            })
+
+        if rows_to_insert:
+            # Insere em lotes
+            batch_size = 100
+            for i in range(0, len(rows_to_insert), batch_size):
+                sb.table("leads").insert(rows_to_insert[i:i + batch_size]).execute()
+
+        logger.info(
+            "[IMPORT_LEADS] Tenant %s: %d contatos lidos, %d inseridos na etapa '%s', %d ignorados/duplicados",
+            tenant_id, len(contacts_to_process), inserted_count, stage, skipped_count
+        )
+
+        return {
+            "ok": True,
+            "tenant_id": tenant_id,
+            "stage": stage,
+            "total_read": len(contacts_to_process),
+            "inserted": inserted_count,
+            "skipped": skipped_count,
+        }
+    except Exception as exc:
+        logger.error("[IMPORT_LEADS] Erro ao importar contatos em lote: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
 

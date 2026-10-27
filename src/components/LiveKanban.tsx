@@ -47,54 +47,91 @@ const STAGES: {
   borderClass: string;
   bgClass: string;
 }[] = [
+  // Esteira oficial (8 colunas — msg 5608)
   {
-    id: 'novo_contato',
-    title: 'Novo Contato',
+    id: 'iniciou_conversa',
+    title: '1. Novo Contato',
     headerClass: 'text-sky-300',
     borderClass: 'border-sky-500/30',
     bgClass: 'bg-sky-950/10',
   },
   {
     id: 'em_atendimento',
-    title: 'Em Atendimento',
+    title: '2. Em Atendimento',
     headerClass: 'text-violet-300',
     borderClass: 'border-violet-500/30',
     bgClass: 'bg-violet-950/10',
   },
   {
-    id: 'consulta_agendada',
-    title: 'Consulta Agendada',
-    headerClass: 'text-emerald-300',
-    borderClass: 'border-emerald-500/30',
-    bgClass: 'bg-emerald-950/10',
-  },
-  {
     id: 'falar_pessoalmente',
-    title: 'Falar Pessoalmente',
+    title: '3. Falar Pessoalmente',
     headerClass: 'text-amber-300',
     borderClass: 'border-amber-500/30',
     bgClass: 'bg-amber-950/10',
   },
   {
-    id: 'sem_resposta',
-    title: 'Sem Resposta',
-    headerClass: 'text-orange-300',
-    borderClass: 'border-orange-500/30',
-    bgClass: 'bg-orange-950/10',
+    id: 'consulta_agendada',
+    title: '4. Agendou',
+    headerClass: 'text-emerald-300',
+    borderClass: 'border-emerald-500/30',
+    bgClass: 'bg-emerald-950/10',
   },
   {
-    id: 'desistiu',
-    title: 'Desistiu',
-    headerClass: 'text-rose-300',
-    borderClass: 'border-rose-500/30',
-    bgClass: 'bg-rose-950/10',
+    id: 'consulta_realizada',
+    title: '5. Compareceu',
+    headerClass: 'text-indigo-300',
+    borderClass: 'border-indigo-500/30',
+    bgClass: 'bg-indigo-950/10',
   },
   {
-    id: 'atendido_concluido',
-    title: 'Atendidos / Concluídos',
+    id: 'contratou',
+    title: '6. Fechou / Contratou',
     headerClass: 'text-emerald-200',
     borderClass: 'border-emerald-400/40',
     bgClass: 'bg-emerald-900/20',
+  },
+  {
+    id: 'paciente_recorrente',
+    title: '7. Cliente Recorrente',
+    headerClass: 'text-cyan-300',
+    borderClass: 'border-cyan-500/30',
+    bgClass: 'bg-cyan-950/10',
+  },
+  {
+    id: 'cancelou',
+    title: '8. Cancelou / Desistiu',
+    headerClass: 'text-slate-400',
+    borderClass: 'border-slate-700/60',
+    bgClass: 'bg-slate-900/40',
+  },
+  // Legacy/Dr. Matheus (mantidos pra não esconder leads legados)
+  {
+    id: 'novo_contato',
+    title: '0. Novo Contato (legado)',
+    headerClass: 'text-sky-300/60',
+    borderClass: 'border-sky-500/20',
+    bgClass: 'bg-sky-950/5',
+  },
+  {
+    id: 'sem_resposta',
+    title: 'Sem Resposta (legado)',
+    headerClass: 'text-orange-300/60',
+    borderClass: 'border-orange-500/20',
+    bgClass: 'bg-orange-950/5',
+  },
+  {
+    id: 'desistiu',
+    title: 'Desistiu (legado)',
+    headerClass: 'text-rose-300/60',
+    borderClass: 'border-rose-500/20',
+    bgClass: 'bg-rose-950/5',
+  },
+  {
+    id: 'atendido_concluido',
+    title: 'Atendidos (legado)',
+    headerClass: 'text-emerald-200/60',
+    borderClass: 'border-emerald-400/20',
+    bgClass: 'bg-emerald-900/10',
   },
 ];
 
@@ -430,7 +467,11 @@ export const LiveKanban: React.FC<LiveKanbanProps> = () => {
         <div className="flex-1 overflow-x-auto p-4">
           <div className="flex gap-3 min-w-max h-full">
             {STAGES.map((stage) => {
-              const stageLeads = leads.filter((l) => l.stage === stage.id);
+              const stageLeads = leads.filter((l) =>
+                stage.id === 'cancelou'
+                  ? l.stage === 'cancelou' || l.stage === 'desistiu'
+                  : l.stage === stage.id
+              );
               return (
                 <div
                   key={stage.id}

@@ -14,6 +14,11 @@ import { LiveKanban } from './components/LiveKanban';
 import { AuthGuard } from './components/AuthGuard';
 import { IntegrationsPage } from './components/IntegrationsPage';
 import { IntegrationsCallback } from './components/IntegrationsCallback';
+import { AgendaView } from './components/AgendaView';
+import { DashboardView } from './components/DashboardView';
+import { CampanhasReativacaoView } from './components/CampanhasReativacaoView';
+import { ProspectorView } from './components/ProspectorView';
+import { ProvisionView } from './components/ProvisionView';
 import type { LiveView } from './components/Sidebar';
 import { deskcommService, purgeLegacyMocks } from './services/deskcommService';
 import * as liveStore from './services/liveStore';
@@ -56,6 +61,25 @@ export default function App() {
   ) {
     return <IntegrationsCallback />;
   }
+  // Rota publica de auto-cadastro — mesmo padrao do callback acima: antes do
+  // AuthGuard, sem exigir login. A SPA e servida via `serve -s dist`, entao
+  // /onboarding e /cadastro caem no index.html e este branch assume a tela.
+  if (
+    typeof window !== 'undefined' &&
+    (window.location.pathname === '/onboarding' || window.location.pathname === '/cadastro')
+  ) {
+    return (
+      <ProvisionView
+        publicMode
+        onProvisioned={() => {
+          window.location.href = '/';
+        }}
+        onBack={() => {
+          window.location.href = '/';
+        }}
+      />
+    );
+  }
   return (
     <AuthGuard>
       <AppInner />
@@ -82,12 +106,23 @@ function AppInner() {
   }, [authRole]);
 
   // Global State
-  const [tenants, setTenants] = useState<Tenant[]>(() => deskcommService.getTenants());
+  // Preferencia local do operador (Bot ON/OFF) por tenant: sobrevive ao F5
+  // antes mesmo do Supabase responder; o banco segue como fonte oficial.
+  const applyAiPref = (list: Tenant[]): Tenant[] =>
+    list.map((t) => {
+      try {
+        const v = localStorage.getItem(`crm-hermes:ai-auto-reply:${t.id}`);
+        return v === null ? t : { ...t, aiAutoReplyEnabled: v === '1' };
+      } catch {
+        return t;
+      }
+    });
+  const [tenants, setTenants] = useState<Tenant[]>(() => applyAiPref(deskcommService.getTenants()));
   const [activeTenantId, setActiveTenantId] = useState<string>(() => {
-    // Clínica: força tenant do JWT. Super admin: primeiro da lista.
+    // Força tenant do JWT. Super admin: primeiro da lista.
     if (authTenantId) return authTenantId;
     const list = deskcommService.getTenants();
-    return list[0]?.id || 'tenant-cardio-matheus';
+    return list[0]?.id || '44444444-4444-4444-4444-444444444444';
   });
 
   const [currentView, setCurrentView] = useState<LiveView>('kanban');
@@ -143,56 +178,26 @@ function AppInner() {
         if (cancelled) return;
         liveStore.setTenants(ts);
 
-        // RBAC: clínica só vê o próprio tenant. Super admin vê todos.
+        // RBAC: cada usuário vê estritamente o seu tenant vinculado no login.
+        // Super admin vê todos.
         let visibleTenants = ts;
         if (userRole !== 'super_admin') {
           if (authTenantId) {
-            const matched = ts.filter(
-              (t) =>
-                t.id === authTenantId ||
-                (authTenantId.includes('matheus') && t.name.toLowerCase().includes('matheus'))
-            );
-            visibleTenants =
-              matched.length > 0
-                ? matched
-                : ts.filter((t) => t.name.toLowerCase().includes('matheus'));
-          } else {
-            visibleTenants = ts.filter((t) => t.name.toLowerCase().includes('matheus'));
-          }
-          if (visibleTenants.length === 0 && ts.length > 0) {
+            const matched = ts.filter((t) => t.id === authTenantId);
+            visibleTenants = matched.length > 0 ? matched : [ts[0]];
+          } else if (ts.length > 0) {
             visibleTenants = [ts[0]];
           }
         }
 
-        setTenants(visibleTenants);
+        setTenants(applyAiPref(visibleTenants));
         if (visibleTenants[0]) setActiveTenantId(visibleTenants[0].id);
         else if (authTenantId) setActiveTenantId(authTenantId);
 
-        // Carrega leads só dos tenants visíveis
+        // Carrega leads só dos tenants visíveis em uma única query rápida
         const allLeadsByTenant = await Promise.all(
           visibleTenants.map(async (t) => {
-            const ll = await remote.getLeads(t.id);
-            const enriched = await Promise.all(
-              ll.map(async (lead) => {
-                try {
-                  const msgs = await remote.getMessages(lead.id);
-                  return {
-                    ...lead,
-                    messages: msgs.map((m) => ({
-                      id: m.id,
-                      sender: m.sender,
-                      senderName: m.senderName,
-                      content: m.content,
-                      timestamp: m.timestamp,
-                      status: m.status,
-                    })),
-                  };
-                } catch {
-                  return lead;
-                }
-              })
-            );
-            return enriched;
+            return await remote.getLeads(t.id);
           })
         );
         if (cancelled) return;
@@ -224,7 +229,7 @@ function AppInner() {
 
   // Reage a mudanças no liveStore e mantém o estado React sincronizado.
   useEffect(() => {
-    const u1 = liveStore.subscribeTenants(() => setTenants(liveStore.snapshot().tenants));
+    const u1 = liveStore.subscribeTenants(() => setTenants(applyAiPref(liveStore.snapshot().tenants)));
     const u2 = liveStore.subscribeLeads(() => {
       const all = liveStore.snapshot().leads;
       setLeads(all.filter((l) => l.tenantId === activeTenantId));
@@ -243,24 +248,32 @@ function AppInner() {
         liveStore.removeLead(row.id);
         return;
       }
-      // Upsert: pega o row atual (recarrega messages quando é INSERT)
+      // Upsert: pega o row atual preservando mensagens e trazendo métricas JEV em tempo real
+      const existing = liveStore.snapshot().leads.find((l) => l.id === row.id);
       liveStore.upsertLead({
         id: row.id,
         tenantId: row.tenant_id,
         name: row.name || 'Sem nome',
         phone: row.phone,
         formattedPhone: row.phone,
-        avatarUrl: '',
+        avatarUrl: existing?.avatarUrl || '',
         insuranceType: (row.insurance ?? 'particular') as 'particular' | 'convenio',
+        insuranceName: row.insurance === 'convenio' ? 'Convênio' : undefined,
         priority: row.priority,
         stage: row.stage,
         handoffState: row.handoff_state,
         mainComplaint: row.clinical_summary ?? '',
         detectedSymptoms: row.symptoms ?? [],
-        silenceHours: 0,
+        silenceHours: existing?.silenceHours ?? 0,
         lastInteractionAt: row.last_interaction,
-        messages: [],
-        internalNotes: [],
+        conversionProbability: row.conversion_probability ?? 0,
+        negotiationStage: row.negotiation_stage ?? 'primeiro_contato',
+        currentObjection: row.current_objection ?? 'nenhuma',
+        copilotGuidance: row.copilot_guidance || undefined,
+        suggestedReply: row.suggested_reply || undefined,
+        lastCopilotEvalAt: row.last_copilot_eval_at || undefined,
+        messages: existing?.messages || [],
+        internalNotes: existing?.internalNotes || [],
         createdAt: row.created_at,
       });
     });
@@ -272,6 +285,8 @@ function AppInner() {
         content: msg.content,
         timestamp: msg.created_at,
         status: 'delivered',
+        mediaType: (msg.media_type as any) || 'text',
+        mediaUrl: msg.media_url || undefined,
       };
       liveStore.appendMessageToLead(msg.lead_id, mapped);
       liveStore.updateLead(msg.lead_id, {
@@ -292,8 +307,35 @@ function AppInner() {
     if (initial[0]) setSelectedLeadId(initial[0].id);
   }, [activeTenantId]);
 
+  // Carrega mensagens sob demanda ESTRITAMENTE quando o usuário estiver no Inbox (Chat)
+  useEffect(() => {
+    if (currentView !== 'inbox' || !selectedLeadId) return;
+    const currentLead = liveStore.snapshot().leads.find((l) => l.id === selectedLeadId);
+    if (currentLead && (!currentLead.messages || currentLead.messages.length === 0)) {
+      remote.getMessages(selectedLeadId).then((msgs) => {
+        liveStore.updateLead(selectedLeadId, {
+          messages: msgs.map((m) => ({
+            id: m.id,
+            sender: m.sender,
+            senderName: m.senderName,
+            content: m.content,
+            timestamp: m.timestamp,
+            status: m.status,
+          })),
+        });
+      }).catch((err) => console.warn('[crm-hermes] falha ao carregar mensagens sob demanda:', err));
+    }
+  }, [currentView, selectedLeadId]);
+
   const activeTenant =
     tenants.find((t) => t.id === activeTenantId) || tenants[0];
+
+  // Branding dinamico: a cor do tenant ativo vira a variavel CSS global
+  // --brand-color (botoes primarios, nome do tenant e acentos a usam).
+  useEffect(() => {
+    const color = activeTenant?.primaryColor || '#0ea5e9';
+    document.documentElement.style.setProperty('--brand-color', color);
+  }, [activeTenant?.primaryColor]);
 
   // Sincroniza em background o status e número do WhatsApp do tenant ativo com a Evolution API
   useEffect(() => {
@@ -310,10 +352,11 @@ function AppInner() {
         if (cancelled) return;
 
         const stateRaw =
+          (statusPayload as { instance?: { state?: string } } | null)?.instance?.state ||
           (statusPayload as { state?: string } | null)?.state ||
           details?.connectionStatus ||
           'unknown';
-        const isOpen = stateRaw === 'open';
+        const isOpen = stateRaw === 'open' || stateRaw === 'connected';
         const newStatus = isOpen ? 'connected' : 'disconnected';
         const ownerPhone = details?.ownerJid || details?.number;
 
@@ -366,6 +409,9 @@ function AppInner() {
     );
     setTenants(optimistic);
     try {
+      localStorage.setItem(`crm-hermes:ai-auto-reply:${activeTenant.id}`, next ? '1' : '0');
+    } catch { /* localStorage indisponivel: banco ja persistiu */ }
+    try {
       await remote.setTenantAiAutoReply(activeTenant.id, next);
       showToast(
         next
@@ -385,11 +431,35 @@ function AppInner() {
 
   // Handler: Change Stage (Kanban Drag & Drop or Selector)
   const handleMoveStage = (leadId: string, newStage: PipelineStage) => {
-    const updated = deskcommService.updateLeadStage(leadId, newStage);
-    if (updated) {
-      setLeads((prev) => prev.map((l) => (l.id === leadId ? updated : l)));
-      showToast(`Paciente movido para "${newStage.replace('_', ' ').toUpperCase()}"`, 'success');
+    let updated = deskcommService.updateLeadStage(leadId, newStage);
+    if (!updated) return;
+
+    // Regra operacional (msg 5608): arrastar card pra coluna
+    // 'falar_pessoalmente' = kill-switch imediato da IA. Garante que
+    // handoff_state vire 'humano_assumiu' automaticamente, mesmo se o
+    // lead estava com IA ativa antes. Caso o operador já tivesse pausado
+    // manualmente (humano_assumiu), preserva o nome do operador.
+    if (newStage === 'falar_pessoalmente' && updated.handoffState !== 'humano_assumiu') {
+      const operator =
+        userRole === 'clinic_admin'
+          ? activeTenant?.doctorName || 'Operador Kanban'
+          : 'Operador Kanban Drag-and-Drop';
+      const withHandoff = deskcommService.toggleAiHandoff(
+        leadId,
+        'humano_assumiu',
+        operator
+      );
+      if (withHandoff) {
+        updated = withHandoff;
+        showToast('🚨 KILL-SWITCH DA IA: operador assumiu este atendimento.', 'warning');
+      }
     }
+
+    setLeads((prev) => prev.map((l) => (l.id === leadId ? updated : l)));
+    showToast(
+      `Paciente movido para "${newStage.replace(/_/g, ' ').toUpperCase()}"`,
+      'success'
+    );
   };
 
   // Handler: Toggle Handoff (Kill-Switch)
@@ -552,14 +622,16 @@ function AppInner() {
       l.silenceHours >= 4 &&
       l.stage !== 'consulta_agendada' &&
       l.stage !== 'desistiu' &&
-      l.stage !== 'atendido_concluido'
+      l.stage !== 'cancelou' &&
+      l.stage !== 'atendido_concluido' &&
+      l.stage !== 'consulta_realizada'
   ).length;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 font-['Plus_Jakarta_Sans',sans-serif]">
       {/* Toast Notification */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-slate-900/95 border border-slate-700 shadow-2xl text-xs text-white animate-in slide-in-from-bottom-3 duration-200">
+        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-slate-900/95 border border-slate-700 shadow-2xl text-xs text-white animate-in slide-in-from-bottom-3 duration-200 print:hidden">
           {toast.type === 'error' ? (
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
           ) : toast.type === 'warning' ? (
@@ -588,7 +660,7 @@ function AppInner() {
         setCurrentView={handleSelectView}
         activeTenant={activeTenant}
         userRole={userRole}
-        unreadCount={leads.filter((l) => l.stage === 'novo_contato').length}
+        unreadCount={leads.filter((l) => l.stage === 'novo_contato' || l.stage === 'iniciou_conversa').length}
         silentLeadsCount={silentLeadsCount}
         onOpenNewLead={() => {
           setShowNewLeadModal(true);
@@ -623,6 +695,8 @@ function AppInner() {
           {currentView === 'kanban' && (
             <KanbanBoard
               leads={leads}
+              activeTenant={activeTenant}
+              userRole={userRole}
               onOpenChat={(id) => {
                 setSelectedLeadId(id);
                 setCurrentView('inbox');
@@ -630,6 +704,13 @@ function AppInner() {
               onToggleHandoff={handleToggleHandoff}
               onMoveStage={handleMoveStage}
               onOpenNewLead={() => setShowNewLeadModal(true)}
+              onRefreshData={() => {
+                if (activeTenant?.id) {
+                  remote.getLeads(activeTenant.id).then((fresh) => {
+                    liveStore.setLeads(fresh);
+                  }).catch(() => {});
+                }
+              }}
             />
           )}
 
@@ -651,11 +732,35 @@ function AppInner() {
           {currentView === 'radar' && (
             <SilenceRadarView
               leads={leads}
+              activeTenant={activeTenant}
+              onUpdateTenant={handleSaveTenant}
               onOpenChat={(id) => {
                 setSelectedLeadId(id);
                 setCurrentView('inbox');
               }}
               onSendFollowup={handleSendFollowup}
+            />
+          )}
+
+          {currentView === 'campanhas_reativacao' && (
+            <CampanhasReativacaoView
+              activeTenant={activeTenant}
+              onToast={showToast}
+            />
+          )}
+
+          {currentView === 'prospeccao' && (
+            <ProspectorView activeTenant={activeTenant} onToast={showToast} />
+          )}
+
+          {currentView === 'provisionar' && (
+            <ProvisionView
+              onToast={showToast}
+              onProvisioned={(tenantId) => {
+                setActiveTenantId(tenantId);
+                setCurrentView('kanban');
+              }}
+              onBack={() => setCurrentView('super_admin')}
             />
           )}
 
@@ -668,6 +773,14 @@ function AppInner() {
               }}
               onToggleHandoff={handleToggleHandoff}
               onOpenNewLead={() => setShowNewLeadModal(true)}
+              activeTenant={activeTenant}
+              onRefreshData={() => {
+                if (activeTenant?.id) {
+                  remote.getLeads(activeTenant.id).then((fresh) => {
+                    liveStore.setLeads(fresh);
+                  }).catch(() => {});
+                }
+              }}
             />
           )}
 
@@ -710,6 +823,7 @@ function AppInner() {
                 setCurrentView('kanban');
               }}
               onOpenNewTenantModal={() => setShowNewTenantModal(true)}
+              onOpenProvision={() => setCurrentView('provisionar')}
             />
           )}
 
@@ -717,6 +831,22 @@ function AppInner() {
 
           {currentView === 'integrations' && (
             <IntegrationsPage activeTenant={activeTenant} />
+          )}
+
+          {currentView === 'agenda' && (
+            <AgendaView
+              activeTenant={activeTenant}
+              leads={leads}
+              showToast={showToast}
+            />
+          )}
+
+          {currentView === 'dashboard' && (
+            <DashboardView
+              activeTenant={activeTenant}
+              leads={leads}
+              showToast={showToast}
+            />
           )}
         </main>
       </div>
@@ -741,6 +871,7 @@ function AppInner() {
       {showNewLeadModal && (
         <NewLeadModal
           tenantName={activeTenant.name}
+          activeTenant={activeTenant}
           onSave={handleCreateLead}
           onClose={() => setShowNewLeadModal(false)}
         />

@@ -61,14 +61,29 @@ export function subscribeTenants(fn: Listener): () => void {
 // ============================================================================
 
 export function setLeads(list: Lead[]): void {
-  state.leads = [...list];
+  // Stale-while-revalidate: preserva histórico de mensagens em memória
+  const existingMap = new Map(state.leads.map((l) => [l.id, l]));
+  state.leads = list.map((newItem) => {
+    const prev = existingMap.get(newItem.id);
+    if (!prev) return newItem;
+    const msgs = (newItem.messages && newItem.messages.length > 0) ? newItem.messages : prev.messages;
+    const notes = (newItem.internalNotes && newItem.internalNotes.length > 0) ? newItem.internalNotes : prev.internalNotes;
+    return { ...prev, ...newItem, messages: msgs, internalNotes: notes };
+  });
   notify(leadListeners);
 }
 
 export function upsertLead(l: Lead): void {
   const i = state.leads.findIndex((x) => x.id === l.id);
-  if (i >= 0) state.leads[i] = l;
-  else state.leads.unshift(l);
+  if (i >= 0) {
+    const existing = state.leads[i];
+    // NUNCA limpa mensagens se 'l' vier vazio (upsert de lead via realtime)
+    const msgs = (l.messages && l.messages.length > 0) ? l.messages : existing.messages;
+    const notes = (l.internalNotes && l.internalNotes.length > 0) ? l.internalNotes : existing.internalNotes;
+    state.leads[i] = { ...existing, ...l, messages: msgs, internalNotes: notes };
+  } else {
+    state.leads.unshift(l);
+  }
   notify(leadListeners);
 }
 
@@ -86,13 +101,21 @@ export function removeLead(id: string): void {
   notify(leadListeners);
 }
 
+export function getLeadById(id: string): Lead | undefined {
+  return state.leads.find((l) => l.id === id);
+}
+
 export function appendMessageToLead(leadId: string, msg: LeadMessage): Lead | null {
   const lead = state.leads.find((l) => l.id === leadId);
   if (!lead) return null;
+  // Evita duplicidade de mensagens pelo ID
+  if (lead.messages.some((m) => m.id === msg.id)) {
+    return lead;
+  }
   const next: Lead = {
     ...lead,
     messages: [...lead.messages, msg],
-    lastInteractionAt: msg.timestamp,
+    lastInteractionAt: msg.timestamp || lead.lastInteractionAt,
   };
   return updateLead(leadId, {
     messages: next.messages,

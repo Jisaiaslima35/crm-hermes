@@ -11,14 +11,20 @@ import {
   Stethoscope,
   Plus,
   Tag,
+  FileSpreadsheet,
+  Plane,
 } from 'lucide-react';
-import { Lead, PipelineStage } from '../types';
+import { Lead, PipelineStage, Tenant } from '../types';
+import { nicheOf, brandColorOf } from '../utils/niche';
+import { ImportLeadsModal } from './ImportLeadsModal';
 
 interface LeadsListViewProps {
   leads: Lead[];
   onOpenChat: (leadId: string) => void;
   onToggleHandoff: (leadId: string) => void;
   onOpenNewLead: () => void;
+  activeTenant?: Tenant;
+  onRefreshData?: () => void;
 }
 
 export const LeadsListView: React.FC<LeadsListViewProps> = ({
@@ -26,10 +32,17 @@ export const LeadsListView: React.FC<LeadsListViewProps> = ({
   onOpenChat,
   onToggleHandoff,
   onOpenNewLead,
+  activeTenant,
+  onRefreshData,
 }) => {
+  const isTourism =
+    activeTenant?.specialty?.toLowerCase().includes('turismo') ||
+    activeTenant?.name?.toLowerCase().includes('esvc');
+
   const [searchTerm, setSearchTerm] = useState('');
   const [stageFilter, setStageFilter] = useState<string>('all');
   const [insuranceFilter, setInsuranceFilter] = useState<string>('all');
+  const [importModalOpen, setImportModalOpen] = useState(false);
 
   const filteredLeads = leads.filter((lead) => {
     const matchesSearch =
@@ -50,26 +63,44 @@ export const LeadsListView: React.FC<LeadsListViewProps> = ({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800">
         <div>
           <div className="flex items-center gap-2">
-            <Users className="w-5 h-5 text-sky-400" />
+            {isTourism ? (
+              <Plane className="w-5 h-5 text-emerald-400" />
+            ) : (
+              <Users className="w-5 h-5 text-sky-400" />
+            )}
             <h1 className="text-lg font-bold text-white tracking-tight">
-              Base de Pacientes & Leads Clínicos
+              {nicheOf(activeTenant) === 'turismo' ? 'Base de Viajantes & Cotações' : nicheOf(activeTenant) === 'comercial' ? 'Base de Clientes & Leads' : 'Base de Pacientes & Leads Clínicos'}
             </h1>
             <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-sky-500/20 text-sky-400 border border-sky-500/30">
               {filteredLeads.length} registros
             </span>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            Histórico completo de atendimentos, sintomas triados e status de conversão.
+            {isTourism
+              ? 'Histórico completo de atendimentos, viagens cadastradas e cotações.'
+              : 'Histórico completo de atendimentos, sintomas triados e status de conversão.'}
           </p>
         </div>
 
-        <button
-          onClick={onOpenNewLead}
-          className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all cursor-pointer self-start sm:self-auto"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Cadastrar Novo Lead</span>
-        </button>
+        <div className="flex items-center gap-2.5 self-start sm:self-auto">
+          {/* Botão Importar Lista */}
+          <button
+            onClick={() => setImportModalOpen(true)}
+            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-400 text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all cursor-pointer"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-sky-400" />
+            <span>Importar Lista (Excel/CSV)</span>
+          </button>
+
+          <button
+            onClick={onOpenNewLead}
+            style={activeTenant?.primaryColor ? { backgroundColor: brandColorOf(activeTenant) } : undefined}
+            className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>{nicheOf(activeTenant) === 'turismo' ? 'Cadastrar Novo Viajante' : nicheOf(activeTenant) === 'comercial' ? 'Cadastrar Novo Cliente' : 'Cadastrar Novo Lead'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Filter Bar */}
@@ -223,6 +254,18 @@ export const LeadsListView: React.FC<LeadsListViewProps> = ({
           </table>
         </div>
       </div>
+
+      {activeTenant && (
+        <ImportLeadsModal
+          isOpen={importModalOpen}
+          onClose={() => setImportModalOpen(false)}
+          tenantId={activeTenant.id}
+          tenantName={activeTenant.name}
+          onImportComplete={() => {
+            onRefreshData?.();
+          }}
+        />
+      )}
     </div>
   );
 };

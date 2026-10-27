@@ -23,20 +23,40 @@ from typing import Any, Optional, Tuple
 
 import httpx
 
+from dotenv import load_dotenv
+
 logger = logging.getLogger("media_handler")
 
-# Configurações do 9Router (porta 20128 local)
-NINEROUTER_BASE_URL = os.environ.get(
-    "NINEROUTER_BASE_URL", "http://127.0.0.1:20128/v1"
-)
-NINEROUTER_API_KEY = os.environ.get("NINEROUTER_API_KEY", "")
+# Carrega .env do projeto e secrets do Hermes
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+for _secret in ("9router.env", "evolution.env", "composio.env"):
+    _p = os.path.join("/root/.hermes/secrets", _secret)
+    if os.path.exists(_p):
+        try:
+            load_dotenv(_p, override=False)
+        except Exception:
+            pass
+
+
+def _get_9router_api_key() -> str:
+    return (
+        os.environ.get("NINEROUTER_API_KEY")
+        or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
+        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+    ).strip()
+
+
+def _get_9router_base_url() -> str:
+    return os.environ.get(
+        "NINEROUTER_BASE_URL", "https://9router.automacaojs.us/v1"
+    ).strip()
+
+
 # Modelos Multimodal (configuráveis via ENV; nunca hardcoded em cliente final)
 NINEROUTER_VISION_MODEL = os.environ.get(
     "NINEROUTER_VISION_MODEL", "gemini/gemini-2.5-flash"
 )
-# ATENÇÃO 01/10: o "nvidia/minimaxai/minimax-m3" via 9Router está EOL desde
-# 2026-09-09 (confirmado via curl — retorna HTTP 410 Gone). Pipeline de visão
-# agora é: 9Router (Gemini) → MiniMax API oficial (último recurso).
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_API_URL = os.environ.get(
     "MINIMAX_API_URL", "https://api.minimax.io/anthropic"
@@ -162,6 +182,7 @@ def _transcribe_with_whisper(wav_path: str) -> str:
         beam_size=1,
         temperature=0.0,
         vad_filter=True,
+        initial_prompt="Consulta médica psiquiátrica clínica Dr. Matheus Dore agendamento receitas",
     )
     parts = [seg.text.strip() for seg in segments if seg.text]
     return " ".join(parts).strip()
@@ -241,9 +262,11 @@ async def _call_9router_vision(
 ) -> tuple[int, str]:
     """Faz UMA chamada ao 9Router com modelo multimodal explícito.
     Retorna (status_code, content). Erros de rede retornam (-1,'')."""
-    url = f"{NINEROUTER_BASE_URL.rstrip('/')}/chat/completions"
+    base_url = _get_9router_base_url()
+    api_key = _get_9router_api_key()
+    url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {NINEROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -264,10 +287,11 @@ async def _call_9router_vision(
                     .get("content", "")
                 )
                 return 200, (content or "").strip()
-            return resp.status_code, resp.text[:200]
+            logger.warning("[9Router Vision] Falhou HTTP %d (model=%s): %s", resp.status_code, model, resp.text[:150])
+            return resp.status_code, ""
     except Exception as exc:
         logger.error("[9Router Vision] Erro de conexão (model=%s): %s", model, exc)
-        return -1, str(exc)[:200]
+        return -1, ""
 
 
 async def process_image_message(
@@ -382,3 +406,85 @@ async def process_image_message(
         logger.error("[Vision MiniMax API OFICIAL] MINIMAX_API_KEY ausente — fallback indisponível")
 
     return ""
+
+
+RECEIPT_EXTRACTION_PROMPT = """Você é um auditor financeiro e leitor de comprovantes bancários para CRM médico/clínico.
+Analise a imagem enviada pelo paciente (comprovante Pix, TED, DOC, transferência bancária ou recibo).
+Extraia estritamente um JSON no seguinte formato:
+{
+  "is_payment_receipt": true,
+  "amount": 300.00,
+  "receiver": "nome do favorecido/clínica",
+  "transaction_id": "código ou id da transação",
+  "date": "data e hora no comprovante",
+  "bank": "nome do banco"
+}
+Se a imagem NÃO for um comprovante de pagamento/transferência (ex: foto de remédio, exame, receita médica, selfie, conversa), retorne:
+{
+  "is_payment_receipt": false,
+  "amount": null,
+  "receiver": null,
+  "transaction_id": null,
+  "date": null,
+  "bank": null
+}
+Responda EXCLUSIVAMENTE o JSON puro, sem crases markdown."""
+
+
+async def extract_receipt_data_multimodal(
+    b64_image: str,
+    mimetype: str = "image/jpeg",
+) -> dict[str, Any]:
+    """Analisa imagem com Gemini 2.5 Flash Multimodal para extrair dados estruturados de comprovante Pix/bancário."""
+    default_empty = {
+        "is_payment_receipt": False,
+        "amount": None,
+        "receiver": None,
+        "transaction_id": None,
+        "date": None,
+        "bank": None,
+    }
+    if not b64_image:
+        return default_empty
+
+    if not mimetype or not mimetype.startswith("image/"):
+        mimetype = "image/jpeg"
+
+    messages = [
+        {"role": "system", "content": RECEIPT_EXTRACTION_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Analise esta imagem e extraia os dados do comprovante Pix/pagamento em JSON:"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mimetype};base64,{b64_image}"},
+                },
+            ],
+        },
+    ]
+
+    status, content = await _call_9router_vision(messages, NINEROUTER_VISION_MODEL)
+    if status == 200 and content:
+        try:
+            # Tenta decodificar JSON direto ou extrair bloco {...}
+            clean_content = content.strip()
+            if clean_content.startswith("```"):
+                clean_content = re.sub(r"^```(?:json)?\s*", "", clean_content)
+                clean_content = re.sub(r"\s*```$", "", clean_content)
+            parsed = json.loads(clean_content)
+            if isinstance(parsed, dict) and "is_payment_receipt" in parsed:
+                return parsed
+        except Exception as parse_err:
+            m = re.search(r"\{.*\}", content, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict) and "is_payment_receipt" in parsed:
+                        return parsed
+                except Exception:
+                    pass
+            logger.warning("[Vision Receipt] Falha ao parsear JSON de comprovante: %s | Raw: %s", parse_err, content[:150])
+
+    return default_empty
+

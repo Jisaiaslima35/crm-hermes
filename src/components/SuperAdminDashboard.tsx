@@ -20,12 +20,14 @@ interface SuperAdminDashboardProps {
   tenants: Tenant[];
   onSelectTenant: (tenantId: string) => void;
   onOpenNewTenantModal: () => void;
+  onOpenProvision: () => void;
 }
 
 export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   tenants,
   onSelectTenant,
   onOpenNewTenantModal,
+  onOpenProvision,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const metrics = deskcommService.getGlobalMetrics();
@@ -65,6 +67,15 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
         >
           <Plus className="w-4 h-4" />
           <span>Cadastrar Nova Clínica</span>
+        </button>
+
+        <button
+          id="btn-provision-new-tenant"
+          onClick={onOpenProvision}
+          className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all cursor-pointer self-start sm:self-auto"
+        >
+          <Plus className="w-4 h-4" />
+          <span>+ Cadastrar Nova Organização</span>
         </button>
       </div>
 

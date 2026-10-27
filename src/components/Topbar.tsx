@@ -10,6 +10,7 @@ import {
   Plus,
   Menu,
   Power,
+  Plane,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
 
@@ -68,10 +69,10 @@ export const Topbar: React.FC<TopbarProps> = ({
   return (
     <header
       id="crm-topbar"
-      className="h-16 bg-slate-900 border-b border-slate-800 px-4 md:px-5 flex items-center justify-between gap-4 select-none shrink-0"
+      className="min-h-16 h-auto py-2 px-3 sm:px-4 md:px-5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-y-2 gap-x-3 select-none shrink-0 relative z-30 print:hidden"
     >
       {/* Left: Hamburguer (mobile) + Tenant Switcher (SÓ super_admin) ou título da clínica (clínica) */}
-      <div className="flex items-center gap-2 md:gap-3 min-w-0">
+      <div className="flex items-center gap-2 md:gap-3 min-w-0 shrink-0">
         {showHamburger && (
           <button
             id="btn-open-sidebar"
@@ -90,10 +91,10 @@ export const Topbar: React.FC<TopbarProps> = ({
               Organização:
             </span>
 
-            <div className="relative group z-30">
-              <div className="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 rounded-xl px-3 py-1.5 transition-all cursor-pointer shadow-inner relative z-30 min-h-[38px]">
+            <div className="relative group">
+              <div className="flex items-center gap-2 bg-slate-800/90 hover:bg-slate-800 border border-slate-700/80 rounded-xl px-3 py-1.5 transition-all cursor-pointer shadow-inner min-h-[38px]">
                 <Building className="w-4 h-4 text-sky-400 shrink-0" />
-                <div className="text-left min-w-0 max-w-[160px] sm:max-w-[260px]">
+                <div className="text-left min-w-0 max-w-[140px] sm:max-w-[200px] lg:max-w-[240px]">
                   <span className="text-xs font-bold text-white block truncate">
                     {activeTenant.name}
                   </span>
@@ -104,10 +105,7 @@ export const Topbar: React.FC<TopbarProps> = ({
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 ml-1 shrink-0" />
               </div>
 
-              {/* Dropdown Menu — z-50 já garante sobreposição acima de qualquer
-                  coluna do Kanban / card do Inbox. group-hover:block funciona
-                  bem em desktop; em mobile a viewport é pequena, mas o menu
-                  ainda aparece porque é relative ao trigger z-30. */}
+              {/* Dropdown Menu */}
               <div className="absolute top-full left-0 mt-1 w-72 sm:w-80 bg-slate-900 border border-slate-700/80 rounded-xl shadow-2xl py-1.5 z-50 hidden group-hover:block group-focus-within:block transition-all animate-in fade-in-50 zoom-in-95">
                 <div className="px-3 py-1.5 border-b border-slate-800 text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
                   <span>Alternar Tenant / Impersonate</span>
@@ -150,16 +148,22 @@ export const Topbar: React.FC<TopbarProps> = ({
             </div>
           </div>
         ) : (
-          // Visão clínica: badge estático, sem dropdown de troca de tenant.
+          // Visão clínica/turismo: badge estático, sem dropdown de troca de tenant.
           <div className="flex items-center gap-2 min-w-0">
             <div className="flex items-center gap-2 bg-slate-800/50 border border-slate-700/60 rounded-xl px-3 py-1.5 min-h-[38px] min-w-0">
-              <Building className="w-4 h-4 text-emerald-400 shrink-0" />
-              <div className="text-left min-w-0 max-w-[180px] sm:max-w-[260px]">
+              {activeTenant.specialty?.toLowerCase().includes('turismo') || activeTenant.name.toLowerCase().includes('esvc') ? (
+                <Plane className="w-4 h-4 text-emerald-400 shrink-0" />
+              ) : (
+                <Building className="w-4 h-4 text-emerald-400 shrink-0" />
+              )}
+              <div className="text-left min-w-0 max-w-[160px] sm:max-w-[240px]">
                 <span className="text-xs font-bold text-white block truncate">
                   {activeTenant.name}
                 </span>
                 <span className="text-[10px] text-slate-400 block -mt-0.5 truncate">
-                  {activeTenant.specialty} • {activeTenant.doctorName}
+                  {activeTenant.specialty?.toLowerCase().includes('turismo') || activeTenant.name.toLowerCase().includes('esvc')
+                    ? 'Agência de Viagens • Consultoria'
+                    : `${activeTenant.specialty} • ${activeTenant.doctorName}`}
                 </span>
               </div>
             </div>
@@ -168,11 +172,11 @@ export const Topbar: React.FC<TopbarProps> = ({
       </div>
 
       {/* Center & Right */}
-      <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
-        {/* RBAC Role Selector Pill (SÓ super_admin, SÓ desktop) */}
+      <div className="flex items-center gap-1.5 sm:gap-2 shrink min-w-0 flex-wrap justify-end">
+        {/* RBAC Role Selector Pill (SÓ super_admin) */}
         {isSuperAdmin && (
-          <div className="hidden md:flex items-center bg-slate-800/80 border border-slate-700/80 rounded-lg p-1">
-            <span className="text-[10px] font-medium text-slate-400 px-2 flex items-center gap-1">
+          <div className="hidden lg:flex items-center bg-slate-800/80 border border-slate-700/80 rounded-lg p-1 shrink-0">
+            <span className="text-[10px] font-medium text-slate-400 px-1.5 hidden xl:flex items-center gap-1">
               <Shield className="w-3 h-3 text-slate-400" />
               Perfil:
             </span>
@@ -180,37 +184,40 @@ export const Topbar: React.FC<TopbarProps> = ({
               id="role-super-admin"
               onClick={() => onSelectRole('super_admin')}
               className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
-                userRole === 'super_admin'
+                (userRole as string) === 'super_admin'
                   ? 'bg-purple-600 text-white shadow-sm font-semibold'
                   : 'text-slate-400 hover:text-white'
               }`}
               title="Super Admin SaaS: visualiza métricas globais de todas as clínicas"
             >
-              Super Admin
+              <span className="hidden xl:inline">Super Admin</span>
+              <span className="xl:hidden">Super</span>
             </button>
             <button
               id="role-clinic-admin"
               onClick={() => onSelectRole('clinic_admin')}
               className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
-                userRole === 'clinic_admin'
+                (userRole as string) === 'clinic_admin'
                   ? 'bg-sky-600 text-white shadow-sm font-semibold'
                   : 'text-slate-400 hover:text-white'
               }`}
               title="Admin da Clínica: gerencia regras da persona, IA e equipe"
             >
-              Admin Clínica
+              <span className="hidden xl:inline">Admin Clínica</span>
+              <span className="xl:hidden">Clínica</span>
             </button>
             <button
               id="role-attendant"
               onClick={() => onSelectRole('attendant_doctor')}
               className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer ${
-                userRole === 'attendant_doctor'
+                (userRole as string) === 'attendant_doctor'
                   ? 'bg-emerald-600 text-white shadow-sm font-semibold'
                   : 'text-slate-400 hover:text-white'
               }`}
               title="Atendente/Médico: focado na Inbox e no Kanban"
             >
-              Atendente / Médico
+              <span className="hidden xl:inline">Atendente / Médico</span>
+              <span className="xl:hidden">Médico</span>
             </button>
           </div>
         )}
@@ -327,7 +334,11 @@ export const Topbar: React.FC<TopbarProps> = ({
               }`}
             />
             <span className="font-semibold text-[11px] hidden sm:inline">
-              {aiEnabled ? 'IA Ativa' : 'Plantão'}
+              {aiEnabled
+                ? 'IA Ativa'
+                : activeTenant.specialty?.toLowerCase().includes('turismo') || activeTenant.name.toLowerCase().includes('esvc')
+                ? 'Bot em OFF (Humano)'
+                : 'Plantão'}
             </span>
             <span
               className={`text-[10px] px-1 py-0.5 rounded font-mono hidden lg:inline ${

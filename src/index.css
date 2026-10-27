@@ -1,1 +1,36 @@
 @import "tailwindcss";
+
+@media print {
+  /* Ocultar navegação, menus laterais, topo, barras de rolagem e toasts */
+  header,
+  aside,
+  nav,
+  #crm-topbar,
+  #btn-open-sidebar,
+  .print-hidden,
+  [data-print-hidden="true"] {
+    display: none !important;
+  }
+
+  body, html {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  main,
+  #root,
+  .flex-1 {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+
+  @page {
+    margin: 10mm;
+    size: A4 portrait;
+  }
+}
+
+:root { --brand-color: #0ea5e9; }

@@ -38,14 +38,14 @@ const BYOK_BASE_URLS: Record<string, string> = {
 
 const INITIAL_TENANTS: Tenant[] = [
   {
-    id: 'tenant-cardio-matheus',
-    name: 'Clínica Cardiológica Dr. Matheus',
-    tagline: 'Cardiologia Clínica, Exames & Arritmias',
-    specialty: 'Cardiologia',
-    doctorName: 'Dr. Matheus Silva (CRM 128452-SP)',
-    phone: '+55 (11) 98765-4321',
-    city: 'São Paulo, SP - Jardins',
-    logoColor: 'emerald',
+    id: '44444444-4444-4444-4444-444444444444',
+    name: 'ESVC Turismo',
+    tagline: 'Agência de Viagens & Consultoria',
+    specialty: 'Turismo',
+    doctorName: 'Consultor de Viagens',
+    phone: '+55 (84) 9216-2937',
+    city: 'Natal, RN',
+    logoColor: 'teal',
     aiEngine: {
       mode: 'hermes_vps',
       hermesEndpoint: '',
@@ -53,16 +53,16 @@ const INITIAL_TENANTS: Tenant[] = [
       byokProvider: 'anthropic',
       byokModel: 'claude-3-5-sonnet-20241022',
       byokKey: '',
-      personaName: 'Dr. Matheus AI (Hermes OS)',
-      doctorSpecialty: 'Cardiologia',
+      personaName: 'Consultora Virtual ESVC Turismo',
+      doctorSpecialty: 'Turismo',
       tone: 'acolhedor',
       systemPrompt: '',
       silenceThresholdHours: 4,
       autoFollowup: true,
     },
     whatsappInstance: {
-      sessionName: 'cardio_matheus_prod_01',
-      phoneNumber: '+55 11 98765-4321',
+      sessionName: 'esvc_turismo_prod_01',
+      phoneNumber: '+55 84 9216-2937',
       status: 'connected',
       batteryLevel: 0,
       webhookUrl: '',
@@ -209,6 +209,8 @@ class DeskcommService {
         byok_provider: updatedTenant.aiEngine.byokProvider,
         byok_api_key: updatedTenant.aiEngine.byokKey,
         byok_model: updatedTenant.aiEngine.byokModel,
+        schedule_rules: updatedTenant.scheduleRules,
+        followup_rules: updatedTenant.followupRules,
       })
       .catch((e) => console.warn('[deskcommService] upsertTenant falhou:', e));
     return updatedTenant;
@@ -418,7 +420,7 @@ class DeskcommService {
     const formattedPhone = leadData.formattedPhone || phone;
     const insuranceType = leadData.insuranceType || 'particular';
     const priority = leadData.priority || 'normal';
-    const stage = leadData.stage || 'novo_contato';
+    const stage = leadData.stage || 'iniciou_conversa';
     const mainComplaint = leadData.mainComplaint || 'Primeiro contato via WhatsApp';
     const detectedSymptoms = leadData.detectedSymptoms || [];
 

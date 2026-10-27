@@ -19,9 +19,16 @@ import {
   ArrowLeft,
   User,
 } from 'lucide-react';
-import { Lead, Tenant, PipelineStage, UserRole } from '../types';
-import { QUICK_TEMPLATES } from '../constants';
+import { Lead, Tenant, PipelineStage, UserRole, LeadMessage } from '../types';
+import { QUICK_TEMPLATES, TURISMO_QUICK_TEMPLATES } from '../constants';
 import { CustomerProfile } from './CustomerProfile';
+import { supabase } from '../services/supabaseClient';
+import * as liveStore from '../services/liveStore';
+import {
+  formatConversationTime,
+  formatMessageTime,
+  formatHeaderTime,
+} from '../utils/dateUtils';
 
 const MOBILE_BREAKPOINT = 768;
 
@@ -53,6 +60,81 @@ interface ChatInboxProps {
   onReceivePatientMessage: (leadId: string, message: string) => void;
 }
 
+// Funções auxiliares para detecção e renderização de mídias (Áudio / Fotos / Comprovantes)
+const isAudioMessage = (msg: LeadMessage): boolean => {
+  if (msg.mediaType === 'audio') return true;
+  const src = (msg.mediaUrl || msg.content || '').toLowerCase();
+  return (
+    src.startsWith('data:audio/') ||
+    src.endsWith('.ogg') ||
+    src.endsWith('.mp3') ||
+    src.endsWith('.wav') ||
+    src.endsWith('.m4a') ||
+    src.endsWith('.aac') ||
+    src.includes('/audio') ||
+    src.includes('.ogg?') ||
+    src.includes('.mp3?') ||
+    src.includes('.wav?')
+  );
+};
+
+const getAudioSrc = (msg: LeadMessage): string | null => {
+  if (msg.mediaUrl) return msg.mediaUrl;
+  const src = (msg.content || '').trim();
+  const lower = src.toLowerCase();
+  if (
+    lower.startsWith('http') &&
+    (lower.includes('.ogg') ||
+      lower.includes('.mp3') ||
+      lower.includes('.wav') ||
+      lower.includes('/audio') ||
+      lower.includes('.m4a'))
+  ) {
+    return src;
+  }
+  if (lower.startsWith('data:audio/')) {
+    return src;
+  }
+  return null;
+};
+
+const isImageMessage = (msg: LeadMessage): boolean => {
+  if (msg.mediaType === 'image') return true;
+  const src = (msg.mediaUrl || msg.content || '').toLowerCase();
+  return (
+    src.startsWith('data:image/') ||
+    src.endsWith('.png') ||
+    src.endsWith('.jpg') ||
+    src.endsWith('.jpeg') ||
+    src.endsWith('.webp') ||
+    src.endsWith('.gif') ||
+    src.includes('.png?') ||
+    src.includes('.jpg?') ||
+    src.includes('.jpeg?') ||
+    src.includes('.webp?')
+  );
+};
+
+const getImageSrc = (msg: LeadMessage): string | null => {
+  if (msg.mediaUrl) return msg.mediaUrl;
+  const src = (msg.content || '').trim();
+  const lower = src.toLowerCase();
+  if (
+    lower.startsWith('http') &&
+    (lower.includes('.png') ||
+      lower.includes('.jpg') ||
+      lower.includes('.jpeg') ||
+      lower.includes('.webp') ||
+      lower.includes('.gif'))
+  ) {
+    return src;
+  }
+  if (lower.startsWith('data:image/')) {
+    return src;
+  }
+  return null;
+};
+
 export const ChatInbox: React.FC<ChatInboxProps> = ({
   leads,
   activeTenant,
@@ -73,11 +155,168 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
   const [customSimulateText, setCustomSimulateText] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Responsividade — em <768px lista e chat alternam (lista fullwidth OU
-  // chat fullwidth); Customer 360 vira drawer retrátil lateral.
+  // Responsividade — em <768px lista e chat alternam
   const isNarrow = useIsNarrow();
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+
+  const isTourism =
+    activeTenant?.id === '44444444-4444-4444-4444-444444444444' ||
+    activeTenant?.specialty?.toLowerCase().includes('turismo') ||
+    activeTenant?.name?.toLowerCase().includes('esvc');
+
+  const selectedLead = leads.find((l) => l.id === selectedLeadId) || leads[0];
+
+  // Estado reativo instantâneo do lead selecionado para atualizar JEV sem F5
+  const [liveLead, setLiveLead] = useState<Lead>(selectedLead);
+  useEffect(() => {
+    setLiveLead(selectedLead);
+  }, [selectedLead?.id, selectedLead?.lastInteractionAt, selectedLead?.conversionProbability]);
+
+  // Cache em memória de mensagens por ID de Lead para NUNCA esvaziar/piscar durante fetches
+  const messagesCacheRef = useRef<Record<string, LeadMessage[]>>({});
+
+  // Estado das mensagens do lead ativo com stale-while-revalidate
+  const [displayedMessages, setDisplayedMessages] = useState<LeadMessage[]>(() => {
+    const initial = selectedLead?.messages || [];
+    if (selectedLead?.id && initial.length > 0) {
+      messagesCacheRef.current[selectedLead.id] = initial;
+    }
+    return initial;
+  });
+
+  // Sincronização resiliente: se selectedLead mudar ou props trouxerem novas mensagens
+  useEffect(() => {
+    if (!selectedLead?.id) return;
+    const leadId = selectedLead.id;
+    const incoming = selectedLead.messages || [];
+
+    if (incoming.length > 0) {
+      // Atualiza cache e estado
+      messagesCacheRef.current[leadId] = incoming;
+      setDisplayedMessages(incoming);
+    } else if (messagesCacheRef.current[leadId] && messagesCacheRef.current[leadId].length > 0) {
+      // Se incoming for vazio mas já temos cache deste lead, MANTÉM O CACHE (não zera)
+      setDisplayedMessages(messagesCacheRef.current[leadId]);
+    } else {
+      setDisplayedMessages([]);
+    }
+  }, [selectedLead?.id, selectedLead?.messages]);
+
+  // Supabase Realtime: Escuta INSERT na tabela 'messages' e UPDATE na tabela 'leads' para o lead ativo
+  useEffect(() => {
+    if (!selectedLead?.id) return;
+    const activeLeadId = selectedLead.id;
+
+    const channelName = `inbox-lead-realtime-${activeLeadId}-${Date.now()}`;
+    const channel = supabase
+      .channel(channelName)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `lead_id=eq.${activeLeadId}`,
+        },
+        (payload) => {
+          const row = payload.new as any;
+          if (!row || !row.id) return;
+
+          const newMsg: LeadMessage = {
+            id: row.id,
+            sender:
+              row.sender === 'patient' || row.sender === 'human' || row.sender === 'ai'
+                ? row.sender
+                : 'patient',
+            senderName:
+              row.sender_name || (row.sender === 'patient' ? selectedLead.name : 'Atendente'),
+            content: row.content || '',
+            timestamp: row.created_at || new Date().toISOString(),
+            status: (row.status as any) || 'delivered',
+            mediaType: row.media_type || (row.media_url ? 'image' : 'text'),
+            mediaUrl: row.media_url || undefined,
+          };
+
+          setDisplayedMessages((prev) => {
+            const exists = prev.some(
+              (m) =>
+                m.id === newMsg.id ||
+                (m.id.startsWith('temp-') && m.content === newMsg.content && m.sender === newMsg.sender)
+            );
+            let nextMessages: LeadMessage[];
+            if (exists) {
+              nextMessages = prev.map((m) =>
+                m.id === newMsg.id || (m.id.startsWith('temp-') && m.content === newMsg.content)
+                  ? newMsg
+                  : m
+              );
+            } else {
+              nextMessages = [...prev, newMsg];
+            }
+            messagesCacheRef.current[activeLeadId] = nextMessages;
+            return nextMessages;
+          });
+
+          liveStore.appendMessageToLead(activeLeadId, newMsg);
+
+          // Scroll suave imediato até o fim
+          setTimeout(() => {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+          }, 80);
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'leads',
+          filter: `id=eq.${activeLeadId}`,
+        },
+        (payload) => {
+          const row = payload.new as any;
+          if (!row) return;
+
+          // Atualiza o liveStore e liveLead em tempo real (Customer 360 e JEV Copilot sem F5)
+          const existing = liveStore.getLeadById(activeLeadId);
+          const nextLead: Lead = {
+            ...(existing || selectedLead),
+            conversionProbability:
+              row.conversion_probability !== undefined && row.conversion_probability !== null
+                ? Number(row.conversion_probability)
+                : (existing?.conversionProbability ?? selectedLead.conversionProbability),
+            negotiationStage: row.negotiation_stage || existing?.negotiationStage || selectedLead.negotiationStage,
+            currentObjection: row.current_objection || existing?.currentObjection || selectedLead.currentObjection,
+            copilotGuidance: row.copilot_guidance || existing?.copilotGuidance || selectedLead.copilotGuidance,
+            suggestedReply: row.suggested_reply || existing?.suggestedReply || selectedLead.suggestedReply,
+            lastCopilotEvalAt: row.last_copilot_eval_at || existing?.lastCopilotEvalAt || selectedLead.lastCopilotEvalAt,
+            stage: (row.pipeline_stage || row.stage || existing?.stage || selectedLead.stage) as any,
+            handoffState: row.handoff_state || existing?.handoffState || selectedLead.handoffState,
+            silenceHours:
+              row.silence_hours !== undefined && row.silence_hours !== null
+                ? Number(row.silence_hours)
+                : (existing?.silenceHours ?? selectedLead.silenceHours),
+            lastInteractionAt: row.last_interaction_at || existing?.lastInteractionAt || selectedLead.lastInteractionAt,
+          };
+
+          if (existing) {
+            liveStore.upsertLead(nextLead);
+          }
+          setLiveLead(nextLead);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [selectedLead?.id]);
+
+  // Scroll suave ao alterar quantidade de mensagens
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [displayedMessages.length]);
 
   // Quando o usuário escolhe outro paciente, no mobile já abre o chat direto.
   const handleSelectLead = (leadId: string) => {
@@ -88,13 +327,6 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
     setMobileChatOpen(false);
     setProfileOpen(false);
   };
-
-  const selectedLead = leads.find((l) => l.id === selectedLeadId) || leads[0];
-
-  // Scroll to bottom on new message
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [selectedLead?.messages]);
 
   // Filter conversations
   const filteredLeads = leads.filter((lead) => {
@@ -113,18 +345,51 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
     e.preventDefault();
     if (!messageInput.trim() || !selectedLead) return;
 
+    const content = messageInput.trim();
     const senderName =
       userRole === 'clinic_admin'
         ? activeTenant.doctorName
         : 'Atendente da Clínica';
 
-    onSendMessage(selectedLead.id, messageInput.trim(), 'human', senderName);
+    // Optimistic update imediato
+    const tempMsg: LeadMessage = {
+      id: `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender: 'human',
+      senderName,
+      content,
+      timestamp: new Date().toISOString(),
+      status: 'sent',
+      mediaType: 'text',
+    };
+
+    setDisplayedMessages((prev) => {
+      const updated = [...prev, tempMsg];
+      messagesCacheRef.current[selectedLead.id] = updated;
+      return updated;
+    });
+
+    onSendMessage(selectedLead.id, content, 'human', senderName);
     setMessageInput('');
+
+    setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 50);
   };
 
   const handleApplyTemplate = (text: string) => {
     setMessageInput(text);
     setShowTemplates(false);
+  };
+
+  const handleUseCopilotReply = (reply: string) => {
+    setMessageInput(reply);
+    setTimeout(() => {
+      const inputEl = document.getElementById('input-whatsapp-chat-message') as HTMLInputElement | null;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.selectionStart = inputEl.selectionEnd = inputEl.value.length;
+      }
+    }, 50);
   };
 
   const isHumanAssumed = selectedLead?.handoffState === 'humano_assumiu';
@@ -258,7 +523,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                       {lead.name}
                     </h4>
                     <span className="text-[10px] text-slate-400 shrink-0">
-                      {lastMsg?.timestamp || 'Hoje'}
+                      {formatConversationTime(lastMsg?.timestamp || lead.lastInteractionAt)}
                     </span>
                   </div>
 
@@ -347,25 +612,30 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                   <Phone className="w-3 h-3 text-slate-500 shrink-0" />
                   <span className="truncate">{selectedLead.formattedPhone}</span>
                   <span className="hidden sm:inline">•</span>
-                  <span className="hidden sm:inline text-slate-500 truncate">Última msg: {selectedLead.lastInteractionAt}</span>
+                  <span className="hidden sm:inline text-slate-500 truncate">
+                    Última msg: {formatHeaderTime(selectedLead.lastInteractionAt)}
+                  </span>
                 </p>
               </div>
             </div>
 
             {/* Quick Kill-switch button on header */}
             <div className="flex items-center gap-2 shrink-0">
-              {/* Botão Customer 360 — só no mobile (no desktop o painel já é visível) */}
-              {isNarrow && (
-                <button
-                  id="btn-open-profile"
-                  onClick={() => setProfileOpen(true)}
-                  className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
-                  title="Abrir perfil do paciente"
-                  aria-label="Abrir perfil"
-                >
-                  <User className="w-4 h-4" />
-                </button>
-              )}
+              {/* Botão Customer 360 — retrátil para não espremer telas menores que XL */}
+              <button
+                id="btn-open-profile"
+                onClick={() => setProfileOpen(!profileOpen)}
+                className={`p-2 rounded-lg border text-slate-200 transition-colors xl:hidden flex items-center gap-1.5 ${
+                  profileOpen
+                    ? 'bg-sky-600 border-sky-500 text-white'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700'
+                }`}
+                title="Abrir perfil 360 do paciente"
+                aria-label="Abrir perfil"
+              >
+                <User className="w-4 h-4" />
+                <span className="hidden sm:inline text-xs font-semibold">Perfil 360</span>
+              </button>
               <button
                 id="btn-toggle-handoff-header"
                 onClick={() => onToggleHandoff(selectedLead.id)}
@@ -441,10 +711,15 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
 
           {/* Messages Thread (WhatsApp Style) */}
           <div className="flex-1 p-4 overflow-y-auto space-y-3 bg-[radial-gradient(#1e293b_1px,transparent_1px)] [background-size:16px_16px]">
-            {selectedLead.messages.map((msg) => {
+            {displayedMessages.map((msg) => {
               const isPatient = msg.sender === 'patient';
               const isAi = msg.sender === 'ai';
               const isHuman = msg.sender === 'human';
+
+              const audioSrc = getAudioSrc(msg);
+              const imageSrc = getImageSrc(msg);
+              const isAudio = isAudioMessage(msg) || Boolean(audioSrc);
+              const isImage = isImageMessage(msg) || Boolean(imageSrc);
 
               return (
                 <div
@@ -482,10 +757,57 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                         : 'bg-gradient-to-br from-sky-950/90 to-slate-900 text-sky-100 rounded-tr-sm border border-sky-600/40'
                     }`}
                   >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    {/* Áudio / Mensagem de voz */}
+                    {isAudio && (
+                      <div className="my-1">
+                        <audio
+                          controls
+                          className="w-full max-w-[270px] h-9 my-1 accent-indigo-500 rounded-lg bg-slate-900/60"
+                          src={audioSrc || msg.mediaUrl || msg.content}
+                        />
+                        {/* Se houver transcrição do áudio gravada no texto */}
+                        {msg.content &&
+                          msg.content !== audioSrc &&
+                          !msg.content.startsWith('http') &&
+                          !msg.content.startsWith('data:') && (
+                            <p className="mt-1 text-[11px] text-slate-200 italic bg-black/30 p-2 rounded-lg border border-slate-700/60 whitespace-pre-wrap">
+                              🎤 <span className="font-semibold text-slate-100">Transcrição:</span>{' '}
+                              {msg.content}
+                            </p>
+                          )}
+                      </div>
+                    )}
+
+                    {/* Imagem / Foto / Comprovante PIX */}
+                    {isImage && (
+                      <div className="my-1">
+                        <img
+                          src={imageSrc || msg.mediaUrl || msg.content}
+                          alt="Mídia"
+                          className="rounded-lg max-h-56 max-w-full object-cover cursor-pointer hover:opacity-95 transition my-1 border border-slate-700/60 shadow-sm"
+                          onClick={() =>
+                            window.open(imageSrc || msg.mediaUrl || msg.content, '_blank')
+                          }
+                        />
+                        {/* Se houver legenda na foto */}
+                        {msg.content &&
+                          msg.content !== imageSrc &&
+                          !msg.content.startsWith('http') &&
+                          !msg.content.startsWith('data:') && (
+                            <p className="mt-1 text-xs text-slate-200 whitespace-pre-wrap">
+                              {msg.content}
+                            </p>
+                          )}
+                      </div>
+                    )}
+
+                    {/* Mensagem de texto normal */}
+                    {!isAudio && !isImage && (
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    )}
 
                     <div className="flex items-center justify-end gap-1 mt-1 text-[10px] text-slate-400">
-                      <span>{msg.timestamp}</span>
+                      <span>{formatMessageTime(msg.timestamp)}</span>
                       {!isPatient && <CheckCheck className="w-3.5 h-3.5 text-sky-400" />}
                     </div>
                   </div>
@@ -502,7 +824,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                 <Sparkles className="w-3.5 h-3.5 text-sky-400" />
                 Templates:
               </span>
-              {QUICK_TEMPLATES.map((tmpl) => (
+              {(isTourism ? TURISMO_QUICK_TEMPLATES : QUICK_TEMPLATES).map((tmpl) => (
                 <button
                   key={tmpl.id}
                   onClick={() => handleApplyTemplate(tmpl.text)}
@@ -555,32 +877,31 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
       )}
 
       {/* 3. Right Column: Customer 360 Profile
-           - md+: coluna fixa sempre visível
-           - <md: drawer lateral retrátil (slide from right + backdrop) */}
+           - xl+: coluna visível ao lado
+           - <xl: drawer lateral retrátil suave com backdrop */}
       {selectedLead && (
         <>
-          {/* Backdrop do drawer — só mobile quando aberto */}
-          {isNarrow && profileOpen && (
+          {/* Backdrop do drawer — visível em telas menores que xl quando aberto */}
+          {profileOpen && (
             <div
-              className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm md:hidden"
+              className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm xl:hidden"
               onClick={() => setProfileOpen(false)}
               aria-hidden="true"
             />
           )}
           <div
-            className={`md:relative md:flex md:w-80 lg:w-96
-              fixed inset-y-0 right-0 z-50 w-[88%] max-w-sm
+            className={`xl:relative xl:flex xl:w-80 2xl:w-96
+              fixed inset-y-0 right-0 z-50 w-[88%] max-w-sm bg-slate-900 border-l border-slate-800
               transform transition-transform duration-200 ease-out
-              ${profileOpen || !isNarrow ? 'translate-x-0' : 'translate-x-full'}
-              md:translate-x-0`}
+              ${profileOpen ? 'translate-x-0' : 'translate-x-full xl:translate-x-0'}`}
           >
-            <div className="relative h-full">
-              {/* Botão fechar — só mobile quando drawer aberto */}
-              {isNarrow && profileOpen && (
+            <div className="relative h-full w-full">
+              {/* Botão fechar — visível em telas < xl quando drawer aberto */}
+              {profileOpen && (
                 <button
                   id="btn-close-profile"
                   onClick={() => setProfileOpen(false)}
-                  className="absolute top-3 right-3 z-10 p-1.5 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-700 text-slate-200"
+                  className="xl:hidden absolute top-3 right-3 z-10 p-1.5 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-700 text-slate-200"
                   title="Fechar perfil"
                   aria-label="Fechar perfil"
                 >
@@ -588,10 +909,11 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({
                 </button>
               )}
               <CustomerProfile
-                lead={selectedLead}
+                lead={liveLead || selectedLead}
                 onUpdateStage={(stage) => onUpdateStage(selectedLead.id, stage)}
                 onToggleHandoff={() => onToggleHandoff(selectedLead.id)}
                 onAddNote={(note) => onAddInternalNote(selectedLead.id, note)}
+                onUseCopilotReply={handleUseCopilotReply}
               />
             </div>
           </div>

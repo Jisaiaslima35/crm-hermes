@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient';
+export { supabase };
 import type {
   Tenant,
   Lead,
@@ -32,6 +33,10 @@ export interface DbTenant {
   // Interruptor Mestre de Plantão IA (migration 20260915)
   // Pode vir null/undefined em tenants pré-migração — default true no mapper.
   ai_auto_reply_enabled?: boolean | null;
+  // Grade horária e capacidade de atendimento (JSONB)
+  schedule_rules?: any;
+  // Regras de follow-up / resgate automático (JSONB)
+  followup_rules?: any;
 }
 
 export interface DbLead {
@@ -49,6 +54,13 @@ export interface DbLead {
   appointment_schedule: string | null;
   last_interaction: string;
   created_at: string;
+  // Copiloto JEV (Customer 360)
+  conversion_probability?: number | null;
+  negotiation_stage?: string | null;
+  current_objection?: string | null;
+  copilot_guidance?: string | null;
+  suggested_reply?: string | null;
+  last_copilot_eval_at?: string | null;
 }
 
 export interface DbMessage {
@@ -59,6 +71,8 @@ export interface DbMessage {
   sender_name: string;
   content: string;
   created_at: string;
+  media_type?: string | null;
+  media_url?: string | null;
 }
 
 // ============================================================================
@@ -82,6 +96,9 @@ function dbTenantToTenant(row: DbTenant): Tenant {
     phone: row.phone,
     city: row.city,
     logoColor: '#10b981',
+    logoUrl: row.logo_url || undefined,
+    primaryColor: row.primary_color || undefined,
+    businessNiche: row.business_niche || undefined,
     aiEngine: {
       mode: row.ai_mode,
       hermesEndpoint: '',
@@ -113,6 +130,8 @@ function dbTenantToTenant(row: DbTenant): Tenant {
     },
     createdAt: row.created_at,
     aiAutoReplyEnabled: row.ai_auto_reply_enabled ?? true,
+    scheduleRules: row.schedule_rules || undefined,
+    followupRules: row.followup_rules || undefined,
   };
 }
 
@@ -135,6 +154,12 @@ function dbLeadToLead(row: DbLead): Lead {
     appointmentTimeSlot: row.appointment_schedule ?? undefined,
     silenceHours: 0,
     lastInteractionAt: row.last_interaction,
+    conversionProbability: row.conversion_probability ?? 0,
+    negotiationStage: row.negotiation_stage ?? 'primeiro_contato',
+    currentObjection: row.current_objection ?? 'nenhuma',
+    copilotGuidance: row.copilot_guidance ?? undefined,
+    suggestedReply: row.suggested_reply ?? undefined,
+    lastCopilotEvalAt: row.last_copilot_eval_at ?? undefined,
     messages,
     internalNotes: [],
     createdAt: row.created_at,
@@ -149,6 +174,8 @@ function dbMessageToMessage(row: DbMessage): LeadMessage {
     content: row.content,
     timestamp: row.created_at,
     status: 'delivered',
+    mediaType: (row.media_type as any) || 'text',
+    mediaUrl: row.media_url || undefined,
   };
 }
 
@@ -168,11 +195,12 @@ export async function getTenants(): Promise<Tenant[]> {
 export async function getLeads(tenantId: string): Promise<Lead[]> {
   const { data, error } = await supabase
     .from('leads')
-    .select('*')
+    .select('id, tenant_id, name, phone, stage, priority, insurance, clinical_summary, symptoms, appointment_schedule, internal_notes, last_interaction, conversion_probability, negotiation_stage, current_objection, copilot_guidance, suggested_reply, handoff_state, last_copilot_eval_at, created_at, updated_at, trip_destination')
     .eq('tenant_id', tenantId)
-    .order('last_interaction', { ascending: false });
+    .order('updated_at', { ascending: false, nullsFirst: false })
+    .limit(2000);
   if (error) throw new Error(`getLeads: ${error.message}`);
-  return (data ?? []).map(dbLeadToLead);
+  return (data ?? []).map((row) => dbLeadToLead(row as DbLead));
 }
 
 export async function getMessages(leadId: string): Promise<LeadMessage[]> {
@@ -180,7 +208,8 @@ export async function getMessages(leadId: string): Promise<LeadMessage[]> {
     .from('messages')
     .select('*')
     .eq('lead_id', leadId)
-    .order('created_at', { ascending: true });
+    .order('created_at', { ascending: true })
+    .limit(100);
   if (error) throw new Error(`getMessages: ${error.message}`);
   return (data ?? []).map(dbMessageToMessage);
 }
@@ -248,7 +277,7 @@ export async function createLead(input: {
       name: input.name,
       phone: input.phone,
       clinical_summary: input.mainComplaint ?? '',
-      stage: 'novo_contato',
+      stage: 'iniciou_conversa',
       handoff_state: 'ia_ativa',
       insurance: input.insurance ?? 'particular',
       priority: input.priority ?? 'normal',
@@ -303,6 +332,8 @@ export async function upsertTenantMeta(input: {
   byok_provider?: string;
   byok_api_key?: string;
   byok_model?: string;
+  schedule_rules?: any;
+  followup_rules?: any;
 }): Promise<void> {
   const payload: Record<string, unknown> = {
     id: input.id,
@@ -321,6 +352,8 @@ export async function upsertTenantMeta(input: {
   if (input.byok_provider !== undefined) payload.byok_provider = input.byok_provider;
   if (input.byok_api_key !== undefined) payload.byok_api_key = input.byok_api_key;
   if (input.byok_model !== undefined) payload.byok_model = input.byok_model;
+  if (input.schedule_rules !== undefined) payload.schedule_rules = input.schedule_rules;
+  if (input.followup_rules !== undefined) payload.followup_rules = input.followup_rules;
 
   const { error } = await supabase
     .from('tenants')
@@ -383,17 +416,35 @@ export function subscribeLeads(
   tenantId: string,
   onChange: RealtimeLeadsHandler
 ) {
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  const pendingUpdates = new Map<string, { lead: DbLead; event: 'INSERT' | 'UPDATE' | 'DELETE' }>();
+
   const channel = supabase
     .channel(`live-leads:${tenantId}`)
     .on(
       'postgres_changes',
       { event: '*', schema: 'public', table: 'leads', filter: `tenant_id=eq.${tenantId}` },
       (payload) => {
-        onChange(payload.new as DbLead, payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE');
+        const lead = payload.new as DbLead;
+        const ev = payload.eventType as 'INSERT' | 'UPDATE' | 'DELETE';
+        const leadId = (lead && lead.id) || (payload.old as any)?.id;
+        if (leadId) {
+          pendingUpdates.set(leadId, { lead, event: ev });
+        }
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          pendingUpdates.forEach(({ lead: l, event: e }) => {
+            onChange(l, e);
+          });
+          pendingUpdates.clear();
+          debounceTimer = null;
+        }, 300);
       }
     )
     .subscribe();
   return () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    pendingUpdates.clear();
     void supabase.removeChannel(channel);
   };
 }
@@ -552,6 +603,81 @@ const crmWebhookBase =
   (import.meta.env.VITE_CRM_WEBHOOK_URL as string | undefined) ||
   'https://crm-webhook.automacaojs.us';
 
+export interface KanbanStageRow {
+  id: string;
+  slug: string;
+  title: string;
+  position: number;
+  ai_keywords?: string[];
+  ai_prompt_hint?: string;
+  has_automation: boolean;
+}
+
+export async function fetchKanbanStages(tenantId: string): Promise<KanbanStageRow[] | null> {
+  try {
+    const res = await fetch(
+      `${crmWebhookBase}/api/kanban/stages?tenant_id=${encodeURIComponent(tenantId)}`
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    return (json?.stages as KanbanStageRow[]) || [];
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchKanbanAutomations(tenantId: string): Promise<any[] | null> {
+  try {
+    const res = await fetch(
+      `${crmWebhookBase}/api/kanban/automations?tenant_id=${encodeURIComponent(tenantId)}`
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.automations || [];
+  } catch {
+    return null;
+  }
+}
+
+/** Carimba os gatilhos quando o card e movido MANUALMENTE (funil dinamico/turismo):
+ *  cotacao_enviada -> arma cobranca D+1; perdido -> arma Segunda Chance D+1;
+ *  lead_real -> arma a cadencia infinita de reativacao. */
+export async function stampStageTransition(
+  leadId: string,
+  tenantId: string,
+  targetSlug: string
+): Promise<void> {
+  try {
+    const nowIso = new Date().toISOString();
+    if (targetSlug === 'cotacao_enviada') {
+      await supabase
+        .from('leads')
+        .update({ last_quote_at: nowIso, quote_followup_sent: false })
+        .eq('id', leadId);
+    } else if (targetSlug === 'perdido') {
+      await supabase
+        .from('leads')
+        .update({ perdido_at: nowIso, lost_followup_sent: false })
+        .eq('id', leadId);
+    } else if (targetSlug === 'lead_real') {
+      const next = new Date(Date.now() + 4 * 24 * 3600 * 1000).toISOString();
+      await supabase.from('lead_reactivation_schedules').upsert(
+        {
+          tenant_id: tenantId,
+          lead_id: leadId,
+          armed_at: nowIso,
+          next_due_at: next,
+          step_index: 0,
+          is_active: true,
+        },
+        { onConflict: 'lead_id' }
+      );
+    }
+  } catch (e) {
+    console.warn('[stampStageTransition] falhou:', e);
+  }
+}
+
 export async function checkEvolutionInstanceExists(
   instanceName: string
 ): Promise<boolean> {
@@ -593,7 +719,13 @@ export async function setEvolutionWebhook(
             webhook_by_events: true,
             webhookByEvents: true,
             byEvents: true,
-            events: ['MESSAGES_UPSERT', 'CONNECTION_UPDATE'],
+            events: [
+              'MESSAGES_UPSERT',
+              'MESSAGES_UPDATE',
+              'CHATS_UPSERT',
+              'CONTACTS_UPSERT',
+              'CONNECTION_UPDATE',
+            ],
           },
         }),
       }
@@ -734,4 +866,191 @@ export async function requestPairingQrCode(
   }
 
   return { base64, code, pairingCode, state };
+}
+
+export interface EvolutionInstanceInfo {
+  name: string;
+  connectionStatus: string;
+  number?: string;
+}
+
+export async function fetchAllEvolutionInstances(): Promise<EvolutionInstanceInfo[]> {
+  if (!evolutionBase || !evolutionKey) return [];
+  try {
+    const res = await fetch(`${evolutionBase}/instance/fetchInstances`, {
+      headers: { apikey: evolutionKey },
+    });
+    if (!res.ok) return [];
+    const list = await res.json();
+    if (!Array.isArray(list)) return [];
+    return list.map((item: any) => ({
+      name: item.name || item.instance?.instanceName || item.instanceName || '',
+      connectionStatus: item.connectionStatus || item.status || 'unknown',
+      number: item.ownerJid || item.number || '',
+    })).filter((i: { name: string }) => Boolean(i.name));
+  } catch {
+    return [];
+  }
+}
+
+// ================= Prospector Integrado =================
+
+export async function mineProspector(payload: {
+  tenant_id: string;
+  category: string;
+  city: string;
+  neighborhood?: string;
+  limit?: number;
+}): Promise<string | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/prospector/mine`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.job_id || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function dispatchProspector(payload: {
+  tenant_id: string;
+  message: string;
+  limit?: number;
+  lead_ids?: string[];
+  media_url?: string;
+  media_base64?: string;
+  media_mimetype?: string;
+}): Promise<string | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/prospector/dispatch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.job_id || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getProspectorJob(jobId: string): Promise<any | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/prospector/jobs/${jobId}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.job || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getProspectorStats(tenantId: string): Promise<any | null> {
+  try {
+    const res = await fetch(
+      `${crmWebhookBase}/api/prospector/stats?tenant_id=${encodeURIComponent(tenantId)}`
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.stats || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getProspectorLeads(tenantId: string): Promise<any[] | null> {
+  try {
+    const res = await fetch(
+      `${crmWebhookBase}/api/prospector/leads?tenant_id=${encodeURIComponent(tenantId)}&limit=300`
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.leads || [];
+  } catch {
+    return null;
+  }
+}
+
+// ================= Provisionador Global + CRUD de Etapas =================
+
+export async function provisionTenant(payload: {
+  name: string;
+  business_niche: string;
+  phone?: string;
+  primary_color?: string;
+  logo_url?: string;
+  engine_mode?: string;
+  admin_email: string;
+  password: string;
+}): Promise<any | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/admin/tenants/provision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function createKanbanStage(payload: {
+  tenant_id: string;
+  title: string;
+  semantic_description?: string;
+  trigger_keywords?: string[];
+  color_accent?: string;
+}): Promise<any | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/kanban/stages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.stage || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateKanbanStage(
+  stageId: string,
+  payload: {
+    title?: string;
+    semantic_description?: string;
+    trigger_keywords?: string[];
+    color_accent?: string;
+    position?: number;
+    has_automation?: boolean;
+  }
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/kanban/stages/${stageId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteKanbanStage(stageId: string): Promise<{ moved_leads: number; moved_to: string } | null> {
+  try {
+    const res = await fetch(`${crmWebhookBase}/api/kanban/stages/${stageId}`, { method: 'DELETE' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }

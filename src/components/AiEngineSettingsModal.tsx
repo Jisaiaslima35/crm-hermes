@@ -13,10 +13,32 @@ import {
   Loader2,
   X,
   Stethoscope,
+  Calendar,
+  Plus,
+  Trash2,
+  Users,
 } from 'lucide-react';
-import { Tenant, AiEngineConfig, AiEngineMode, AiProvider } from '../types';
+import {
+  Tenant,
+  AiEngineConfig,
+  AiEngineMode,
+  AiProvider,
+  ScheduleRules,
+  WeeklySlotRule,
+  FollowupRules,
+} from '../types';
 import { BYOK_PROVIDERS } from '../constants';
 import { deskcommService } from '../services/deskcommService';
+
+const DAYS_OF_WEEK = [
+  { value: 1, label: 'Segunda-feira' },
+  { value: 2, label: 'Terça-feira' },
+  { value: 3, label: 'Quarta-feira' },
+  { value: 4, label: 'Quinta-feira' },
+  { value: 5, label: 'Sexta-feira' },
+  { value: 6, label: 'Sábado' },
+  { value: 0, label: 'Domingo' },
+];
 
 interface AiEngineSettingsModalProps {
   activeTenant: Tenant;
@@ -33,6 +55,63 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
     ...activeTenant.aiEngine,
   });
 
+  const [scheduleRules, setScheduleRules] = useState<ScheduleRules>(() => {
+    const raw = activeTenant.scheduleRules || {};
+    if (Array.isArray(raw.weekly_slots) && raw.weekly_slots.length > 0) {
+      return {
+        enabled: raw.enabled !== false,
+        weekly_slots: raw.weekly_slots,
+        timezone: raw.timezone || 'America/Fortaleza',
+        slot_duration_minutes: raw.slot_duration_minutes || 30,
+      };
+    }
+    if (Array.isArray(raw.days_of_week) && raw.days_of_week.length > 0) {
+      const startTime = raw.time_slots?.[0] || '18:00';
+      const endTime = raw.time_slots?.[raw.time_slots.length - 1] || '20:00';
+      return {
+        enabled: raw.enabled !== false,
+        weekly_slots: raw.days_of_week.map((d) => ({
+          day_of_week: d,
+          start_time: startTime,
+          end_time: endTime,
+          max_capacity: 6,
+        })),
+        timezone: raw.timezone || 'America/Fortaleza',
+        slot_duration_minutes: raw.slot_duration_minutes || 30,
+      };
+    }
+    return {
+      enabled: true,
+      weekly_slots: [
+        {
+          day_of_week: 2,
+          start_time: '18:00',
+          end_time: '20:00',
+          max_capacity: 6,
+        },
+      ],
+      timezone: 'America/Fortaleza',
+      slot_duration_minutes: 30,
+    };
+  });
+
+  const [followupRules, setFollowupRules] = useState<FollowupRules>(() => {
+    const raw = (activeTenant.followupRules || {}) as Partial<FollowupRules>;
+    let mins = raw.silence_minutes;
+    if (mins === undefined) {
+      if (raw.silence_hours !== undefined) {
+        mins = Number(raw.silence_hours) * 60;
+      } else {
+        mins = 15;
+      }
+    }
+    return {
+      enabled: raw.enabled !== false,
+      silence_minutes: mins,
+      silence_hours: Math.max(1, Math.round(mins / 60)),
+    };
+  });
+
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<{
     success: boolean;
@@ -43,6 +122,46 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
   // Modelos descobertos via GET /v1/models após Testar Conexão.
   // Quando vazio, o select usa a lista estática de BYOK_PROVIDERS.
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+
+  const handleAddSlot = () => {
+    setScheduleRules((prev) => ({
+      ...prev,
+      weekly_slots: [
+        ...(prev.weekly_slots || []),
+        {
+          day_of_week: 1,
+          start_time: '18:00',
+          end_time: '20:00',
+          max_capacity: 6,
+        },
+      ],
+    }));
+  };
+
+  const handleRemoveSlot = (index: number) => {
+    setScheduleRules((prev) => ({
+      ...prev,
+      weekly_slots: (prev.weekly_slots || []).filter((_, i) => i !== index),
+    }));
+  };
+
+  const handleUpdateSlot = (
+    index: number,
+    field: keyof WeeklySlotRule,
+    value: string | number
+  ) => {
+    setScheduleRules((prev) => {
+      const updated = [...(prev.weekly_slots || [])];
+      updated[index] = {
+        ...updated[index],
+        [field]: value,
+      };
+      return {
+        ...prev,
+        weekly_slots: updated,
+      };
+    });
+  };
 
   const handleTestConnection = async () => {
     setIsTesting(true);
@@ -72,9 +191,26 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
 
   const handleSave = () => {
     setIsSaving(true);
+    const mins = followupRules.silence_minutes ?? 15;
+    const hours = Math.max(1, Math.round(mins / 60));
     const updatedTenant: Tenant = {
       ...activeTenant,
-      aiEngine: config,
+      aiEngine: {
+        ...config,
+        silenceThresholdHours: hours,
+        autoFollowup: followupRules.enabled,
+      },
+      scheduleRules: {
+        ...scheduleRules,
+        days_of_week: Array.from(
+          new Set((scheduleRules.weekly_slots || []).map((s) => s.day_of_week))
+        ),
+      },
+      followupRules: {
+        enabled: followupRules.enabled,
+        silence_minutes: mins,
+        silence_hours: hours,
+      },
     };
     onSaveTenant(updatedTenant);
     setTimeout(() => {
@@ -375,34 +511,227 @@ export const AiEngineSettingsModal: React.FC<AiEngineSettingsModalProps> = ({
               />
             </div>
 
-            <div className="flex items-center justify-between pt-2 border-t border-slate-800 text-xs">
-              <div className="flex items-center gap-2">
-                <Clock className="w-4 h-4 text-amber-400" />
-                <span className="text-slate-300 font-medium">Limite Radar de Silêncio:</span>
-                <select
-                  value={config.silenceThresholdHours}
-                  onChange={(e) =>
-                    setConfig({ ...config, silenceThresholdHours: Number(e.target.value) })
+            <div className="pt-3 border-t border-slate-800 space-y-3">
+              {/* Toggle de Follow-up Automático com Badge de Status */}
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/60 p-3 rounded-xl border border-slate-800">
+                <div className="flex items-center gap-2.5">
+                  <Clock className="w-4 h-4 text-amber-400" />
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold text-slate-200">
+                        Follow-up Automático:
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+                          followupRules.enabled
+                            ? 'bg-emerald-950/80 text-emerald-400 border-emerald-800/80'
+                            : 'bg-slate-800 text-slate-400 border-slate-700'
+                        }`}
+                      >
+                        {followupRules.enabled ? 'ATIVADO' : 'PAUSADO'}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-0.5">
+                      Régua de 2 tempos: cutucada rápida (15 min) + resgate amigável (24 horas).
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setFollowupRules((prev) => ({
+                      ...prev,
+                      enabled: !prev.enabled,
+                    }))
                   }
-                  className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white"
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    followupRules.enabled ? 'bg-emerald-600' : 'bg-slate-700'
+                  }`}
+                  role="switch"
+                  aria-checked={followupRules.enabled}
                 >
-                  <option value={2}>2 horas</option>
-                  <option value={4}>4 horas (Recomendado)</option>
-                  <option value={6}>6 horas</option>
-                  <option value={12}>12 horas</option>
-                  <option value={24}>24 horas</option>
-                </select>
+                  <span
+                    aria-hidden="true"
+                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      followupRules.enabled ? 'translate-x-5' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
               </div>
 
-              <label className="flex items-center gap-2 cursor-pointer">
+              {/* Select de Tempo de Silêncio para a 1ª Mensagem */}
+              <div className="flex items-center justify-between text-xs px-1">
+                <span className="text-slate-300 font-medium">
+                  Limite Radar de Silêncio (1ª Mensagem):
+                </span>
+                <select
+                  value={followupRules.silence_minutes ?? 15}
+                  onChange={(e) => {
+                    const mins = Number(e.target.value);
+                    setFollowupRules((prev) => ({
+                      ...prev,
+                      silence_minutes: mins,
+                      silence_hours: Math.max(1, Math.round(mins / 60)),
+                    }));
+                  }}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-400"
+                >
+                  <option value={10}>10 minutos</option>
+                  <option value={15}>15 minutos (Padrão)</option>
+                  <option value={30}>30 minutos</option>
+                  <option value={60}>1 hora</option>
+                  <option value={120}>2 horas</option>
+                  <option value={1440}>24 horas</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {/* Grade de Atendimento & Limite de Vagas por Dia (Fase Beatriz) */}
+          <div className="p-4 rounded-xl bg-slate-850 border border-slate-800 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-200">
+                <Calendar className="w-4 h-4 text-emerald-400" />
+                <span>Grade de Atendimento & Limite de Vagas por Dia</span>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer text-xs">
                 <input
                   type="checkbox"
-                  checked={config.autoFollowup}
-                  onChange={(e) => setConfig({ ...config, autoFollowup: e.target.checked })}
-                  className="rounded border-slate-700 text-sky-600 focus:ring-sky-500"
+                  checked={scheduleRules.enabled !== false}
+                  onChange={(e) =>
+                    setScheduleRules((prev) => ({ ...prev, enabled: e.target.checked }))
+                  }
+                  className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500"
                 />
-                <span className="text-slate-300 font-medium">Disparo Automático de Resgate</span>
+                <span className="text-[11px] font-semibold text-slate-300">
+                  Grade Ativa
+                </span>
               </label>
+            </div>
+
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Configure os horários e o teto diário de atendimentos. A IA não proporá nem confirmará consultas fora destes limites ou quando o limite de vagas for atingido.
+            </p>
+
+            {/* Lista de Slots */}
+            <div className="space-y-2.5">
+              {(!scheduleRules.weekly_slots || scheduleRules.weekly_slots.length === 0) ? (
+                <div className="p-4 rounded-xl border border-dashed border-slate-700/80 bg-slate-900/50 text-center">
+                  <p className="text-xs text-slate-400">
+                    Nenhuma regra de grade ou limite de vagas configurado.
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Clique em "+ Adicionar Regra / Horário" para cadastrar dias e turnos.
+                  </p>
+                </div>
+              ) : (
+                scheduleRules.weekly_slots.map((slot, index) => (
+                  <div
+                    key={index}
+                    className="p-3 bg-slate-900 border border-slate-800 hover:border-slate-700/80 rounded-xl flex flex-wrap sm:flex-nowrap items-center gap-3 transition-colors"
+                  >
+                    {/* Select Dia da Semana */}
+                    <div className="flex-1 min-w-[140px]">
+                      <label className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                        Dia da Semana
+                      </label>
+                      <select
+                        value={slot.day_of_week}
+                        onChange={(e) =>
+                          handleUpdateSlot(index, 'day_of_week', Number(e.target.value))
+                        }
+                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                      >
+                        {DAYS_OF_WEEK.map((d) => (
+                          <option key={d.value} value={d.value}>
+                            {d.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Horário Início */}
+                    <div className="w-24">
+                      <label className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                        Início
+                      </label>
+                      <input
+                        type="time"
+                        value={slot.start_time}
+                        onChange={(e) =>
+                          handleUpdateSlot(index, 'start_time', e.target.value)
+                        }
+                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white text-center font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+
+                    {/* Horário Fim */}
+                    <div className="w-24">
+                      <label className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                        Fim
+                      </label>
+                      <input
+                        type="time"
+                        value={slot.end_time}
+                        onChange={(e) =>
+                          handleUpdateSlot(index, 'end_time', e.target.value)
+                        }
+                        className="w-full bg-slate-850 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white text-center font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+
+                    {/* Limite de Vagas */}
+                    <div className="w-28">
+                      <label className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                        Vagas / Dia
+                      </label>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min={1}
+                          max={50}
+                          value={slot.max_capacity}
+                          onChange={(e) =>
+                            handleUpdateSlot(
+                              index,
+                              'max_capacity',
+                              Math.max(1, parseInt(e.target.value) || 1)
+                            )
+                          }
+                          className="w-full bg-slate-850 border border-slate-700 rounded-lg pl-2.5 pr-7 py-1.5 text-xs text-white text-center font-bold focus:outline-none focus:border-emerald-500"
+                        />
+                        <Users className="w-3.5 h-3.5 text-slate-500 absolute right-2.5 top-2 pointer-events-none" />
+                      </div>
+                    </div>
+
+                    {/* Botão Excluir */}
+                    <div className="self-end sm:self-center pt-5 sm:pt-4">
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveSlot(index)}
+                        title="Excluir regra"
+                        className="p-2 text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 border border-transparent hover:border-rose-900/60 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Botão Adicionar Regra */}
+            <div className="pt-1">
+              <button
+                type="button"
+                id="btn-add-schedule-slot"
+                onClick={handleAddSlot}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-emerald-400 hover:text-emerald-300 border border-slate-700 hover:border-emerald-600/50 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>+ Adicionar Regra / Horário</span>
+              </button>
             </div>
           </div>
         </div>

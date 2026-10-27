@@ -14,14 +14,25 @@ import {
   Wifi,
   Radio,
   Plug,
+  CalendarDays,
+  BarChart3,
+  Rocket,
+  X,
+  Plane,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
+import { nicheOf, brandColorOf } from '../utils/niche';
 
 export type LiveView =
+  | 'dashboard'
   | 'kanban'
   | 'inbox'
   | 'leads'
+  | 'agenda'
   | 'radar'
+  | 'campanhas_reativacao'
+  | 'prospeccao'
+  | 'provisionar'
   | 'integrations'
   | 'whatsapp'
   | 'ai_settings'
@@ -70,32 +81,77 @@ export const Sidebar: React.FC<SidebarProps> = ({
     userRole === 'clinic_admin' ||
     userRole === 'admin';
 
+  const isTourism =
+    activeTenant.specialty?.toLowerCase().includes('turismo') ||
+    activeTenant.name.toLowerCase().includes('esvc');
+  const niche = nicheOf(activeTenant);
+  const brandColor = brandColorOf(activeTenant);
+
   return (
     <aside
       id="crm-sidebar"
-      className={`w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col justify-between shrink-0 h-screen select-none z-50
+      className={`w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col justify-between shrink-0 h-screen select-none z-50 print:hidden
         fixed md:static inset-y-0 left-0 transform transition-transform duration-200 ease-out
         ${isOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`}
     >
-      {/* Brand & Clinic Info */}
+      {/* Brand & Clinic/Agency Info */}
       <div className="flex flex-col">
         {/* Logo Header */}
         <div className="p-4 border-b border-slate-800/80 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-600/20">
-              <Activity className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <div className="flex items-center gap-1.5">
-                <span className="font-extrabold text-base tracking-tight text-white">Deskcomm</span>
-                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30">
-                  CLINIC
-                </span>
+            {isTourism ? (
+              <div className="flex items-center gap-2.5">
+                {activeTenant.logoUrl ? (
+                  <img src={activeTenant.logoUrl} alt={activeTenant.name} className="h-9 max-w-[130px] rounded-lg bg-white p-1 object-contain shrink-0" />
+                ) : (
+                  <div className="w-9 h-9 rounded-xl bg-[#091428] border border-emerald-500/50 flex items-center justify-center shadow-lg shadow-emerald-500/10 shrink-0">
+                    <Plane className="w-5 h-5 text-emerald-400 rotate-[-25deg]" />
+                  </div>
+                )}
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-extrabold text-base tracking-tight text-white">ESVC</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                      TURISMO
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-sky-400 font-semibold tracking-wider uppercase">
+                    Agência de Viagens
+                  </p>
+                </div>
               </div>
-              <p className="text-[10px] text-slate-400 font-medium">
-                {isSuperAdmin ? 'AI Sales OS for WhatsApp' : 'Atendimento Clínico Inteligente'}
-              </p>
-            </div>
+            ) : (
+              <>
+                {activeTenant.logoUrl ? (
+                  <img src={activeTenant.logoUrl} alt={activeTenant.name} className="h-9 max-w-[130px] rounded-lg bg-white p-1 object-contain shrink-0" />
+                ) : (
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-600/20">
+                    <Activity className="w-5 h-5 text-white" />
+                  </div>
+                )}
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-extrabold text-base tracking-tight text-white">Deskcomm</span>
+                    {niche === 'clinica' && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30">
+                        CLINIC
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-slate-400 font-medium">
+                    {isSuperAdmin ? 'AI Sales OS for WhatsApp' : 'Atendimento Clínico Inteligente'}
+                  </p>
+                </div>
+              </>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Fechar menu"
+              className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer ml-auto"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
@@ -103,17 +159,33 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="p-3 m-3 rounded-xl bg-slate-800/50 border border-slate-700/60">
           <div className="flex items-start gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center shrink-0 mt-0.5">
-              <Stethoscope className="w-4 h-4 text-emerald-400" />
+              {isTourism ? (
+                <Plane className="w-4 h-4 text-emerald-400" />
+              ) : (
+                <Stethoscope className="w-4 h-4 text-emerald-400" />
+              )}
             </div>
             <div className="min-w-0 flex-1">
-              <p className="text-xs font-semibold text-slate-200 truncate" title={activeTenant.name}>
+              <p className="text-xs font-semibold truncate" style={{ color: brandColor }} title={activeTenant.name}>
                 {activeTenant.name}
               </p>
-              <p className="text-[11px] text-slate-400 truncate">{activeTenant.doctorName}</p>
+              <p className="text-[11px] text-slate-400 truncate">
+                {isTourism ? 'Consultor de Viagens' : activeTenant.doctorName}
+              </p>
               <div className="flex items-center gap-1.5 mt-1.5">
-                <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-[10px] text-emerald-400 font-medium">
-                  {isClinic
+                <span
+                  className={`inline-block w-2 h-2 rounded-full ${
+                    activeTenant.aiAutoReplyEnabled ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                  }`}
+                />
+                <span
+                  className={`text-[10px] font-medium ${
+                    activeTenant.aiAutoReplyEnabled ? 'text-emerald-400' : 'text-amber-400'
+                  }`}
+                >
+                  {isTourism && !activeTenant.aiAutoReplyEnabled
+                    ? 'Bot OFF (Humano Responde)'
+                    : isClinic
                     ? `Assistente ${activeTenant.aiEngine.personaName} Ativa`
                     : activeTenant.aiEngine.mode === 'hermes_vps'
                     ? 'Hermes VPS Ativo'
@@ -132,12 +204,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-sky-600 hover:bg-sky-500 active:scale-[0.98] text-white text-xs font-semibold rounded-lg shadow-sm transition-all cursor-pointer"
           >
             <PlusCircle className="w-4 h-4" />
-            <span>Novo Atendimento / Lead</span>
+            <span>{isTourism ? 'Novo Atendimento / Viajante' : 'Novo Atendimento / Lead'}</span>
           </button>
         </div>
 
         {/* Navigation Menu */}
         <nav className="px-3 space-y-1 mt-1">
+          {/* === VISÃO EXECUTIVA — Dashboard no TOPO (msg 5615) === */}
+          <div className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-emerald-400/80">
+            Visão Executiva
+          </div>
+
+          <button
+            id="nav-dashboard"
+            onClick={() => setCurrentView('dashboard')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+              currentView === 'dashboard'
+                ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/30'
+                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <BarChart3 className="w-4 h-4" />
+              <span>Dashboard Geral</span>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+              NOV
+            </span>
+          </button>
+
           {/* === VISÃO ENXUTA — visível pra TODOS os perfis === */}
           <div className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
             Operação WhatsApp
@@ -157,7 +252,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <span>Kanban & Pipeline</span>
             </div>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-              6 Fases
+              {isTourism ? '7 Fases' : 'Pipeline'}
             </span>
           </button>
 
@@ -201,6 +296,46 @@ export const Sidebar: React.FC<SidebarProps> = ({
             )}
           </button>
 
+          {(isSuperAdmin || isClinic) && (
+            <button
+              id="nav-campanhas"
+              onClick={() => setCurrentView('campanhas_reativacao')}
+              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                currentView === 'campanhas_reativacao'
+                  ? 'bg-rose-600/20 text-rose-300 border border-rose-500/30'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <Rocket className="w-4 h-4 text-rose-400" />
+                <span>Campanhas & Reativação</span>
+              </div>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
+                ANTI-BAN
+              </span>
+            </button>
+          )}
+
+          {niche !== 'clinica' && (
+            <button
+              id="nav-prospeccao"
+              onClick={() => setCurrentView('prospeccao')}
+              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                currentView === 'prospeccao'
+                  ? 'bg-rose-600/20 text-rose-300 border border-rose-500/30'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <span className="text-sm leading-none">🎯</span>
+                <span>Prospecção Ativa</span>
+              </div>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
+                OUTBOUND
+              </span>
+            </button>
+          )}
+
           <button
             id="nav-leads"
             onClick={() => setCurrentView('leads')}
@@ -211,7 +346,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
             }`}
           >
             <Users className="w-4 h-4" />
-            <span>Pacientes & Leads</span>
+            <span>{niche === 'turismo' ? 'Viajantes & Cotações' : niche === 'comercial' ? 'Clientes & Leads' : 'Pacientes & Leads'}</span>
+          </button>
+
+          <button
+            id="nav-agenda"
+            onClick={() => setCurrentView('agenda')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+              currentView === 'agenda'
+                ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
+                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <CalendarDays className="w-4 h-4" />
+              <span>Agenda</span>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+              Semana · Mês
+            </span>
           </button>
 
           <button
@@ -339,12 +492,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <p className="text-xs font-medium text-slate-200 truncate">
                 {userRole === 'super_admin'
                   ? 'Super Admin (SaaS)'
+                  : isTourism
+                  ? 'Admin ESVC Turismo'
                   : userRole === 'clinic_admin' || userRole === 'admin'
                   ? 'Admin da Clínica'
-                  : 'Atendente / Médico'}
+                  : 'Atendente / Operador'}
               </p>
               <p className="text-[10px] text-slate-500">
-                {isClinic ? 'Visão da clínica' : 'RBAC Ativo'}
+                {isTourism ? 'Gestão Turismo' : isClinic ? 'Visão da clínica' : 'RBAC Ativo'}
               </p>
             </div>
           </div>
