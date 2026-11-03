@@ -448,6 +448,44 @@ def _heuristic_copilot_analysis_turismo(lead_name: str, conversa_text: str) -> d
     }
 
 
+_RE_CAMPO_COPILOT = {
+    "conversion_probability": re.compile(r'"conversion_probability"\s*:\s*(-?\d+(?:\.\d+)?)'),
+    "negotiation_stage": re.compile(r'"negotiation_stage"\s*:\s*"([^"]{0,160})"'),
+    "current_objection": re.compile(r'"current_objection"\s*:\s*"([^"]{0,400})"'),
+    "suggested_reply": re.compile(r'"suggested_reply"\s*:\s*"([^"]{0,400})"'),
+    "copilot_guidance": re.compile(r'"copilot_guidance"\s*:\s*"([^"]{0,400})"'),
+}
+
+
+def _parse_copilot_json(texto: str) -> Optional[dict[str, Any]]:
+    """JSON do Copiloto, tolerante a string quebrada do modelo.
+
+    03/11/2026 (sprint Copiloto FDE): o gpt-oss-120b (via Hermes-fallbacks)
+    às vezes devolve texto multilinha SEM escape — JSON inválido — e o
+    Copiloto caía na heurística, perdendo a análise real. Aqui reparamos os
+    campos por regex: a análise da LLM é aproveitada mesmo com JSON torto.
+    """
+    if not texto:
+        return None
+    try:
+        parsed = json.loads(texto)
+        if isinstance(parsed, dict) and "conversion_probability" in parsed:
+            return parsed
+    except Exception:
+        pass
+    m = _RE_CAMPO_COPILOT["conversion_probability"].search(texto)
+    if not m:
+        return None
+    out: dict[str, Any] = {"conversion_probability": int(float(m.group(1)))}
+    for campo, rx in _RE_CAMPO_COPILOT.items():
+        if campo == "conversion_probability":
+            continue
+        mm = rx.search(texto)
+        if mm:
+            out[campo] = mm.group(1).strip()
+    return out
+
+
 def _heuristic_copilot_analysis(lead_name: str, conversa_text: str) -> dict[str, Any]:
     """Análise heurística contextual rica executada caso a chamada LLM falhe ou demore.
     Impede que o JEV congele em 50% / 'primeiro_contato'.
@@ -570,37 +608,59 @@ async def _call_llm_json(
 
     last_error = None
     for target in endpoints_to_try:
-        try:
-            payload = {
-                "model": target["model"],
-                "messages": [
-                    {"role": "system", "content": chosen_system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 400,
-                "stream": False,
-            }
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.post(target["url"], json=payload, headers=target["headers"])
-                if r.status_code == 200:
-                    data = r.json()
-                    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-                    if content:
-                        cleaned = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
-                        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-                        first = cleaned.find("{")
-                        last = cleaned.rfind("}")
-                        if first >= 0 and last > first:
-                            cleaned = cleaned[first:last + 1]
-                        parsed = json.loads(cleaned)
-                        if isinstance(parsed, dict) and "conversion_probability" in parsed:
-                            return parsed
-                else:
-                    last_error = f"HTTP {r.status_code}: {r.text[:120]}"
-        except Exception as exc:
-            last_error = str(exc)
-            logger.debug("[JEV_COPILOT] Tentativa com %s falhou: %s", target["model"], exc)
+        # 03/11/2026 (sprint Copiloto FDE): o 9Router às vezes devolve 404
+        # transitório (camada Next.js) e o Hermes-fallbacks leva >8s quando a
+        # fila do provedor está cheia. Sem retry, o Copiloto caía na heurística
+        # e o relatório perdia veracidade. Timeout maior + 1 nova tentativa no
+        # alvo primário.
+        tentativas = 2 if target["model"] == "Hermes-fallbacks" else 1
+        for tentativa in range(tentativas):
+            try:
+                payload = {
+                    "model": target["model"],
+                    "messages": [
+                        {"role": "system", "content": chosen_system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 600,
+                    "stream": False,
+                }
+                async with httpx.AsyncClient(timeout=25.0) as client:
+                    r = await client.post(target["url"], json=payload, headers=target["headers"])
+                    if r.status_code == 200:
+                        data = r.json()
+                        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+                        if content:
+                            cleaned = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+                            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+                            first = cleaned.find("{")
+                            last = cleaned.rfind("}")
+                            if first >= 0 and last > first:
+                                cleaned = cleaned[first:last + 1]
+                            parsed = _parse_copilot_json(cleaned)
+                            if parsed and "conversion_probability" in parsed:
+                                # 03/11/2026 (sprint Copiloto FDE): log do SUCESSO
+                                # da LLM — antes só a heurística aparecia no pm2 e
+                                # não dava pra provar que o Copiloto pensou.
+                                logger.info(
+                                    "[JEV_COPILOT] LLM ok via %s (tentativa %s/%s) — analise real, sem heuristica",
+                                    target["model"], tentativa + 1, tentativas,
+                                )
+                                return parsed
+                            last_error = "resposta sem conversion_probability"
+                    else:
+                        last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+                        logger.info(
+                            "[JEV_COPILOT] Alvo %s respondeu HTTP %s (tentativa %s/%s): %s",
+                            target["model"], r.status_code, tentativa + 1, tentativas, r.text[:160],
+                        )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.info(
+                    "[JEV_COPILOT] Alvo %s falhou (tentativa %s/%s): %s: %s",
+                    target["model"], tentativa + 1, tentativas, type(exc).__name__, str(exc)[:180],
+                )
 
     logger.info("[JEV_COPILOT] LLM fallback acionado (%s). Aplicando heurística contextual (turismo=%s, peixaria=%s).", last_error, is_tourism, is_peixaria)
     if is_peixaria:

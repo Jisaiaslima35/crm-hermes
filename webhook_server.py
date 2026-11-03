@@ -42,6 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
 from jev_decision import avaliar_lead_clinico, DecisaoClinicaJEV
 from jev_copilot_engine import evaluate_lead_copilot
+from fde_metrics import bloco_operacao as fde_bloco_operacao, status_copiloto as fde_status_copiloto
 from media_handler import (
     get_media_base64_from_evolution,
     process_audio_message,
@@ -5976,8 +5977,46 @@ async def metrics_snapshot(request: Request, tenant_id: str, days_back: int = 7)
             out["tenant_nome"] = meta.get("name") or ""
     out["fonte"] = "crm-hermes /api/v1/metrics/snapshot"
     out["origem_dados"] = origem
+    # 03/11/2026 (sprint Copiloto FDE): bloco de trabalho REAL do agente —
+    # contatos que chegaram, atendimento humano x conversa sem retorno,
+    # mídia auditada por visão e a agenda VERDADEIRA (appointments, nunca
+    # leads.stage). Falha aqui NÃO derruba o snapshot.
+    try:
+        out["fde_operacao"] = fde_bloco_operacao(sb_service, tid, days_back)
+    except Exception as exc:
+        logger.warning("[metrics/snapshot] bloco fde_operacao indisponivel: %s", type(exc).__name__)
     out["latencia_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     return out
+
+
+@app.get("/api/v1/fde/status")
+async def fde_status(request: Request, tenant_id: str) -> dict[str, Any]:
+    """Estado do Copiloto FDE: analítico ATIVO em segundo plano + envio TRAVADO.
+
+    GET /api/v1/fde/status?tenant_id={uuid|apelido}
+    Auth interna: header X-Internal-Token (server-to-server) ou chamada local.
+    Serve como prova operacional de que desligar o envio ao paciente NÃO
+    desligou a análise (minerador silencioso, extração clínica, auditoria de
+    visão e relatórios 12h/18h seguem rodando).
+    """
+    if not _metrics_internal_authorized(request):
+        raise HTTPException(status_code=401, detail="X-Internal-Token ausente ou invalido")
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tenant_id.strip()):
+        tid = tenant_id.strip()
+    else:
+        resolved = _decision_resolve_tenant(tenant_id)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="tenant nao encontrado")
+        tid = resolved[0]
+    cfg = _get_tenant_config(tid)
+    try:
+        payload = fde_status_copiloto(sb_service, tid, cfg)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"falha ao montar status do copiloto: {type(exc).__name__}",
+        )
+    return payload
 
 
 @app.get("/api/automations/status")

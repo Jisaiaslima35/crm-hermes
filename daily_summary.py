@@ -41,6 +41,12 @@ from telegram_notify import (
     _supabase_client,
     send_telegram,
 )
+from fde_metrics import (
+    classificar_audio as _fde_classificar_audio,
+    classificar_imagem as _fde_classificar_imagem,
+    formatar_telefone,
+    resposta_generica_imagem,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("daily_summary")
@@ -55,6 +61,8 @@ TAG_CONTEUDO_DOCUMENTO = "[CONTEÚDO DO DOCUMENTO:"
 
 # Resposta automática genérica do bot (pipeline anterior): NÃO descreve a imagem,
 # então não pode ser apresentada como "conteúdo do exame".
+# 03/11/2026 (sprint Copiloto FDE): fonte única de verdade = fde_metrics
+# .resposta_generica_imagem (cobre "Recebi a imagem que você enviou", etc.).
 _RE_BOILERPLATE_IMAGEM = re.compile(
     r"agrade[çc]o por compartilhar|analisando o que voc[êe] me envi|"
     r"sua imagem foi recebida|recebi sua imagem|enviei uma imagem",
@@ -121,28 +129,72 @@ _RE_SOMENTE_NUMEROS = re.compile(r"[\d\s+\-()]+")
 def _nome_confiavel(nome: str) -> tuple[str, bool]:
     """(nome exibido, é confiável?).
 
-    O CRM da clínica tem l.leads.name polluted por material gerado por IA
+    O CRM da clínica tem l.leads.name poluído por material gerado por IA
     (ex.: "DISPONÍVEL", "Contato 2476", frases inteiras). Exibir isso como
     nome de paciente contaminaria o relatório — a regra é: na dúvida, não
-    qualifica.
+    qualifica. 03/11/2026: rótulo único "Paciente (a confirmar)".
     """
     bruto = (nome or "").strip()
     if not bruto or _RE_SOMENTE_NUMEROS.fullmatch(bruto):
-        return "Paciente (nome não registrado)", False
+        return "Paciente (a confirmar)", False
     if re.match(r"^(contato|paciente|lead)\s*\d+", bruto, re.IGNORECASE):
-        return "Paciente (nome não registrado)", False
+        return "Paciente (a confirmar)", False
     if len(bruto.split()) > 5:
-        return "Paciente (nome não registrado)", False
+        return "Paciente (a confirmar)", False
     if bruto.lower().strip(" .!-") in _NOMES_ARTIFACT:
-        return "Paciente (nome não registrado)", False
+        return "Paciente (a confirmar)", False
     return bruto, True
+
+
+def _sem_acento(txt: str) -> str:
+    import unicodedata
+
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", txt or "") if not unicodedata.combining(c)
+    ).lower()
+
+
+def _nome_ancorado(nome: str, conversa: str) -> bool:
+    """O nome do paciente aparece na própria conversa?
+
+    03/11/2026 (sprint Copiloto FDE): nome que a IA inventou no cadastro
+    (ex.: "Ateliê da Arte", "MD", "MentalMe") NÃO pode virar identidade no
+    relatório. Se o nome não estiver ancorado no texto do paciente, exibir
+    "Paciente (a confirmar)" + telefone formatado.
+    """
+    alvo = _sem_acento((nome or "").strip())
+    if not alvo:
+        return False
+    texto = _sem_acento(conversa or "")
+    if not texto:
+        return False
+    if alvo in texto:
+        return True
+    partes = [p for p in re.split(r"\s+", alvo) if len(p) >= 3]
+    if len(partes) >= 2 and partes[0] in texto and partes[-1] in texto:
+        return True
+    return False
+
+
+def _sufixo_tel(telefone: str) -> str:
+    """Desambiguador sem PII completo: "final 7329".
+
+    03/11/2026 (sprint Copiloto FDE): o relatório vai pro Telegram (app de
+    terceiro) — LGPD do Sprint D proíbe telefone completo. Mantemos só o
+    final para a equipe saber qual contato é qual. O telefone inteiro fica
+    no CRM e na API autenticada.
+    """
+    d = re.sub(r"\D", "", telefone or "")
+    if len(d) < 4:
+        return ""
+    return f" · final {d[-4:]}"
 
 
 def _sem_nome(descricao: str, nome: str) -> str:
     """Remove o nome do paciente (CRM) do texto extraído do documento."""
     if not descricao:
         return ""
-    if nome and nome.lower() != "paciente (nome não registrado)":
+    if nome and nome.lower() not in ("paciente (a confirmar)", "paciente (sem contato vinculado)"):
         try:
             descricao = re.sub(re.escape(nome), "[paciente]", descricao, flags=re.IGNORECASE)
         except Exception:
@@ -244,6 +296,38 @@ def _buscar_agendamentos(sb, inicio: datetime, fim: datetime) -> list[dict]:
         return []
 
 
+def _conversas_leads(sb, lead_ids: list[str], dias: int = 30) -> dict[str, str]:
+    """Texto concatenado das conversas (checa se o nome do cadastro tem âncora).
+
+    03/11/2026 (sprint Copiloto FDE): nome sem âncora textual = identidade
+    inventada pela IA — no relatório vira "Paciente (a confirmar)" + telefone.
+    """
+    out: dict[str, str] = {}
+    if not lead_ids:
+        return out
+    desde = datetime.now(BRT) - timedelta(days=dias)
+    for i in range(0, min(len(lead_ids), 400), 200):
+        bloco = lead_ids[i:i + 200]
+        try:
+            res = (
+                sb.table("messages")
+                .select("lead_id,content")
+                .eq("tenant_id", CLINICA_TENANT_ID)
+                .gte("created_at", _ts(desde))
+                .in_("lead_id", bloco)
+                .limit(3000)
+                .execute()
+            )
+            for row in res.data or []:
+                lid = row.get("lead_id")
+                txt = (row.get("content") or "").strip()
+                if lid and txt:
+                    out[lid] = (out.get(lid, "") + " " + txt)[:8000]
+        except Exception as exc:
+            logger.warning("daily_summary: falha ao montar conversas (%s)", exc)
+    return out
+
+
 def _historico_ultimo(sb, lead_ids: list[str], dias: int = 3) -> dict[str, dict]:
     """Última mensagem por lead (janela maior) — base das pendências."""
     if not lead_ids:
@@ -294,15 +378,30 @@ def montar_relatorio(sb, shift: str) -> str:
     leads = _buscar_leads(sb, lead_ids)
 
     nomes_confiaveis = {"total": 0, "suspeitos": 0}
+    conversas = _conversas_leads(sb, lead_ids, dias=30)
 
     def nome(lid: str | None) -> str:
+        """Nome EXIBIDO com âncora textual (03/11/2026 sprint Copiloto FDE).
+
+        Regra: nome do CRM só vale se (a) não for artefato de IA e (b) aparecer
+        na conversa do próprio paciente. Sem âncora → "Paciente (a confirmar)".
+        """
         if not lid:
             return "Paciente (sem contato vinculado)"
-        exibido, ok = _nome_confiavel((leads.get(lid) or {}).get("name") or "")
-        if (leads.get(lid) or {}).get("name"):
-            nomes_confiaveis["total"] += 1
-            if not ok:
-                nomes_confiaveis["suspeitos"] += 1
+        lead = leads.get(lid) or {}
+        bruto = (lead.get("name") or "").strip()
+        sufixo = _sufixo_tel(lead.get("phone") or "")
+        if not bruto:
+            return "Paciente (a confirmar)" + sufixo
+        nomes_confiaveis["total"] += 1
+        exibido, ok = _nome_confiavel(bruto)
+        if not ok:
+            nomes_confiaveis["suspeitos"] += 1
+            return "Paciente (a confirmar)" + sufixo
+        # âncora: só exige se TEMOS conversa do lead (falha de query não pune)
+        if lid in conversas and not _nome_ancorado(bruto, conversas.get(lid, "")):
+            nomes_confiaveis["suspeitos"] += 1
+            return "Paciente (a confirmar)" + sufixo
         return exibido
 
     # ---------- 1) CONTATOS ATENDIDOS ----------
@@ -445,7 +544,7 @@ def montar_relatorio(sb, shift: str) -> str:
             desc_curto = _resumir(desc, 110)
             if not desc_curto:
                 docs.append(f"• {nome_pac} — imagem recebida (sem conteúdo extraído)")
-            elif _RE_BOILERPLATE_IMAGEM.search(desc):
+            elif resposta_generica_imagem(desc):
                 # resposta automática do bot: não descreve a imagem — não fingir conteúdo
                 docs.append(
                     f"• {nome_pac} — imagem recebida (sem conteúdo extraído: "
@@ -457,6 +556,49 @@ def montar_relatorio(sb, shift: str) -> str:
                     f"{redigir(_sem_nome(desc_curto, nome_pac))}"
                 )
 
+    # ---------- 4b) COPILOTO FDE — TRABALHO REAL (mídia auditada) ----------
+    # 03/11/2026 (sprint Copiloto FDE): o relatório mostra o que o Copiloto
+    # realmente fez — contatos que chegaram, quem foi atendido pela equipe,
+    # quem ficou sem retorno, e a mídia auditada (áudio transcrito, imagem com
+    # análise de verdade, documento com texto). Nada de inferir agenda a partir
+    # de leads.stage: agenda real = appointments com status da equipe.
+    fde = {
+        "equipe": 0, "imagens_analise": 0, "imagens_genericas": 0,
+        "pix": 0, "exames": 0, "docs_texto": 0, "docs_recebidos": 0,
+    }
+    equipe_leads: set[str] = set()
+    for m in msgs:
+        snd = (m.get("sender") or "")
+        lid = m.get("lead_id") or ""
+        if snd == "human" and lid:
+            equipe_leads.add(lid)
+        if snd != "patient":
+            continue
+        mt = (m.get("media_type") or "").lower()
+        conteudo = (m.get("content") or "").strip()
+        if mt == "image":
+            desc = ""
+            if TAG_CONTEUDO_IMAGEM in conteudo:
+                desc = re.sub(r"^\[[^\]]{0,40}:\s*", "", conteudo).rstrip("]").strip()
+            else:
+                cls = _fde_classificar_imagem(conteudo)
+                if cls.get("tem_analise"):
+                    desc = conteudo
+            if desc:
+                fde["imagens_analise"] += 1
+                cat = _fde_classificar_imagem(desc).get("categoria")
+                if cat == "comprovante_pix":
+                    fde["pix"] += 1
+                elif cat == "exame_receita":
+                    fde["exames"] += 1
+            else:
+                fde["imagens_genericas"] += 1
+        elif mt == "document":
+            fde["docs_recebidos"] += 1
+            if TAG_CONTEUDO_DOCUMENTO in conteudo and len(conteudo) > 80:
+                fde["docs_texto"] += 1
+    fde["equipe"] = len(equipe_leads)
+
     # ---------- Montagem ----------
     titulo = "MANHÃ (00h–12h)" if shift == "manha" else ("TARDE (12h–18h)" if shift == "tarde" else "DIA")
     L: list[str] = []
@@ -465,7 +607,7 @@ def montar_relatorio(sb, shift: str) -> str:
     L.append("Fonte: CRM-Hermes (conversas + agenda). Sem inferência.")
     L.append("")
 
-    L.append(f"👥 CONTATOS ATENDIDOS ({len(por_lead)})")
+    L.append(f"👥 CONTATOS QUE CHEGARAM — escreveram no período ({len(por_lead)})")
     L.extend(contatos or ["• Nenhum contato do paciente no período."])
     L.append("")
 
@@ -487,10 +629,34 @@ def montar_relatorio(sb, shift: str) -> str:
         f"{imagens_sem_conteudo} imagem(ns) sem extração estruturada"
     )
     L.append(f"Total de mensagens lidas: {len(msgs)}")
+
+    L.append("")
+    L.append("🤖 COPILOTO FDE — TRABALHO REAL (janela do relatório)")
+    L.append(
+        f"• Contatos que chegaram: {len(por_lead)} · "
+        f"atendidos pela equipe: {fde['equipe']} · "
+        f"conversas sem retorno: {len(pendencias)}"
+    )
+    L.append(
+        f"• Mídia auditada: {audios_transcritos} áudio(s) transcrito(s) · "
+        f"{fde['imagens_analise']} imagem(ns) com análise real "
+        f"({fde['pix']} comprovante(s) de Pix, {fde['exames']} exame/receita) · "
+        f"{fde['imagens_genericas']} imagem(ns) sem conteúdo aproveitável · "
+        f"{fde['docs_texto']}/{fde['docs_recebidos']} documento(s) com texto extraído"
+    )
+    L.append(
+        "• Agenda real: só a tabela de consultations com status confirmado pela "
+        f"equipe ({len(efetivados)}). Estágio do Kanban não vira agendamento."
+    )
+    L.append(
+        "• Envio automático ao paciente: DESLIGADO (Copiloto só escuta, audita e "
+        "reporta — não responde o paciente)."
+    )
     if nomes_confiaveis["suspeitos"]:
         L.append(
-            f"⚠️ Cadastro: {nomes_confiaveis['suspeitos']} contato(s) com nome ausente ou irregular "
-            "no CRM (exibidos como 'nome não registrado'). Corrigir no cadastro."
+            f"⚠️ Cadastro: {nomes_confiaveis['suspeitos']} contato(s) com nome ausente, "
+            "irregular ou sem âncora na conversa (exibidos como 'Paciente (a confirmar)'). "
+            "Corrigir no CRM."
         )
     return "\n".join(L)
 
