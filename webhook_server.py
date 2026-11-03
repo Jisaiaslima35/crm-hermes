@@ -1550,6 +1550,21 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
     insurance = lead.get("insurance") or "Particular"
     stage = lead.get("stage") or "novo_contato"
 
+    # 03/11/2026 (auditoria Dr. Matheus): NOME AUTORITATIVO = CRM.
+    # O pushname do WhatsApp e o resumo clínico podem citar outra pessoa
+    # (ex.: paciente "Wendell Félix" x contato "Rayane Medeiros"). A IA deve
+    # SEMPRE chamar o paciente pelo nome cadastrado no CRM — nunca pelo nome
+    # divergente, nunca inventando apelido — e nunca "trocar" o nome no meio
+    # da conversa. Divergência é registrada internamente (internal_notes),
+    # nunca exposta ao paciente no chat.
+    nome_regra = (
+        f"- Nome do contato (CRM — FONTE DA VERDADE): {lead_name}\n"
+        "- Ao se dirigir a esta pessoa, use EXCLUSIVAMENTE o nome acima. "
+        "Se outro nome aparecer no resumo clínico, no histórico ou no pushname do "
+        "WhatsApp, o nome do CRM tem precedência: não cite o outro nome, não "
+        "chame por apelido e não troque o nome durante a conversa."
+    )
+
     # Contexto dinâmico (sempre presente). ATENÇÃO 01/10 (Isaías msg 5479):
     # antes deste fix, o bloco usava terminologia fixa de clínica
     # ("Clínica/Paciente/Convênio") mesmo pra tenants TECH/SaaS — o LLM ficava
@@ -1579,7 +1594,8 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         f"- Tom de voz: {tone}\n"
         f"- {contact_label}: {lead_name}\n"
         f"{extra_ctx}"
-        f"- Estágio atual no funil: {stage}"
+        f"- Estágio atual no funil: {stage}\n"
+        f"{nome_regra}"
     )
 
     sched_rules = tenant_cfg.get("schedule_rules")
@@ -1634,7 +1650,8 @@ def _build_system_prompt(tenant_cfg: dict[str, Any], lead: dict[str, Any]) -> st
         f"Contexto do paciente:\n"
         f"- Nome: {lead_name}\n"
         f"- Convênio: {insurance}\n"
-        f"- Estágio atual no funil: {stage}\n\n"
+        f"- Estágio atual no funil: {stage}\n"
+        f"{nome_regra}\n\n"
         f"Diretrizes:\n"
         f"1. Faça triagem empática e identifique a queixa principal.\n"
         f"2. Se houver sinais de emergência (dor no peito irradiando, desmaio, "
@@ -2430,6 +2447,51 @@ async def _extract_and_persist_clinical_data(
 # SILÊNCIO TOTAL: Jamais envia mensagens ou respostas automáticas no WhatsApp.
 # ============================================================================
 
+# 03/11/2026 (auditoria Dr. Matheus): NOME AUTORITATIVO = CRM.
+# O resumo clínico é escrito pela IA e às vezes cita o NOME DO PACIENTE
+# (ex.: "Wendell Félix de Mendonça") enquanto o cadastro do CRM traz o nome
+# do CONTATO ("Rayane Medeiros"). Regras:
+#   1. A IA fala SEMPRE com o nome do CRM (injetado no system prompt);
+#   2. a divergência é registrada INTERNAMENTE (internal_notes), nunca no chat;
+#   3. o Copiloto continua minerando em silêncio — ele não "corrige" o nome.
+_RE_NOME_CANDIDATO = re.compile(
+    r"\b(?i:paciente|cliente|contato)\s+"
+    r"([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][\wÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç'’\-]+"
+    r"(?:\s+(?:[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][\wÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç'’\-]+"
+    r"|de|da|do|dos|das)){0,4})"
+)
+
+
+def _norm_nome(valor: str) -> str:
+    """Normaliza nome para comparação: sem acento, minúsculo, só letras."""
+    s = unicodedata.normalize("NFKD", str(valor or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    return re.sub(r"[^a-z]", "", s)
+
+
+def _detectar_nome_divergente(crm_nome: str, *textos: str) -> str:
+    """Devolve o nome divergente citado nos textos (vazio se não houver).
+
+    Compara o nome do CRM com os nomes citados como "Paciente X" / "Cliente X"
+    / "Contato X" no resumo clínico ou na conversa. Normaliza (sem acento,
+    minúsculo) e ignora o caso em que um nome contém o outro (mesma pessoa
+    com nome abreviado no texto).
+    """
+    crm = _norm_nome(crm_nome)
+    if not crm:
+        return ""
+    for texto in textos:
+        for m in _RE_NOME_CANDIDATO.finditer(str(texto or "")):
+            cand = m.group(1).strip()
+            n = _norm_nome(cand)
+            if not n or n == crm:
+                continue
+            if crm in n or n in crm:
+                continue  # mesma pessoa, grafia diferente
+            return cand
+    return ""
+
+
 async def _mine_silent_conversation(
     tenant_id: str,
     lead: dict[str, Any],
@@ -2845,8 +2907,21 @@ async def _mine_silent_conversation(
                 patch["clinical_summary"] = sintomas_ou_queixa
 
             data_agendamento = data.get("data_agendamento")
+            # 03/11/2026 (auditoria Dr. Matheus): com copiloto_cria_appointment=false
+            # o Copiloto NÃO grava horário inferido pela IA (nem na agenda, nem no
+            # campo legado leads.appointment_schedule) — inferência não é agendamento.
+            _copiloto_cria_appt = bool(
+                (tenant_cfg.get("schedule_rules") or {}).get("copiloto_cria_appointment", True)
+            )
             if data_agendamento and str(data_agendamento).lower() != "null":
-                patch["appointment_schedule"] = str(data_agendamento)
+                if _copiloto_cria_appt:
+                    patch["appointment_schedule"] = str(data_agendamento)
+                else:
+                    logger.info(
+                        "[%s] ⛔ [MINERADOR] copiloto_cria_appointment=false no tenant %s — "
+                        "horário inferido pela IA NÃO gravado (lead %s): %s",
+                        instance, tenant_id, lead_id, data_agendamento,
+                    )
 
             tipo_atend = str(data.get("tipo_atendimento") or "").strip().lower()
             if tipo_atend in ("particular", "convenio"):
@@ -2857,6 +2932,27 @@ async def _mine_silent_conversation(
                 curr_notes = lead.get("internal_notes") or ""
                 if "[ALERTA_INCIDENTE]" not in curr_notes:
                     patch["internal_notes"] = f"{curr_notes}\n[ALERTA_INCIDENTE] {resumo_conversa or sintomas_ou_queixa}".strip()
+
+            # 03/11/2026 (auditoria Dr. Matheus): NOME — o CRM manda. Se o resumo
+            # clínico citar outro nome que não é o do cadastro, registra alerta
+            # INTERNO para a recepção. A IA segue usando o nome do CRM no chat.
+            _nome_divergente = _detectar_nome_divergente(
+                lead.get("name") or "", sintomas_ou_queixa, resumo_conversa
+            )
+            if _nome_divergente:
+                _notes_atual = patch.get("internal_notes") or lead.get("internal_notes") or ""
+                if "[ALERTA_NOME_DIVERGENTE]" not in _notes_atual:
+                    patch["internal_notes"] = (
+                        f"{_notes_atual}\n[ALERTA_NOME_DIVERGENTE] Nome cadastrado no CRM: "
+                        f"'{lead.get('name')}'. Outro nome citado no resumo/conversa: "
+                        f"'{_nome_divergente}'. A IA deve usar SEMPRE o nome do CRM — "
+                        "confirmar com a recepção qual é o nome correto do paciente."
+                    ).strip()
+                logger.info(
+                    "[%s] 🏷️ [MINERADOR] Nome divergente no lead %s: CRM='%s' citado='%s' — "
+                    "prioridade CRM (alerta interno, não vai para o chat)",
+                    instance, lead_id, lead.get("name"), _nome_divergente,
+                )
 
             # Executa update em public.leads
             sb_service.table("leads").update(patch).eq("id", lead_id).execute()
@@ -2895,7 +2991,13 @@ async def _mine_silent_conversation(
                     logger.warning("[%s] Erro ao registrar customer_complaints no minerador: %s", instance, comp_err)
 
             # Se identificou agendamento com data/hora, sincroniza na tabela appointments
-            if data_agendamento and str(data_agendamento).lower() != "null":
+            if data_agendamento and str(data_agendamento).lower() != "null" and not _copiloto_cria_appt:
+                logger.info(
+                    "[%s] ⛔ [MINERADOR] Agenda protegida no tenant %s (copiloto_cria_appointment=false) — "
+                    "horário inferido pela IA descartado (lead %s): %s",
+                    instance, tenant_id, lead_id, data_agendamento,
+                )
+            elif data_agendamento and str(data_agendamento).lower() != "null":
                 try:
                     raw_dt = str(data_agendamento).replace("T", " ")
                     dt_parsed = None
@@ -2932,7 +3034,14 @@ async def _mine_silent_conversation(
                                 "end_time": end_iso,
                                 "status": "agendado",
                                 "specialty": lead.get("tenant_specialty") or tenant_cfg.get("specialty") or "Consulta",
-                                "notes": f"Agendamento detectado pelo Copiloto Invisível. Queixa: {sintomas_ou_queixa or resumo_conversa}",
+                                # 03/11/2026 (auditoria Dr. Matheus): o Copiloto é SILENCIOSO e
+                                # nunca confirma — o registro só vira "confirmado" quando a equipe
+                                # clica na agenda. Marcado explicitamente para a recepção ler.
+                                "notes": (
+                                    f"⏳ Pendente de validação da recepção — detectado pelo Copiloto Invisível "
+                                    f"(inferência de IA, NÃO é confirmação). Queixa: "
+                                    f"{sintomas_ou_queixa or resumo_conversa}"
+                                ),
                                 "source": "whatsapp",
                                 "created_at": now_iso,
                             }).execute()

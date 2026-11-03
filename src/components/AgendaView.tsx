@@ -491,6 +491,20 @@ function AppointmentDetailsModal({
             )}
           </div>
 
+          {/* 03/11/2026 (auditoria Dr. Matheus): registro inferido pelo Copiloto
+              Invisível NÃO é agendamento confirmado. A recepção precisa validar
+              antes de qualquer confirmação automática sair. */}
+          {appt.source === 'whatsapp' && appt.status === 'agendado' && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+              <p className="text-xs font-bold text-amber-300">⏳ Pendente de validação da recepção</p>
+              <p className="text-[11px] text-amber-200/80 mt-1">
+                Este horário foi inferido pelo Copiloto Invisível a partir da conversa — não é
+                confirmação da equipe. Valide com o paciente e clique em <strong>Confirmado</strong>{' '}
+                abaixo para liberar o lembrete automático.
+              </p>
+            </div>
+          )}
+
           <div className="space-y-2 text-xs">
             <Row label="Data e hora" value={`${formatDate(appt.start)} · ${formatTime(appt.start)} – ${formatTime(appt.end)}`} />
             <Row label="Duração" value={`${Math.round((appt.end.getTime() - appt.start.getTime()) / 60_000)} min`} />

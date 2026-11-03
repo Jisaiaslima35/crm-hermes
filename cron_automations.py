@@ -209,6 +209,111 @@ def _appointment_state(tenant_id: str, lead_id: str) -> dict[str, Any]:
     return {"futura": futura, "ultima_passada": ultima_passada, "total": total}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# TRAVA DE CONFIRMAÇÃO (03/11/2026 — auditoria clínica Dr. Matheus Dore)
+# ─────────────────────────────────────────────────────────────────────────
+# Incidente de 03/11/2026 10:00:43 (BRT): a Eduarda (lead 93e18b78) recebeu
+# "Lembrando que sua consulta com o Dr. Matheus Dore está agendada para
+# amanhã, 04/11/2026 às 19:00. Podemos confirmar sua presença?" — e NÃO
+# tinha consulta confirmada na agenda (a recepção nunca formalizou nada).
+#
+# Causa raiz: o Copiloto Invisível (minerador silencioso da conversa da
+# recepção, em webhook_server.py) grava o que a IA INFERE da conversa como
+# appointments (status='agendado', source='whatsapp') — inclusive horários
+# inventados (19:00, 04:30, 00:00) e dias que nem são da grade da clínica.
+# O gatilho D-1 tratava essa linha como "fonte da verdade" e disparava a
+# confirmação para qualquer um.
+#
+# Travas novas (fail-closed), ativas quando a etapa tem
+# require_confirmed_appointment = true:
+#   1. tenants.schedule_rules.confirmacao_automatica precisa estar true;
+#   2. o appointment precisa estar com status='confirmado' (a equipe valida
+#      com 1 clique na tela da Agenda Integrada);
+#   3. a consulta precisa ser FUTURA (nunca confirmar consulta de ontem);
+#   4. leads.appointment_schedule (campo legado) nunca mais serve de âncora
+#      para confirmação.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _get_confirmed_appointments(
+    tenant_id: str,
+    lead_id: str,
+    statuses: tuple[str, ...] = ("confirmado",),
+) -> dict[str, Any]:
+    """Consultas CONFIRMADAS/REALIZADAS pela equipe.
+
+    1 requisição por lead (filtro em Python, como _appointment_state).
+    - status 'confirmado' = a equipe validou na Agenda (1 clique).
+    - status 'compareceu' = a consulta aconteceu de fato (vale para as
+      etapas pós-atendimento: D+3, D+28).
+    Retorna {"futura": ISO|None, "ultima_passada": ISO|None, "total": int}.
+    """
+    vazio: dict[str, Any] = {"futura": None, "ultima_passada": None, "total": 0}
+    try:
+        rows = _supabase_request(
+            f"appointments?tenant_id=eq.{tenant_id}&lead_id=eq.{lead_id}"
+            f"&select=start_time,status&order=start_time.asc"
+        )
+    except Exception:
+        return vazio
+    if not rows:
+        return vazio
+    now_utc = datetime.now(timezone.utc)
+    future: list[str] = []
+    past: list[str] = []
+    for r in rows:
+        if (r.get("status") or "") not in statuses:
+            continue
+        st = (r.get("start_time") or "").strip()
+        if not st:
+            continue
+        try:
+            dt = datetime.fromisoformat(st.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt >= now_utc:
+            future.append(st)
+        else:
+            past.append(st)
+    return {
+        "futura": future[0] if future else None,
+        "ultima_passada": past[-1] if past else None,
+        "total": len(future) + len(past),
+    }
+
+
+def _anchor_confirmado(conf: dict[str, Any], prefer: str | None) -> str | None:
+    """Escolhe a âncora confirmada conforme o modo da etapa."""
+    if prefer == "past":
+        return conf.get("ultima_passada") or conf.get("futura")
+    return conf.get("futura") or conf.get("ultima_passada")
+
+
+def _confirmacao_automatica_permitida(tenant_info: dict[str, Any]) -> bool:
+    """Flag do tenant: schedule_rules.confirmacao_automatica.
+
+    Ausente  = permitido (compatibilidade com os outros tenants que já usam
+                gatilho D-1).
+    Presente e false = bloqueia a confirmação automática (modo assistido:
+                a equipe confirma na tela da Agenda e a IA só avisa).
+    """
+    rules = tenant_info.get("schedule_rules") or {}
+    if not isinstance(rules, dict) or "confirmacao_automatica" not in rules:
+        return True
+    return rules.get("confirmacao_automatica") is True
+
+
+def _turno_por_hora(hora: int) -> str:
+    """Turno da clínica — a Dr. Matheus não trabalha com horário cravado."""
+    if hora < 12:
+        return "Manhã"
+    if hora < 18:
+        return "Tarde"
+    return "Noite"
+
+
 # Sinais de que o lead ja e paciente em tratamento (usado pela TRAVA 2b
 # da regua de triagem). 01/11/2026: caso da Anabela Vieira, que perguntou
 # "posso suspender o uso da Quetiapina" e mesmo assim recebeu a mensagem
@@ -783,6 +888,51 @@ def process_kanban_stages_config_automations():
                                 )
                                 continue
 
+                        # ========== TRAVA 1B (03/11/2026) ==========
+                        # CONFIRMAÇÃO ASSISTIDA (auditoria Dr. Matheus):
+                        # quando a etapa tem require_confirmed_appointment,
+                        # o ÚNICO gatilho válido é um appointment com
+                        # status='confirmado' — validado pela equipe com 1
+                        # clique na tela da Agenda Integrada. O que o
+                        # Copiloto Invisível infere da conversa
+                        # (source='whatsapp', status='agendado') fica FORA.
+                        # Foi assim que a Eduarda recebeu confirmação de
+                        # uma "consulta" de 19:00 que nunca existiu
+                        # (03/11/2026 10:00, lead 93e18b78).
+                        # ==============================================
+                        exige_confirmacao = bool(cfg.get("require_confirmed_appointment"))
+                        conf_state: dict[str, Any] = {}
+                        if exige_confirmacao:
+                            if not _confirmacao_automatica_permitida(tenant_info):
+                                logger.info(
+                                    "⛔ [SKIP] Lead %s - confirmação automática DESLIGADA no tenant "
+                                    "(schedule_rules.confirmacao_automatica=false)",
+                                    lead["id"],
+                                )
+                                continue
+                            # Etapa de CONFIRMAÇÃO (pré-consulta) exige só
+                            # 'confirmado'. Etapa PÓS-atendimento (D+3, D+28)
+                            # aceita 'confirmado' ou 'compareceu' — a consulta
+                            # precisa ter sido confirmada/realizada de fato.
+                            estados_exigidos = (
+                                ("confirmado", "compareceu")
+                                if trigger_days > 0
+                                else ("confirmado",)
+                            )
+                            conf_state = _get_confirmed_appointments(
+                                tenant_id, lead["id"], estados_exigidos
+                            )
+                            if not conf_state.get("total"):
+                                logger.info(
+                                    "⛔ [SKIP] Lead %s - nenhuma consulta %s pela equipe "
+                                    "— mensagem não sai",
+                                    lead["id"],
+                                    "confirmada/realizada"
+                                    if trigger_days > 0
+                                    else "CONFIRMADA",
+                                )
+                                continue
+
                         # ========== TRAVA 2 (01/11/2026) ==========
                         # Reguas de boas-vindas (triagem D+0): nao enviar
                         # "Seja muito bem-vindo(a)" para quem JA e paciente
@@ -840,7 +990,12 @@ def process_kanban_stages_config_automations():
                             prefer = "past"
 
                         ref_anchor = None
-                        if prefer == "future":
+                        if exige_confirmacao:
+                            # SOMENTE o appointment confirmado pela equipe —
+                            # nunca o fallback legado leads.appointment_schedule.
+                            ref_anchor = _anchor_confirmado(conf_state, prefer)
+                            ref_str = ref_anchor
+                        elif prefer == "future":
                             ref_anchor = _get_appointment_anchor(tenant_id, lead["id"], "future")
                             ref_str = ref_anchor or lead.get("appointment_schedule")
                         elif prefer == "past":
@@ -870,6 +1025,25 @@ def process_kanban_stages_config_automations():
                         if not (0 <= days_diff <= 2):
                             continue
 
+                        # TRAVA 1C (03/11/2026): com appointment confirmado, o
+                        # disparo acontece SÓ na véspera da consulta. Nunca
+                        # numa consulta que já passou (aí o texto "amanhã"
+                        # mentiria) e nunca com data no futuro distante.
+                        if exige_confirmacao:
+                            # Pré-consulta (D-1): a consulta precisa ser FUTURA.
+                            # Pós-atendimento (D+3/D+28): a âncora é a consulta
+                            # JÁ REALIZADA (o que precisa ser futuro é o
+                            # gatilho, não a data da consulta).
+                            if trigger_days < 0 or stage_key == "agendados_d1":
+                                if ref_date <= today_local:
+                                    logger.info(
+                                        "⛔ [SKIP] Lead %s - consulta (%s) não é futura — confirmação só na véspera",
+                                        lead["id"], ref_str,
+                                    )
+                                    continue
+                            if days_diff != 0:
+                                continue
+
                         # Evita disparo duplicado: verifica se já enviou mensagem com este template recentemente
                         lead_id = lead["id"]
                         # 01/11/2026: a query anterior (sem ORDER BY) podia
@@ -898,14 +1072,16 @@ def process_kanban_stages_config_automations():
                         if already_sent:
                             continue
 
-                        # Formata mensagem com variáveis {nome}, {data}, {horario}
+                        # Formata mensagem com variáveis {nome}, {data}, {horario}, {turno}
                         name = lead.get("name") or "Paciente"
                         appt_str = ref_anchor or _get_appointment_anchor(tenant_id, lead["id"], "future") or lead.get("appointment_schedule")
+                        turno = "Tarde"
                         if appt_str:
                             try:
                                 a_dt = datetime.fromisoformat(appt_str.replace("Z", "+00:00")).astimezone(tz_br)
                                 fmt_data = a_dt.strftime("%d/%m/%Y")
                                 fmt_horario = a_dt.strftime("%H:%M")
+                                turno = _turno_por_hora(a_dt.hour)
                             except Exception:
                                 fmt_data = today_local.strftime("%d/%m/%Y")
                                 fmt_horario = "10:00"
@@ -918,6 +1094,7 @@ def process_kanban_stages_config_automations():
                             .replace("{nome}", name)
                             .replace("{data}", fmt_data)
                             .replace("{horario}", fmt_horario)
+                            .replace("{turno}", turno)
                         )
 
                         logger.info(
