@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import random
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -44,8 +45,16 @@ from jev_copilot_engine import evaluate_lead_copilot
 from media_handler import (
     get_media_base64_from_evolution,
     process_audio_message,
+    process_audio_message_detalhado,
     process_image_message,
     extract_receipt_data_multimodal,
+    analisar_imagem_documento,
+    analisar_documento_texto,
+    montar_tag_conteudo,
+    TAG_AUDIO_INAUDIVEL,
+    TAG_CONTEUDO_DOCUMENTO,
+    TAG_CONTEUDO_IMAGEM,
+    TAG_IMAGEM_RECEBIDA,
 )
 
 # ============================================================================
@@ -1322,6 +1331,45 @@ def _extract_text(data: dict[str, Any]) -> str:
     return ""
 
 
+async def _extrair_texto_documento(b64_doc: str, mime_doc: str = "") -> str:
+    """Extrai texto de um documento (PDF) recebido via WhatsApp (pdftotext).
+
+    Devolve string vazia se não for PDF legível — o chamador então marca
+    apenas [IMAGEM_RECEBIDA], sem inventar conteúdo.
+    """
+    if not b64_doc:
+        return ""
+    try:
+        raw = base64.b64decode(b64_doc)
+    except Exception:
+        return ""
+    mime = (mime_doc or "").lower()
+    tmp_path = ""
+    try:
+        suffix = ".pdf" if "pdf" in mime else ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+            fh.write(raw)
+            tmp_path = fh.name
+        proc = await asyncio.create_subprocess_exec(
+            "pdftotext", "-layout", tmp_path, "-",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=45)
+        texto = (out or b"").decode("utf-8", "ignore").strip()
+        if proc.returncode == 0 and texto:
+            return texto[:8000]
+        logger.warning("[Documento] pdftotext rc=%s err=%s", proc.returncode, (err or b"").decode("utf-8", "ignore")[:160])
+    except Exception as exc:
+        logger.warning("[Documento] falha ao extrair texto: %s", exc)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    return ""
+
+
 async def _extract_message(event: str, data: dict[str, Any], instance: str = "") -> dict[str, Any] | None:
     """Normaliza um payload Evolution pra {sender, sender_name, content, ts, phone, from_me}, com transcrição de áudio via Whisper e visão via 9Router."""
     norm_event = str(event or "").lower().replace("-", ".").replace("_", ".")
@@ -1396,10 +1444,18 @@ async def _extract_message(event: str, data: dict[str, Any], instance: str = "")
                 b64_audio, mime = media_tuple
                 if not media_url:
                     media_url = f"data:{mime};base64,{b64_audio}"
-                transcribed = await process_audio_message(b64_audio)
-                if transcribed:
+                # Sprint D: cascata Whisper local -> Whisper small -> 9Router/MiniMax.
+                # Inaudível => [AUDIO_INAUDIVEL]: nunca chuta palavra e nunca agenda
+                # (regra de ouro do FDE: "na dúvida, não qualifica").
+                res_audio = await process_audio_message_detalhado(b64_audio)
+                status_audio = str((res_audio or {}).get("status") or "")
+                transcribed = str((res_audio or {}).get("texto") or "")
+                if status_audio == "ok" and transcribed:
                     text = transcribed
-                    logger.info("[%s] 🎤 Áudio transcrito com sucesso: %r", instance, text[:80])
+                    logger.info("[%s] 🎤 Áudio transcrito (%s): %r", instance, (res_audio or {}).get("motor"), text[:80])
+                elif status_audio == "inaudivel":
+                    text = TAG_AUDIO_INAUDIVEL
+                    logger.warning("[%s] 🎤 %s %s", instance, TAG_AUDIO_INAUDIVEL, (res_audio or {}).get("observacao"))
                 else:
                     text = "[Áudio enviado pelo paciente]"
             else:
@@ -1421,25 +1477,58 @@ async def _extract_message(event: str, data: dict[str, Any], instance: str = "")
                     "saude" in _inst_lower or "saúde" in _inst_lower
                 )
                 if _is_health_instance:
-                    system_instr = (
-                        "Você é a assistente clínica virtual. O paciente enviou uma imagem/exame pelo WhatsApp. "
-                        "Analise de forma acolhedora, ética e profissional. Se for exame ou receita, descreva o que identifica "
-                        "e informe que a consulta médica fará a validação clínica completa."
-                    )
+                    # Sprint D: visão ESTRUTURADA (classifica + extrai o conteúdo
+                    # objetivo do documento). Conteúdo legível => [CONTEÚDO DA IMAGEM: ...].
+                    # Foto comum/ilegível => [IMAGEM_RECEBIDA] (nada de dado clínico inventado).
+                    analise = await analisar_imagem_documento(b64_img, mimetype=mime, caption=img_caption)
+                    tag = montar_tag_conteudo(analise)
+                    text = tag
+                    if tag == TAG_IMAGEM_RECEBIDA:
+                        logger.info("[%s] 🖼️ Imagem sem conteúdo clínico aproveitável (%s)", instance, (analise or {}).get("classificacao"))
+                    else:
+                        logger.info("[%s] 🖼️ Conteúdo extraído: %r", instance, tag[:140])
                 else:
                     system_instr = (
                         "Você é o assistente comercial/serviço do Isaías (Automação JS). O contato enviou uma imagem pelo WhatsApp. "
                         "Analise de forma objetiva e útil: descreva o que vê (produto, marca, embalagem, tela de sistema, "
                         "documento, print, etc) e dê uma resposta prática. Não use linguagem clínica."
                     )
-                analysis = await process_image_message(b64_img, mimetype=mime, system_instruction=system_instr, caption=img_caption)
-                if analysis:
-                    text = f"[Imagem enviada pelo contato]: {analysis}"
-                    logger.info("[%s] 🖼️ Imagem analisada: %r", instance, analysis[:80])
-                else:
-                    text = "[Imagem enviada pelo contato]" + (f": {img_caption}" if img_caption else "")
+                    analysis = await process_image_message(b64_img, mimetype=mime, system_instruction=system_instr, caption=img_caption)
+                    if analysis:
+                        text = f"[Imagem enviada pelo contato]: {analysis}"
+                        logger.info("[%s] 🖼️ Imagem analisada: %r", instance, analysis[:80])
+                    else:
+                        text = "[Imagem enviada pelo contato]" + (f": {img_caption}" if img_caption else "")
             else:
                 text = "[Imagem enviada pelo contato]"
+
+        elif is_document:
+            # Sprint D: documento (PDF/guia/exame) -> texto -> análise objetiva.
+            _inst_lower_d = (instance or "").lower()
+            _is_health_doc = (
+                "clinic" in _inst_lower_d or "cardio" in _inst_lower_d or
+                "saude" in _inst_lower_d or "saúde" in _inst_lower_d
+            )
+            logger.info("[%s] 📄 Documento recebido do WhatsApp (%s)", instance, phone)
+            media_tuple_d = await get_media_base64_from_evolution(instance, data, EVOLUTION_BASE_URL, EVOLUTION_API_KEY)
+            if media_tuple_d and _is_health_doc:
+                b64_doc, mime_doc = media_tuple_d
+                if not media_url:
+                    media_url = f"data:{mime_doc};base64,{b64_doc}"
+                texto_doc = await _extrair_texto_documento(b64_doc, mime_doc)
+                if texto_doc:
+                    analise_doc = await analisar_documento_texto(texto_doc)
+                    text = montar_tag_conteudo(analise_doc, tag=TAG_CONTEUDO_DOCUMENTO)
+                    logger.info("[%s] 📄 Documento processado: %r", instance, text[:140])
+                else:
+                    text = TAG_IMAGEM_RECEBIDA
+            elif media_tuple_d:
+                b64_doc, mime_doc = media_tuple_d
+                if not media_url:
+                    media_url = f"data:{mime_doc};base64,{b64_doc}"
+                text = "[Documento enviado pelo contato]"
+            else:
+                text = "[Documento enviado pelo contato]"
 
     if not text:
         text = f"[{msg_type or 'mensagem'}]"
@@ -2321,6 +2410,47 @@ _CLINICAL_KEYWORDS_MAP: dict[str, str] = {
 }
 
 
+_STOPWORDS_SINTOMA = {
+    "uso", "de", "do", "da", "des", "dificuldade", "alteracao", "alteração",
+    "mudanca", "mudança", "transtorno", "sintoma", "sintomas", "relata", "relata.",
+    "paciente", "com", "sem", "possui", "apresenta", "sofre",
+}
+
+
+def _sem_acento(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", (texto or ""))
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _sintoma_ancorado(sintoma: str, texto_norm: str) -> bool:
+    """True se o sintoma tem palavra significantemente presente na fala do paciente."""
+    norm = _sem_acento((sintoma or "").lower())
+    tokens = [t for t in re.findall(r"[a-z0-9]{4,}", norm) if t not in _STOPWORDS_SINTOMA]
+    if not tokens:
+        # Sem token significativo (ex.: "MD"): só aceita se o texto for curto
+        # e trouxer exatamente a mesma expressão.
+        return bool(norm.strip()) and norm.strip() in texto_norm
+    return any(t in texto_norm for t in tokens)
+
+
+def _resumo_inventa_clinico(resumo: str, texto_norm: str) -> bool:
+    """True se o resumo cita termo clínico que NÃO aparece na conversa."""
+    if not resumo:
+        return False
+    r_norm = _sem_acento(resumo.lower())
+    for kw in _CLINICAL_KEYWORDS_MAP.keys():
+        k = _sem_acento(kw.lower())
+        if len(k) < 4:
+            continue
+        if re.search(r"\b" + re.escape(k) + r"\b", r_norm) and not re.search(
+            r"\b" + re.escape(k) + r"\b", texto_norm
+        ):
+            return True
+    return False
+
+
 async def _extract_and_persist_clinical_data(
     lead: dict[str, Any],
     patient_text: str,
@@ -2383,10 +2513,30 @@ async def _extract_and_persist_clinical_data(
                     sum_text = str(data.get("clinical_summary") or "").strip()
                     if sum_text:
                         clinical_summary = sum_text
+                    # Sprint D (veracidade): o sintoma só entra no prontuário se
+                    # estiver ANCORADO na fala do paciente. Sem âncora => é
+                    # inferência do modelo e é descartada (regra de ouro do FDE:
+                    # "na dúvida, não qualifica").
+                    _txt_norm = _sem_acento((patient_text or "").lower())
+                    _soltos: list[str] = []
                     for s in data.get("symptoms") or []:
                         s_clean = str(s).strip()
-                        if s_clean and s_clean not in detected_symptoms:
+                        if not s_clean or s_clean in detected_symptoms:
+                            continue
+                        if _sintoma_ancorado(s_clean, _txt_norm):
                             detected_symptoms.append(s_clean)
+                        else:
+                            _soltos.append(s_clean)
+                    if _soltos:
+                        logger.info(
+                            "[%s] 🩺 [CLINICAL] %d sintoma(s) SEM ÂNCORA na fala do paciente "
+                            "foram descartados: %s",
+                            instance, len(_soltos), _soltos[:8],
+                        )
+                        # Resumo que dependia de sintoma descartado não é confiável:
+                        # reconstrói a partir do que TEM âncora na conversa.
+                        if _resumo_inventa_clinico(clinical_summary, _txt_norm):
+                            clinical_summary = ""
             except Exception as exc:
                 logger.debug("[%s] [CLINICAL] LLM extrator secundário falhou (%s), usando heurística", instance, exc)
 
