@@ -12,6 +12,10 @@ __pycache__/
 *.bak
 *.bak-*
 webhook_server.py.bak-*
+*.bak.pre-*
+dist.bak-*/
+# Config pessoal do Reversa (o próprio arquivo pede pra não commitar)
+.reversa/config.user.toml
 # Mídia temporária (Whisper WAV cru, downloads Evolution, previews)
 *.wav
 *.raw

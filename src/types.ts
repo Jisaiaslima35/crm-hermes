@@ -123,6 +123,14 @@ export interface Tenant {
   logoUrl?: string;
   primaryColor?: string;
   businessNiche?: string;
+  /**
+   * Tipo de serviço do tenant (sprint dedetização 02/11/2026).
+   * 'servicos_dedetizacao' liga a esteira de 6 etapas, a emissão de
+   * Ordem de Serviço e o badge de fidelidade/mensalistas.
+   */
+  businessType?: string;
+  /** Slug canônico do tenant (ex.: 'adriano-dedetizacao'). */
+  slug?: string;
   aiEngine: AiEngineConfig;
   whatsappInstance: WhatsAppInstance;
   metrics: TenantMetrics;
@@ -212,6 +220,48 @@ export interface Lead {
   tenantSpecialty?: string;
   /** Nome do tenant (ex: 'Clínica Psiquiátrica Dr. Matheus Dore'). */
   tenantName?: string;
+  /** Insígnias e métricas dinâmicas do paciente */
+  total_orders_count?: number;
+  totalOrdersCount?: number;
+  total_spent_value?: number;
+  totalSpentValue?: number;
+  is_vip?: boolean;
+  isVip?: boolean;
+  has_incident_history?: boolean;
+  hasIncidentHistory?: boolean;
+  incident_count?: number;
+  incidentCount?: number;
+  last_incident_notes?: string;
+  lastIncidentNotes?: string;
+  ai_auto_silence?: boolean;
+  aiAutoSilence?: boolean;
+  /**
+   * Dados comerciais do lead (sprint Propostas B2B — 03/11/2026).
+   * Hoje não existe pré-cadastro de cliente: o nome que vem atrelado ao
+   * número no banco NÃO é necessariamente o nome fantasia do comércio.
+   * `nome_fantasia`/`empresa` são preenchidos pelo operador (lápis do card).
+   */
+  nome_fantasia?: string;
+  nomeFantasia?: string;
+  empresa?: string;
+  cidade?: string;
+  bairro?: string;
+}
+
+export interface KanbanStageConfig {
+  id?: string;
+  tenant_id: string;
+  stage_key: string;
+  stage_name: string;
+  stage_order: number;
+  is_active: boolean;
+  trigger_days: number;
+  trigger_time: string;
+  system_prompt?: string;
+  auto_message_template?: string;
+  requires_human_only: boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface StageColumnInfo {

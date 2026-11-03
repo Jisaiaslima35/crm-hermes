@@ -1,0 +1,27 @@
+--- followup_worker.py.bak-sprint-metrics-20261102	2026-11-02 14:16:43.358587003 -0300
++++ followup_worker.py	2026-11-02 14:16:37.162715747 -0300
+@@ -62,7 +62,14 @@
+ 
+ # --- Configuração -------------------------------------------------------------
+ SUPABASE_URL = os.environ.get("VITE_SUPABASE_URL", "").rstrip("/")
+-SUPABASE_KEY = os.environ.get("VITE_SUPABASE_ANON_KEY", "")
++# 02/11/2026: a tabela `tenants` tem RLS só para `authenticated`. Com a ANON key
++# o SELECT devolvia HTTP 401 e o worker morria em silêncio (1061 ciclos no log).
++# O backend é servidor -> usa SERVICE ROLE (ignora RLS), como o resto do CRM.
++SUPABASE_KEY = (
++    os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
++    or os.environ.get("SUPABASE_KEY", "").strip()
++    or os.environ.get("VITE_SUPABASE_ANON_KEY", "")
++)
+ EVOLUTION_BASE_URL = (
+     os.environ.get("EVOLUTION_API_URL")
+     or os.environ.get("EVOLUTION_BASE_URL")
+@@ -429,7 +436,7 @@
+ # --- main loop --------------------------------------------------------------
+ def main() -> int:
+     if not SUPABASE_URL or not SUPABASE_KEY:
+-        logger.error("VITE_SUPABASE_URL/ANON_KEY ausentes. Abort.")
++        logger.error("SUPABASE_URL / SERVICE_ROLE_KEY ausentes. Abort.")
+         return 2
+     if not EVOLUTION_API_KEY:
+         logger.error("EVOLUTION_API_KEY ausente. Abort.")

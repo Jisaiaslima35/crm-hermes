@@ -16,6 +16,7 @@ import { IntegrationsPage } from './components/IntegrationsPage';
 import { IntegrationsCallback } from './components/IntegrationsCallback';
 import { AgendaView } from './components/AgendaView';
 import { DashboardView } from './components/DashboardView';
+import { DecisionView } from './components/DecisionView';
 import { CampanhasReativacaoView } from './components/CampanhasReativacaoView';
 import { ProspectorView } from './components/ProspectorView';
 import { ProvisionView } from './components/ProvisionView';
@@ -847,6 +848,9 @@ function AppInner() {
               leads={leads}
               showToast={showToast}
             />
+          )}
+          {currentView === 'decision' && (
+            <DecisionView activeTenant={activeTenant} />
           )}
         </main>
       </div>

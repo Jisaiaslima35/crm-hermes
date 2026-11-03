@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Building,
   ChevronDown,
@@ -11,8 +11,13 @@ import {
   Menu,
   Power,
   Plane,
+  Zap,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
+
+const CRM_WEBHOOK_BASE =
+  (import.meta.env.VITE_CRM_WEBHOOK_URL as string | undefined) ||
+  'https://crm-webhook.automacaojs.us';
 
 interface TopbarProps {
   tenants: Tenant[];
@@ -65,6 +70,73 @@ export const Topbar: React.FC<TopbarProps> = ({
   const isConnected = instanceStatus === 'connected';
   const isReconnecting = instanceStatus === 'reconnecting';
   const aiEnabled = activeTenant.aiAutoReplyEnabled;
+
+  // --- Chave global de Automações temporais (31/10/2026) ---
+  // Estado próprio (não depende do tenant): busca /api/automations/status
+  // ao montar + a cada 60s; o clique chama /api/automations/toggle com
+  // feedback otimista imediato e confirmação do servidor.
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoAlive, setAutoAlive] = useState(false);
+  const [autoRunning, setAutoRunning] = useState(false);
+  const [autoLoading, setAutoLoading] = useState(true);
+  const [autoBusy, setAutoBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`${CRM_WEBHOOK_BASE}/api/automations/status`);
+        const data = await res.json();
+        if (!cancelled && data && typeof data.enabled === 'boolean') {
+          setAutoEnabled(data.enabled);
+          setAutoAlive(!!data.worker_alive);
+          setAutoRunning(!!data.is_running);
+        }
+      } catch {
+        // mantém o último estado conhecido
+      } finally {
+        if (!cancelled) setAutoLoading(false);
+      }
+    };
+    fetchStatus();
+    const timer = setInterval(fetchStatus, 60000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
+
+  const handleToggleAutomations = async () => {
+    if (autoBusy) return;
+    const next = !autoEnabled;
+    setAutoBusy(true);
+    // Feedback imediato (otimista), confirmado pelo servidor abaixo.
+    setAutoEnabled(next);
+    setAutoRunning(next && autoAlive);
+    try {
+      const res = await fetch(`${CRM_WEBHOOK_BASE}/api/automations/toggle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const data = await res.json();
+      if (data && typeof data.enabled === 'boolean') {
+        setAutoEnabled(data.enabled);
+        setAutoAlive(!!data.worker_alive);
+        setAutoRunning(!!data.is_running);
+      }
+    } catch {
+      // Reverte para o estado do servidor.
+      try {
+        const res = await fetch(`${CRM_WEBHOOK_BASE}/api/automations/status`);
+        const data = await res.json();
+        if (data && typeof data.enabled === 'boolean') {
+          setAutoEnabled(data.enabled);
+          setAutoAlive(!!data.worker_alive);
+          setAutoRunning(!!data.is_running);
+        }
+      } catch { /* mantém otimista */ }
+    } finally {
+      setAutoBusy(false);
+    }
+  };
 
   return (
     <header
@@ -205,10 +277,10 @@ export const Topbar: React.FC<TopbarProps> = ({
                   ? 'bg-[var(--bg-elevated)] text-[var(--label-primary)] shadow-[var(--shadow-control)] font-semibold'
                   : 'text-[var(--label-secondary)] hover:text-[var(--label-primary)]'
               }`}
-              title="Admin da Clínica: gerencia regras da persona, IA e equipe"
+              title="Admin Comercial: gerencia regras da persona, IA e equipe"
             >
-              <span className="hidden xl:inline">Admin Clínica</span>
-              <span className="xl:hidden">Clínica</span>
+              <span className="hidden xl:inline">Admin Comercial</span>
+              <span className="xl:hidden">Comercial</span>
             </button>
             <button
               id="role-attendant"
@@ -355,6 +427,53 @@ export const Topbar: React.FC<TopbarProps> = ({
             </span>
           </button>
         )}
+
+        {/* ⏱️ Chave global de Automações temporais — réguas D-1/D+3/D+28.
+            OFF = nenhuma régua dispara; o atendimento em tempo real
+            (webhook + Plantão) continua normal. */}
+        <button
+          id="btn-topbar-automacoes"
+          onClick={handleToggleAutomations}
+          disabled={autoBusy}
+          className={`flex items-center gap-2 px-3 py-2 rounded-[14px] text-xs transition-all cursor-pointer shrink-0 min-h-[44px] shadow-[var(--shadow-control)] ${
+            autoRunning
+              ? 'bg-emerald-500/16 hover:bg-emerald-500/24 text-emerald-200'
+              : 'bg-rose-500/16 hover:bg-rose-500/24 text-rose-200'
+          }`}
+          title={
+            autoRunning
+              ? 'Automações ATIVADAS — réguas temporais (D-1, D+3, D+28) disparam normalmente. Clique para pausar.'
+              : autoEnabled && !autoAlive
+              ? 'Automações LIGADAS mas o worker está parado — nenhuma régua dispara até o processo voltar. Clique para desligar a flag.'
+              : 'Automações PAUSADAS — nenhuma régua temporal dispara. O atendimento em tempo real continua normal. Clique para ativar.'
+          }
+          aria-pressed={autoRunning}
+        >
+          <span className="relative flex h-2.5 w-2.5 shrink-0">
+            <span
+              className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+                autoRunning ? 'bg-emerald-400' : 'bg-rose-500'
+              }`}
+            />
+          </span>
+          <Zap
+            className={`w-4 h-4 shrink-0 hidden sm:inline ${
+              autoRunning ? 'text-emerald-400' : 'text-rose-400'
+            }`}
+          />
+          <span className="font-semibold text-[12px] hidden sm:inline">
+            Automações
+          </span>
+          <span
+            className={`ap-chip font-mono hidden lg:inline ${
+              autoRunning
+                ? 'bg-emerald-500/18 text-emerald-300'
+                : 'bg-rose-500/18 text-rose-300'
+            }`}
+          >
+            {autoLoading ? '...' : autoRunning ? 'ON' : 'OFF'}
+          </span>
+        </button>
 
         {/* Fast Intake Button (TODOS) — acção primária */}
         <button

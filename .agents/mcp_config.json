@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rea": {
+      "command": "/usr/bin/rea",
+      "args": [
+        "--mcp"
+      ],
+      "env": {
+        "PATH": "/root/.hermes/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      }
+    }
+  }
+}

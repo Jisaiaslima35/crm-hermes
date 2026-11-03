@@ -56,12 +56,12 @@ interface DashboardViewProps {
 // ----------------------------------------------------------------------------
 // Helpers visuais
 // ----------------------------------------------------------------------------
-const CLINIC_CATEGORY_CHIPS: Array<{ key: FinancialCategory | 'all'; label: string; emoji: string }> = [
+const COMERCIAL_CATEGORY_CHIPS: Array<{ key: FinancialCategory | 'all'; label: string; emoji: string }> = [
   { key: 'all', label: 'Todos', emoji: '📊' },
-  { key: 'clinica_particular', label: '🏥 Clínica', emoji: '🏥' },
-  { key: 'previdenciario_inss', label: '⚖️ INSS', emoji: '⚖️' },
-  { key: 'convenio', label: '💳 Convênios', emoji: '💳' },
-  { key: 'laudo_pericial', label: '📋 Laudos', emoji: '📋' },
+  { key: 'clinica_particular', label: '🛒 Pedidos Faturados', emoji: '🛒' },
+  { key: 'convenio', label: '📦 Atacado B2B', emoji: '📦' },
+  { key: 'previdenciario_inss', label: '🐟 Pescados / Varejo', emoji: '🐟' },
+  { key: 'laudo_pericial', label: '📋 Outros Faturamentos', emoji: '📋' },
 ];
 
 const TURISMO_CATEGORY_CHIPS: Array<{ key: FinancialCategory | 'all'; label: string; emoji: string }> = [
@@ -93,13 +93,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     activeTenant.id === '44444444-4444-4444-4444-444444444444';
 
   const niche = nicheOf(activeTenant);
-  const MEDICAL_CHIP_KEYS = ['previdenciario_inss', 'convenio', 'laudo_pericial'];
-  const categoryChips =
-    niche === 'clinica'
-      ? CLINIC_CATEGORY_CHIPS
-      : niche === 'comercial'
-      ? CLINIC_CATEGORY_CHIPS.filter((c) => !MEDICAL_CHIP_KEYS.includes(c.key))
-      : TURISMO_CATEGORY_CHIPS;
+  const categoryChips = isTourism ? TURISMO_CATEGORY_CHIPS : COMERCIAL_CATEGORY_CHIPS;
 
   // Período + categoria
   const [periodKind, setPeriodKind] = useState<'this_month' | 'last_month' | 'custom'>('this_month');
@@ -405,9 +399,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         />
         <MetricCard
           icon={isTourism ? <Plane className="w-4 h-4 rotate-[-25deg]" /> : <CalendarCheck className="w-4 h-4" />}
-          label={niche === 'turismo' ? "Viagens Agendadas" : niche === 'comercial' ? "Serviços / Agendamentos" : "Consultas"}
+          label={niche === 'turismo' ? "Viagens Agendadas" : "Pedidos Faturados"}
           value={consultasMes.toString()}
-          hint={isTourism ? "cotações & viagens no mês" : "agendadas no mês"}
+          hint={isTourism ? "cotações & viagens no mês" : "pedidos no mês"}
           tone="violet"
         />
         <MetricCard
@@ -715,9 +709,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <thead>
             <tr className="border-y-2 border-slate-800 bg-slate-100 text-slate-800">
               <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Data</th>
-              <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Paciente / Cliente</th>
+              <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Cliente / Lead</th>
               <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Categoria</th>
-              <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Serviço / Procedimento</th>
+              <th className="py-2.5 px-2 text-left font-bold uppercase tracking-wider text-[11px]">Item / Pedido</th>
               <th className="py-2.5 px-2 text-right font-bold uppercase tracking-wider text-[11px]">Valor (R$)</th>
               <th className="py-2.5 px-2 text-center font-bold uppercase tracking-wider text-[11px]">Forma Pgto</th>
               <th className="py-2.5 px-2 text-center font-bold uppercase tracking-wider text-[11px]">Status</th>
@@ -1051,9 +1045,9 @@ function ManageFinancialModal({
                 <thead>
                   <tr className="text-left text-slate-400 bg-slate-950/70 border-b border-slate-800">
                     <th className="py-3 px-3 font-semibold">Data</th>
-                    <th className="py-3 px-3 font-semibold">Paciente</th>
+                    <th className="py-3 px-3 font-semibold">Cliente / Lead</th>
                     <th className="py-3 px-3 font-semibold">Categoria</th>
-                    <th className="py-3 px-3 font-semibold">Serviço</th>
+                    <th className="py-3 px-3 font-semibold">Item / Pedido</th>
                     <th className="py-3 px-3 font-semibold text-right">Valor</th>
                     <th className="py-3 px-3 font-semibold text-center">Status</th>
                     <th className="py-3 px-3 font-semibold text-right">Ações</th>
@@ -1240,10 +1234,10 @@ function EditEntryModal({ activeTenant, entry, onClose, onSaved, showToast }: Ed
                 </>
               ) : (
                 <>
-                  <option value="clinica_particular">Clínica Médica Particular</option>
-                  <option value="previdenciario_inss">Previdenciário INSS</option>
-                  <option value="convenio">Convênios</option>
-                  <option value="laudo_pericial">Laudo Pericial</option>
+                  <option value="clinica_particular">🛒 Pedido Varejo / Loja</option>
+                  <option value="convenio">📦 Atacado B2B / Restaurante</option>
+                  <option value="previdenciario_inss">🐟 Pescados & Frutos Frescos</option>
+                  <option value="laudo_pericial">📋 Faturamento Comercial</option>
                 </>
               )}
             </select>
@@ -1412,10 +1406,10 @@ function NewEntryModal({ activeTenant, leads, onClose, onCreated, showToast }: N
                 </>
               ) : (
                 <>
-                  <option value="clinica_particular">Clínica Médica</option>
-                  <option value="convenio">Convênios</option>
-                  <option value="previdenciario_inss">Previdenciário INSS</option>
-                  <option value="laudo_pericial">Laudos Periciais</option>
+                  <option value="clinica_particular">🛒 Pedido Varejo / Loja</option>
+                  <option value="convenio">📦 Atacado B2B / Restaurante</option>
+                  <option value="previdenciario_inss">🐟 Pescados & Frutos Frescos</option>
+                  <option value="laudo_pericial">📋 Faturamento Comercial</option>
                 </>
               )}
             </select>
@@ -1429,7 +1423,7 @@ function NewEntryModal({ activeTenant, leads, onClose, onCreated, showToast }: N
                 type="text"
                 value={serviceType}
                 onChange={(e) => setServiceType(e.target.value)}
-                placeholder={isTourism ? "Ex: Pacote Porto de Galinhas, Voo SP-Lisboa" : "Ex: Consulta Psiquiátrica"}
+                placeholder={isTourism ? "Ex: Pacote Porto de Galinhas, Voo SP-Lisboa" : "Ex: Atum Fresco Kg, Camarão, Tilápia"}
                 className="w-full px-3 py-2 text-xs bg-slate-800 border border-slate-700 rounded text-slate-200"
               />
             </div>

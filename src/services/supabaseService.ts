@@ -47,6 +47,18 @@ export interface DbTenant {
   schedule_rules?: any;
   // Regras de follow-up / resgate automático (JSONB)
   followup_rules?: any;
+  // Marca visual do tenant
+  logo_url?: string | null;
+  primary_color?: string | null;
+  // Nicho de negócio (clinica | turismo | comercial | ...)
+  business_niche?: string | null;
+  // 02/11/2026 (sprint dedetização): tipo de serviço do tenant.
+  // 'servicos_dedetizacao' liga a OS, a esteira de 6 etapas e o badge
+  // de fidelidade no frontend. Vem do slug canônico do tenant.
+  business_type?: string | null;
+  // Slug canônico do tenant (ex.: 'adriano-dedetizacao') — usado pela
+  // API de métricas multi-tenant e pela Sala de Decisões.
+  slug?: string | null;
 }
 
 export interface DbLead {
@@ -71,6 +83,18 @@ export interface DbLead {
   copilot_guidance?: string | null;
   suggested_reply?: string | null;
   last_copilot_eval_at?: string | null;
+  total_orders_count?: number | null;
+  total_spent_value?: number | null;
+  is_vip?: boolean | null;
+  has_incident_history?: boolean | null;
+  incident_count?: number | null;
+  last_incident_notes?: string | null;
+  ai_auto_silence?: boolean | null;
+  // Dados comerciais (sprint Propostas B2B — 03/11/2026)
+  nome_fantasia?: string | null;
+  empresa?: string | null;
+  cidade?: string | null;
+  bairro?: string | null;
 }
 
 export interface DbMessage {
@@ -123,6 +147,7 @@ function dbTenantToTenant(row: DbTenant): Tenant {
     logoUrl: row.logo_url || undefined,
     primaryColor: row.primary_color || undefined,
     businessNiche: row.business_niche || undefined,
+    businessType: row.business_type || undefined,
     aiEngine: {
       mode: row.ai_mode,
       hermesEndpoint: '',
@@ -190,6 +215,25 @@ function dbLeadToLead(row: DbLead): Lead {
     copilotGuidance: row.copilot_guidance ?? undefined,
     suggestedReply: row.suggested_reply ?? undefined,
     lastCopilotEvalAt: row.last_copilot_eval_at ?? undefined,
+    total_orders_count: row.total_orders_count ?? 0,
+    totalOrdersCount: row.total_orders_count ?? 0,
+    total_spent_value: Number(row.total_spent_value ?? 0),
+    totalSpentValue: Number(row.total_spent_value ?? 0),
+    is_vip: Boolean(row.is_vip),
+    isVip: Boolean(row.is_vip),
+    has_incident_history: Boolean(row.has_incident_history),
+    hasIncidentHistory: Boolean(row.has_incident_history),
+    incident_count: row.incident_count ?? 0,
+    incidentCount: row.incident_count ?? 0,
+    last_incident_notes: row.last_incident_notes ?? '',
+    lastIncidentNotes: row.last_incident_notes ?? '',
+    ai_auto_silence: Boolean(row.ai_auto_silence),
+    aiAutoSilence: Boolean(row.ai_auto_silence),
+    nome_fantasia: row.nome_fantasia ?? undefined,
+    nomeFantasia: row.nome_fantasia ?? undefined,
+    empresa: row.empresa ?? undefined,
+    cidade: row.cidade ?? undefined,
+    bairro: row.bairro ?? undefined,
     messages,
     internalNotes: [],
     createdAt: row.created_at,
@@ -221,7 +265,7 @@ export async function getTenants(): Promise<Tenant[]> {
     // select('*') para a coluna legada `byok_api_key` (chave do cliente em
     // claro) e a `byok_api_key_encrypted` não atravessarem a rede até ao
     // browser. A máscara vem do endpoint autenticado do backend.
-    .select('id, name, specialty, doctor_name, phone, city, logo_url, primary_color, business_niche, ai_mode, byok_provider, byok_model, persona_name, tone_of_voice, system_prompt, schedule_rules, followup_rules, ai_auto_reply_enabled, evolution_instance, status, created_at')
+    .select('id, name, specialty, doctor_name, phone, city, logo_url, primary_color, business_niche, business_type, slug, ai_mode, byok_provider, byok_model, persona_name, tone_of_voice, system_prompt, schedule_rules, followup_rules, ai_auto_reply_enabled, evolution_instance, status, created_at')
     .order('name', { ascending: true });
   if (error) throw new Error(`getTenants: ${error.message}`);
   return (data ?? []).map(dbTenantToTenant);
@@ -230,7 +274,7 @@ export async function getTenants(): Promise<Tenant[]> {
 export async function getLeads(tenantId: string): Promise<Lead[]> {
   const { data, error } = await supabase
     .from('leads')
-    .select('id, tenant_id, name, phone, stage, priority, insurance, clinical_summary, symptoms, appointment_schedule, internal_notes, last_interaction, conversion_probability, negotiation_stage, current_objection, copilot_guidance, suggested_reply, handoff_state, last_copilot_eval_at, created_at, updated_at, trip_destination')
+    .select('id, tenant_id, name, phone, stage, priority, insurance, clinical_summary, symptoms, appointment_schedule, internal_notes, last_interaction, conversion_probability, negotiation_stage, current_objection, copilot_guidance, suggested_reply, handoff_state, last_copilot_eval_at, created_at, updated_at, trip_destination, total_orders_count, total_spent_value, is_vip, has_incident_history, incident_count, last_incident_notes, ai_auto_silence, nome_fantasia, empresa, cidade, bairro')
     .eq('tenant_id', tenantId)
     .order('updated_at', { ascending: false, nullsFirst: false })
     .limit(2000);
@@ -334,6 +378,12 @@ export async function patchLead(input: {
   stage?: PipelineStage;
   handoff_state?: HandoffState;
   appointment_schedule?: string;
+  /** Dados comerciais (sprint Propostas B2B — 03/11/2026) */
+  nome_fantasia?: string;
+  empresa?: string;
+  cidade?: string;
+  bairro?: string;
+  phone?: string;
 }): Promise<void> {
   const payload: Record<string, unknown> = {};
   if (input.name !== undefined) payload.name = input.name;
@@ -346,6 +396,11 @@ export async function patchLead(input: {
   if (input.handoff_state !== undefined) payload.handoff_state = input.handoff_state;
   if (input.appointment_schedule !== undefined)
     payload.appointment_schedule = input.appointment_schedule;
+  if (input.nome_fantasia !== undefined) payload.nome_fantasia = input.nome_fantasia;
+  if (input.empresa !== undefined) payload.empresa = input.empresa;
+  if (input.cidade !== undefined) payload.cidade = input.cidade;
+  if (input.bairro !== undefined) payload.bairro = input.bairro;
+  if (input.phone !== undefined) payload.phone = input.phone;
   if (Object.keys(payload).length === 0) return;
   const { error } = await supabase.from('leads').update(payload).eq('id', input.id);
   if (error) throw new Error(`patchLead: ${error.message}`);
@@ -809,6 +864,19 @@ export interface KanbanStageRow {
   ai_keywords?: string[];
   ai_prompt_hint?: string;
   has_automation: boolean;
+  /** 02/11/2026 (sprint dedetização) — chave da etapa de automação (o ⚙️
+   *  usa esta chave; sem ela o botão editava a etapa errada). */
+  automation_stage_key?: string;
+  /** Âncora do gatilho: auto | future | past (contagem a partir da consulta). */
+  anchor_mode?: 'auto' | 'future' | 'past';
+  /** Labels alternativos de `leads.stage` que também caem nesta etapa. */
+  stage_aliases?: string[];
+  requires_human_only?: boolean;
+  is_active?: boolean;
+  trigger_days?: number | null;
+  trigger_time?: string;
+  auto_message_template?: string;
+  color_accent?: string;
 }
 
 export async function fetchKanbanStages(tenantId: string): Promise<KanbanStageRow[] | null> {

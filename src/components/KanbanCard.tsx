@@ -13,6 +13,10 @@ import {
   Building2,
   Tag,
   Plane,
+  FileBadge,
+  FileText,
+  Pencil,
+  MessageCircle,
 } from 'lucide-react';
 import { Lead, PipelineStage } from '../types';
 import { formatAppointmentSlot } from '../utils/dateUtils';
@@ -53,6 +57,34 @@ interface KanbanCardProps {
   onToggleHandoff: (leadId: string) => void;
   onMoveStage?: (leadId: string, targetStage: PipelineStage) => void;
   onRegisterTrip?: (lead: Lead) => void;
+  /**
+   * 02/11/2026 (sprint dedetização) — abre a Ordem de Serviço. Só é
+   * passado pelo board quando o tenant é de dedetização.
+   */
+  onEmitirOS?: (lead: Lead) => void;
+  /**
+   * Cotação & Proposta Comercial B2B (Peixaria do William / Varejo)
+   */
+  onGerarProposta?: (lead: Lead) => void;
+  /**
+   * Sprint Propostas B2B (03/11/2026) — dispara a proposta em TEXTO puro
+   * no WhatsApp do cliente (Evolution sendText).
+   */
+  onPropostaTexto?: (lead: Lead) => void;
+  /**
+   * Sprint Propostas B2B (03/11/2026) — gera o PDF no servidor e envia
+   * como documento pelo WhatsApp (Evolution sendMedia application/pdf).
+   */
+  onPropostaPdf?: (lead: Lead) => void;
+  /**
+   * Sprint Propostas B2B (03/11/2026) — lápis para corrigir nome fantasia,
+   * empresa, telefone, cidade e bairro do lead (o nome do banco não é
+   * necessariamente o nome do comércio).
+   */
+  onEditarComercial?: (lead: Lead) => void;
+  /** Indica envio em andamento (desabilita o botão correspondente). */
+  propostaBusyTexto?: boolean;
+  propostaBusyPdf?: boolean;
 }
 
 export const KanbanCard: React.FC<KanbanCardProps> = ({
@@ -60,6 +92,13 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
   onOpenChat,
   onToggleHandoff,
   onRegisterTrip,
+  onEmitirOS,
+  onGerarProposta,
+  onPropostaTexto,
+  onPropostaPdf,
+  onEditarComercial,
+  propostaBusyTexto,
+  propostaBusyPdf,
 }) => {
   const isHumanAssumed = lead.handoffState === 'humano_assumiu';
   const isCold = (lead.silenceHours || 0) >= 4 &&
@@ -191,8 +230,59 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
           lead.tenantName?.toLowerCase().includes('esvc');
         const isWon = lead.stage === 'fechou_vendido' || lead.stage === 'contratou';
 
+        const totalOrders = lead.totalOrdersCount ?? lead.total_orders_count ?? 0;
+        const totalSpent = Number(lead.totalSpentValue ?? lead.total_spent_value ?? 0);
+        const isVip = Boolean(lead.isVip ?? lead.is_vip);
+        const hasIncident = Boolean(lead.hasIncidentHistory ?? lead.has_incident_history);
+        const incidentNotes = lead.lastIncidentNotes || lead.last_incident_notes || 'Histórico de atrito / risco de conflito registrado';
+
         return (
           <>
+            {/* Badges e Insígnias Dinâmicas (Pedidos, Financeiro, VIP, Alerta de Atrito) */}
+            {(totalOrders > 0 || totalSpent > 0 || isVip || hasIncident) && (
+              <div className="flex flex-wrap items-center gap-1.5 mb-2.5">
+                {totalOrders > 0 && (
+                  <span
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-500/15 text-blue-300 border border-blue-500/30"
+                    title={`Total de atendimentos/pedidos: ${totalOrders}`}
+                  >
+                    <span>🔁</span>
+                    <span>#{totalOrders}</span>
+                  </span>
+                )}
+
+                {totalSpent > 0 && (
+                  <span
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                    title={`Total investido: R$ ${totalSpent.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                  >
+                    <span>💰</span>
+                    <span>R$ {totalSpent.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                  </span>
+                )}
+
+                {isVip && (
+                  <span
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-gradient-to-r from-amber-500/25 to-yellow-500/25 text-amber-300 border border-amber-400/50 shadow-[0_0_8px_rgba(245,158,11,0.25)]"
+                    title="Paciente / Cliente VIP"
+                  >
+                    <span>⭐</span>
+                    <span>VIP</span>
+                  </span>
+                )}
+
+                {hasIncident && (
+                  <span
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse cursor-help"
+                    title={`⚠️ ATENÇÃO: ${incidentNotes}`}
+                  >
+                    <span>⚠️</span>
+                    <span>ATENÇÃO</span>
+                  </span>
+                )}
+              </div>
+            )}
+
             <div className="p-3 rounded-[12px] bg-white/[0.045] mb-3">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--label-secondary)] mb-1">
                 {isTourism ? (
@@ -260,6 +350,96 @@ export const KanbanCard: React.FC<KanbanCardProps> = ({
         <div className="mb-3 px-3 py-2 rounded-[10px] bg-teal-500/14 flex items-center gap-1.5 text-[11px] text-teal-300 font-medium">
           <CalendarCheck className="w-3.5 h-3.5 text-teal-400 shrink-0" />
           <span className="truncate">{formatAppointmentSlot(lead.appointmentTimeSlot)}</span>
+        </div>
+      )}
+
+      {/* Ordem de Serviço (sprint dedetização) */}
+      {onEmitirOS && (
+        <div className="mb-3">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEmitirOS(lead);
+            }}
+            className="w-full py-2 px-3 rounded-[12px] bg-emerald-500/14 hover:bg-emerald-500/26 text-emerald-300 text-[12px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[36px]"
+          >
+            <FileBadge className="w-3.5 h-3.5 text-emerald-400" />
+            <span>📄 Ordem de Serviço</span>
+          </button>
+        </div>
+      )}
+
+      {/* Proposta Comercial B2B (sprint 03/11/2026) */}
+      {(onPropostaTexto || onPropostaPdf || onEditarComercial || onGerarProposta) && (
+        <div className="mb-3 space-y-1.5">
+          {onEditarComercial && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEditarComercial(lead);
+              }}
+              className="w-full py-2 px-3 rounded-[12px] bg-slate-700/40 hover:bg-slate-700/60 text-slate-200 text-[12px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[36px]"
+              title="Corrigir nome fantasia, empresa, telefone, cidade e bairro do cliente"
+            >
+              <Pencil className="w-3.5 h-3.5 text-slate-300" />
+              <span>✏️ Dados do cliente</span>
+            </button>
+          )}
+
+          {onPropostaTexto && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onPropostaTexto(lead);
+              }}
+              className="w-full py-2 px-3 rounded-[12px] bg-emerald-500/15 hover:bg-emerald-500/28 text-emerald-300 text-[12px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[36px] disabled:opacity-50"
+              title="Envia a proposta em texto puro no WhatsApp do cliente"
+              disabled={propostaBusyTexto}
+            >
+              <MessageCircle className="w-3.5 h-3.5 text-emerald-400" />
+              <span>
+                {propostaBusyTexto
+                  ? 'Enviando texto...'
+                  : '💬 Disparar Proposta WhatsApp (Texto)'}
+              </span>
+            </button>
+          )}
+
+          {onPropostaPdf && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onPropostaPdf(lead);
+              }}
+              className="w-full py-2 px-3 rounded-[12px] bg-blue-500/15 hover:bg-blue-500/28 text-blue-300 text-[12px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[36px] disabled:opacity-50"
+              title="Gera o PDF timbrado no servidor e envia pelo WhatsApp"
+              disabled={propostaBusyPdf}
+            >
+              <FileText className="w-3.5 h-3.5 text-blue-400" />
+              <span>
+                {propostaBusyPdf ? 'Gerando e enviando PDF...' : '📄 Gerar e Enviar Proposta PDF (WhatsApp)'}
+              </span>
+            </button>
+          )}
+
+          {onGerarProposta && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onGerarProposta(lead);
+              }}
+              className="w-full py-1.5 px-3 rounded-[12px] bg-slate-800/60 hover:bg-slate-800 text-slate-300 text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[32px]"
+              title="Abrir editor de itens, condições e prévia do PDF"
+            >
+              <Pencil className="w-3 h-3 text-slate-400" />
+              <span>🧾 Revisar proposta (itens e condições)</span>
+            </button>
+          )}
         </div>
       )}
 

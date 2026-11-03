@@ -10,9 +10,11 @@ import {
   X,
   RefreshCw,
   Building2,
+  UserPlus,
 } from 'lucide-react';
 import { Tenant } from '../types';
 import { nicheOf } from '../utils/niche';
+import { supabase } from '../services/supabaseClient';
 import {
   mineProspector,
   dispatchProspector,
@@ -27,11 +29,13 @@ interface ProspectorViewProps {
 }
 
 const NICHOS = [
+  'Restaurantes',
+  'Bares & Petiscarias',
+  'Quiosques & Barracas de Praia',
+  'Buffets & Eventos',
   'Lanchonete',
   'Pizzaria',
   'Hamburgueria',
-  'Restaurante',
-  'Buffet & Eventos',
   'Cerimonialista',
   'Eventos',
   'Dedetização',
@@ -211,6 +215,42 @@ export const ProspectorView: React.FC<ProspectorViewProps> = ({ activeTenant, on
 
   const fmtDate = (iso?: string) =>
     iso ? new Date(iso).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : '—';
+
+  const [importingId, setImportingId] = useState<string | null>(null);
+
+  const handleImportLeadToCrm = async (l: any) => {
+    try {
+      setImportingId(l.id);
+      const cleanPhone = (l.phone || '').replace(/\D/g, '');
+      const fullPhone = cleanPhone.startsWith('55') ? cleanPhone : `55${cleanPhone}`;
+
+      const { data, error } = await supabase.from('leads').upsert(
+        {
+          tenant_id: activeTenant.id,
+          name: l.business_name || 'Restaurante / Comércio',
+          phone: fullPhone,
+          stage: 'proposta_b2b',
+          negotiation_stage: 'proposta_b2b',
+          clinical_summary: `Prospectado via B2B: ${l.category || 'Comércio'} em ${l.city || 'Natal'} ${l.neighborhood || ''}`,
+          internal_notes: `Endereço: ${l.address || l.neighborhood || 'Natal/RN'}. Origem: Prospector B2B`,
+          ai_active: true,
+          handoff_state: 'ia_ativa',
+          conversion_probability: 70,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'tenant_id,phone' }
+      );
+
+      if (error) throw error;
+      onToast?.(`Lead "${l.business_name}" importado com sucesso na coluna [Cotação & Proposta B2B]!`, 'success');
+      refresh();
+    } catch (e: any) {
+      console.error('[ProspectorView] Erro ao importar:', e);
+      onToast?.(`Erro ao importar lead: ${e.message}`, 'error');
+    } finally {
+      setImportingId(null);
+    }
+  };
 
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden">
@@ -525,12 +565,13 @@ export const ProspectorView: React.FC<ProspectorViewProps> = ({ activeTenant, on
                   <th className="px-4 py-3 font-bold">Cidade</th>
                   <th className="px-4 py-3 font-bold">Status</th>
                   <th className="px-4 py-3 font-bold">Último envio</th>
+                  <th className="px-4 py-3 font-bold text-right">Ação</th>
                 </tr>
               </thead>
               <tbody>
                 {leads.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="px-4 py-10 text-center text-slate-500">
+                    <td colSpan={7} className="px-4 py-10 text-center text-slate-500">
                       Nenhum lead prospectado ainda. Rode uma mineração na aba Operação & Disparo.
                     </td>
                   </tr>
@@ -554,6 +595,18 @@ export const ProspectorView: React.FC<ProspectorViewProps> = ({ activeTenant, on
                         </span>
                       </td>
                       <td className="px-4 py-2.5 text-slate-400">{fmtDate(l.last_contact_at)}</td>
+                      <td className="px-4 py-2.5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleImportLeadToCrm(l)}
+                          disabled={importingId === l.id}
+                          className="px-2.5 py-1 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/40 text-blue-300 text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                          title="Importar direto para a coluna Cotação & Proposta B2B do CRM"
+                        >
+                          <UserPlus className="w-3.5 h-3.5" />
+                          <span>{importingId === l.id ? 'Importando...' : 'Importar p/ CRM'}</span>
+                        </button>
+                      </td>
                     </tr>
                   ))
                 )}

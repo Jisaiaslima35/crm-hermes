@@ -49,15 +49,43 @@ export function useAuth(): AuthApi {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Bootstrap: tenta puxar session existente do localStorage.
+  // Bootstrap: tenta puxar session existente do localStorage ou via SSO (hash / query).
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const { data } = await supabase.auth.getSession();
+        let currentSession: Session | null = null;
+        if (typeof window !== 'undefined') {
+          const hash = window.location.hash || '';
+          const hashMatch = hash.match(/access_token=([^&]+)/);
+          const refreshMatch = hash.match(/refresh_token=([^&]+)/);
+          const searchParams = new URLSearchParams(window.location.search);
+          const ssoToken = searchParams.get('sso_token') || (hashMatch ? decodeURIComponent(hashMatch[1]) : null);
+          const refreshToken = searchParams.get('refresh_token') || (refreshMatch ? decodeURIComponent(refreshMatch[1]) : ssoToken);
+
+          if (ssoToken) {
+            try {
+              const { data: ssoData, error: ssoErr } = await supabase.auth.setSession({
+                access_token: ssoToken,
+                refresh_token: refreshToken || ssoToken,
+              });
+              if (!ssoErr && ssoData?.session) {
+                currentSession = ssoData.session;
+              }
+            } catch (sErr) {
+              console.warn('[useAuth] SSO setSession falhou:', sErr);
+            }
+          }
+        }
+
+        if (!currentSession) {
+          const { data } = await supabase.auth.getSession();
+          currentSession = data.session;
+        }
+
         if (!mounted) return;
-        setSession(data.session);
-        setUser(data.session?.user ?? null);
+        setSession(currentSession);
+        setUser(currentSession?.user ?? null);
       } catch (err) {
         console.warn('[useAuth] getSession falhou:', err);
       } finally {

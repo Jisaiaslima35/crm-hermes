@@ -1,0 +1,216 @@
+--- webhook_server.py.bak-sprint-metrics-20261102	2026-11-02 14:02:41.571080780 -0300
++++ webhook_server.py	2026-11-02 14:14:24.964462760 -0300
+@@ -17,6 +17,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import hmac
+ import json
+ import logging
+ import os
+@@ -54,7 +55,7 @@
+ 
+ # Carrega .env do projeto (URLs, ANON key) + cofre Hermes (chaves LLM/Evolution/Composio)
+ load_dotenv(os.path.join(BASE_DIR, ".env"))
+-for _secret in ("9router.env", "evolution.env", "composio.env"):
++for _secret in ("9router.env", "evolution.env", "composio.env", "crm-internal.env"):
+     _p = os.path.join("/root/.hermes/secrets", _secret)
+     if os.path.exists(_p):
+         load_dotenv(_p, override=False)
+@@ -246,6 +247,80 @@
+     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+ )
+ 
++# API de métricas: rota rápida via KONG INTERNO (PostgREST sem Cloudflare/Tunnel).
++# O host público (supabase.automacaojs.us) custa ~110-180ms por chamada por causa do
++# TLS + CF; o Kong local (127.0.0.1:28000) responde em ~30-60ms com keep-alive.
++# Se o Kong interno falhar, o endpoint cai automaticamente para o PostgREST público.
++SUPABASE_INTERNAL_BASE = (
++    os.environ.get("SUPABASE_INTERNAL_URL", "").strip() or "http://127.0.0.1:28000"
++).rstrip("/")
++_METRICS_SERVICE_KEY = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
++_metrics_http = httpx.Client(
++    timeout=20.0, limits=httpx.Limits(max_keepalive_connections=4, max_connections=8)
++)
++
++
++def _internal_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
++    """GET no PostgREST INTERNO (Kong local). Retorna None se falhar."""
++    try:
++        resp = _metrics_http.get(
++            f"{SUPABASE_INTERNAL_BASE}{path}",
++            params=params,
++            headers={
++                "apikey": _METRICS_SERVICE_KEY,
++                "Authorization": f"Bearer {_METRICS_SERVICE_KEY}",
++            },
++        )
++        if resp.status_code == 200:
++            return resp.json()
++    except Exception as exc:
++        logger.debug(f"_internal_get falhou em {path}: {type(exc).__name__}")
++    return None
++
++
++def _metrics_snapshot_rpc(tid: str, days: int) -> tuple[dict[str, Any], str]:
++    """Chama public.metrics_snapshot. Rota 1 = Kong interno; rota 2 = PostgREST público."""
++    body = {"p_tenant_id": tid, "p_days_back": days}
++    headers = {
++        "apikey": _METRICS_SERVICE_KEY,
++        "Authorization": f"Bearer {_METRICS_SERVICE_KEY}",
++        "Content-Type": "application/json",
++    }
++    try:
++        resp = _metrics_http.post(
++            f"{SUPABASE_INTERNAL_BASE}/rest/v1/rpc/metrics_snapshot",
++            json=body,
++            headers=headers,
++        )
++        if resp.status_code == 200:
++            data = resp.json()
++            cand = (
++                data
++                if isinstance(data, dict)
++                else (data[0] if isinstance(data, list) and data else data)
++            )
++            if isinstance(cand, dict):
++                return cand, "kong-interno"
++        logger.warning(
++            f"metrics_snapshot via kong-interno respondeu {resp.status_code}; "
++            "usando PostgREST publico"
++        )
++    except Exception as exc:
++        logger.warning(
++            f"metrics_snapshot via kong-interno falhou ({type(exc).__name__}); "
++            "usando PostgREST publico"
++        )
++    res = sb_service.rpc("metrics_snapshot", body).execute()
++    data = res.data
++    cand = (
++        data
++        if isinstance(data, dict)
++        else (data[0] if isinstance(data, list) and data else data)
++    )
++    if not isinstance(cand, dict):
++        raise RuntimeError("metricas vazias")
++    return cand, "postgrest-publico"
++
+ 
+ # ============================================================================
+ # SEGREDOS DO TENANT (chave BYOK) — cifra em repouso
+@@ -4595,10 +4670,34 @@
+ 
+ 
+ def _decision_resolve_tenant(value):
+-    """Resolve tenant_id (UUID) ou apelido -> (id, nome) ou None."""
++    """Resolve tenant_id (UUID) ou apelido -> (id, nome) ou None.
++
++    02/11/2026: rota interna (Kong local) primeiro — o PostgREST público via
++    Cloudflare custava ~150ms x 2 consultas por resolução.
++    """
+     value = (value or "").strip()
+     if not value:
+         return None
++    rows = _internal_get("/rest/v1/tenants", {"select": "id,name", "id": f"eq.{value}"})
++    if not rows:
++        rows = _internal_get("/rest/v1/tenants", {"select": "id,name"})
++    if rows:
++        try:
++            if len(rows) == 1 and rows[0].get("id") == value:
++                return rows[0]["id"], rows[0]["name"]
++            want = _slugify(value)
++            cands = []
++            for r in rows:
++                slug = _slugify(r.get("name") or "")
++                if want and (want == slug or want in slug):
++                    cands.append(r)
++            if len(cands) == 1:
++                return cands[0]["id"], cands[0]["name"]
++            if len(cands) > 1:
++                return None
++        except Exception:
++            pass
++    # fallback: PostgREST público
+     try:
+         res = (
+             sb_service.table("tenants")
+@@ -4883,6 +4982,79 @@
+     }
+ 
+ 
++# ============================================================================
++# API UNIVERSAL DE MÉTRICAS MULTI-TENANT (fonte única da verdade)
++# ============================================================================
++# Token de serviço (server-to-server) no cofre /root/.hermes/secrets/
++# crm-internal.env — NUNCA versionar o valor.
++CRM_INTERNAL_TOKEN = os.environ.get("CRM_INTERNAL_TOKEN", "").strip()
++
++# Headers que provêm proxy/túnel: com eles o token passa a ser obrigatório
++# (senão o endpoint interno viraria público via domínio).
++_PROXY_HEADERS = (
++    "x-forwarded-for", "cf-connecting-ip", "x-real-ip",
++    "x-forwarded-proto", "forwarded", "x-forwarded-host",
++)
++
++
++def _metrics_internal_authorized(request: Request) -> bool:
++    """Libera chamada local direta (sem proxy) ou com X-Internal-Token correto.
++
++    Token enviado e errado -> NEGADO (não cai no fallback local).
++    Sem token -> só passa se for chamada local direta e sem headers de proxy.
++    """
++    token = (request.headers.get("x-internal-token") or "").strip()
++    if token:
++        return bool(CRM_INTERNAL_TOKEN and hmac.compare_digest(token, CRM_INTERNAL_TOKEN))
++    if any(request.headers.get(h) for h in _PROXY_HEADERS):
++        return False
++    client = request.client
++    return bool(client and client.host in ("127.0.0.1", "::1", "localhost"))
++
++
++@app.get("/api/v1/metrics/snapshot")
++async def metrics_snapshot(request: Request, tenant_id: str, days_back: int = 7) -> dict[str, Any]:
++    """Snapshot consolidado de métricas do tenant — fonte única da verdade.
++
++    GET /api/v1/metrics/snapshot?tenant_id={uuid|apelido}&days_back={N}
++    Auth interna: header X-Internal-Token (server-to-server) ou chamada
++    local direta (sem proxy). Resposta em < 300 ms (1 ida ao banco via RPC).
++    """
++    if not _metrics_internal_authorized(request):
++        raise HTTPException(status_code=401, detail="X-Internal-Token ausente ou invalido")
++    try:
++        days_back = max(1, min(90, int(days_back or 7)))
++    except (TypeError, ValueError):
++        days_back = 7
++    # UUID puro -> sem roundtrip extra de resolução (mantém a latência < 300ms)
++    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tenant_id.strip()):
++        tid, tname = tenant_id.strip(), ""
++    else:
++        resolved = _decision_resolve_tenant(tenant_id)
++        if not resolved:
++            raise HTTPException(
++                status_code=404,
++                detail="tenant nao encontrado (use o UUID ou o apelido, ex: dr-matheus-dore)",
++            )
++        tid, tname = resolved
++    t0 = time.perf_counter()
++    try:
++        payload, origem = _metrics_snapshot_rpc(tid, days_back)
++    except Exception as exc:
++        raise HTTPException(
++            status_code=502,
++            detail=f"falha ao consultar metricas: {type(exc).__name__}",
++        )
++    if not isinstance(payload, dict):
++        raise HTTPException(status_code=502, detail="metricas vazias")
++    out = dict(payload)
++    out["tenant_nome"] = out.get("tenant_nome") or tname
++    out["fonte"] = "crm-hermes /api/v1/metrics/snapshot"
++    out["origem_dados"] = origem
++    out["latencia_ms"] = round((time.perf_counter() - t0) * 1000, 1)
++    return out
++
++
+ @app.get("/api/automations/status")
+ async def automations_status() -> dict[str, Any]:
+     """Estado da chave global de automações + vida do worker."""

@@ -13,7 +13,10 @@ import {
   FileSpreadsheet,
   Plane,
   Plus,
+  FileText,
+  Download,
 } from 'lucide-react';
+import { supabase } from '../services/supabaseClient';
 import { Lead, PipelineStage, Tenant, StageColumnInfo, UserRole } from '../types';
 import { nicheOf } from '../utils/niche';
 import { fetchKanbanStages, stampStageTransition, KanbanStageRow, createKanbanStage } from '../services/supabaseService';
@@ -21,8 +24,13 @@ import { StageEditModal, StageDeleteModal, DynStageRow } from './StageCrudModals
 import { PIPELINE_STAGES, TURISMO_PIPELINE_STAGES } from '../constants';
 import { KanbanCard } from './KanbanCard';
 import { StageAutomationModal } from './StageAutomationModal';
+import { StageConfigModal } from './StageConfigModal';
 import { NewTripModal } from './NewTripModal';
 import { ImportLeadsModal } from './ImportLeadsModal';
+import { OrdemServicoModal } from './OrdemServicoModal';
+import { PropostaB2BModal } from './PropostaB2BModal';
+import { LeadDadosComerciaisModal } from './LeadDadosComerciaisModal';
+import { enviarProposta } from '../services/propostaService';
 
 interface KanbanBoardProps {
   leads: Lead[];
@@ -125,7 +133,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     cancelou: 'perdido',
   };
 
-  const renderStages: StageColumnInfo[] = dynStages
+  const renderStages: StageColumnInfo[] = (dynStages
     ? dynStages.map((s, i) => ({
         id: s.slug as PipelineStage,
         title: s.title,
@@ -134,14 +142,20 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
         badgeText: DYN_PALETTE[i % DYN_PALETTE.length].badgeText,
         borderHover: DYN_PALETTE[i % DYN_PALETTE.length].borderHover,
         hasAutomationGear: !!s.has_automation && s.slug !== 'novo_lead',
-        automationStageKey: DYN_GEAR_KEY[s.slug] || 'cotacao',
+        // 02/11/2026: a chave de automação vem do próprio config (o ⚙️ tem
+        // que editar a linha certa da etapa). Fallback no mapa legado.
+        automationStageKey:
+          (s as any).automation_stage_key || DYN_GEAR_KEY[s.slug] || 'cotacao',
         stageId: s.id,
         colorAccent: (s as any).color_accent,
         isProtected: !!(s as any).is_system_protected,
         keywords: (s as any).trigger_keywords || s.ai_keywords || [],
         description: (s as any).semantic_description || s.ai_prompt_hint || '',
+        position: (s as any).position || i + 1,
+        isActive: (s as any).is_active !== false,
       }))
-    : currentStages;
+    : currentStages
+  ).filter((s: any) => s.isActive !== false);
 
   // Enriquece cada lead com info do tenant ativo
   const enrichedLeads: Lead[] = activeTenant
@@ -158,6 +172,13 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   const [draggedOverStage, setDraggedOverStage] = useState<PipelineStage | null>(null);
 
   // Modals state
+  const [stageConfigModalOpen, setStageConfigModalOpen] = useState(false);
+  const [selectedStageConfig, setSelectedStageConfig] = useState<{
+    key: string;
+    name: string;
+    order?: number;
+  } | null>(null);
+
   const [automationModalOpen, setAutomationModalOpen] = useState(false);
   const [automationStageKey, setAutomationStageKey] = useState<string>('cotacao');
 
@@ -168,9 +189,133 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [toastMsg, setToastMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
+  // 02/11/2026 (sprint dedetização) — Ordem de Serviço
+  const [osModalOpen, setOsModalOpen] = useState(false);
+  const [osLead, setOsLead] = useState<Lead | null>(null);
+  const isDedetizacao =
+    activeTenant?.businessType === 'servicos_dedetizacao' ||
+    activeTenant?.slug === 'adriano-dedetizacao';
+
+  // Cotação & Proposta Comercial B2B (Peixaria do William / Varejo)
+  const [propostaModalOpen, setPropostaModalOpen] = useState(false);
+  const [propostaLead, setPropostaLead] = useState<Lead | null>(null);
+  // Lápis de dados comerciais (msg 5983: o nome do banco não é o do comércio)
+  const [comercialModalOpen, setComercialModalOpen] = useState(false);
+  const [comercialLead, setComercialLead] = useState<Lead | null>(null);
+  const [propostaBusy, setPropostaBusy] = useState<Record<string, boolean>>({});
+  const isPeixaria =
+    activeTenant?.businessType === 'peixaria' ||
+    activeTenant?.slug === 'peixaria-william' ||
+    (activeTenant?.name || '').toLowerCase().includes('peixaria') ||
+    (activeTenant?.name || '').toLowerCase().includes('william');
+
+  /** Dispara a proposta no WhatsApp — modo 'texto' (sendText) ou 'pdf' (sendMedia). */
+  const handleDispararProposta = async (lead: Lead, modo: 'texto' | 'pdf') => {
+    const key = `${lead.id}:${modo}`;
+    if (propostaBusy[key]) return;
+    setPropostaBusy((p) => ({ ...p, [key]: true }));
+    try {
+      const r = await enviarProposta({ leadId: lead.id, modo });
+      if (r.ok) {
+        showToast(
+          modo === 'pdf'
+            ? `📄 Proposta PDF enviada no WhatsApp de ${lead.name} (${r.numero || ''})`
+            : `💬 Proposta em texto enviada no WhatsApp de ${lead.name}`,
+          'success'
+        );
+      } else {
+        showToast(
+          `Falha ao enviar para ${lead.name}: ${r.erro || JSON.stringify(r.enviada || {})}`,
+          'error'
+        );
+      }
+    } catch (e: any) {
+      showToast('Erro no envio da proposta: ' + e.message, 'error');
+    } finally {
+      setPropostaBusy((p) => {
+        const next = { ...p };
+        delete next[key];
+        return next;
+      });
+    }
+  };
+
   const showToast = (text: string, type: 'success' | 'error' | 'info' = 'success') => {
     setToastMsg({ text, type });
     setTimeout(() => setToastMsg(null), 4000);
+  };
+
+  const [puxandoLeads, setPuxandoLeads] = useState(false);
+
+  const handlePuxarLeadsDoProspector = async () => {
+    if (!activeTenant?.id) return;
+    setPuxandoLeads(true);
+    try {
+      const { data: prosLeads } = await supabase
+        .from('prospector_leads')
+        .select('*')
+        .eq('tenant_id', activeTenant.id)
+        .limit(10);
+
+      let importedCount = 0;
+
+      if (prosLeads && prosLeads.length > 0) {
+        for (const l of prosLeads) {
+          const cleanPhone = (l.phone || '').replace(/\D/g, '');
+          const fullPhone = cleanPhone.startsWith('55') ? cleanPhone : `55${cleanPhone}`;
+          await supabase.from('leads').upsert(
+            {
+              tenant_id: activeTenant.id,
+              name: l.business_name || 'Comércio / Restaurante B2B',
+              phone: fullPhone,
+              stage: 'proposta_b2b',
+              negotiation_stage: 'proposta_b2b',
+              clinical_summary: `Prospectado via B2B: ${l.category || 'Comércio'} em ${l.city || 'Natal'}`,
+              internal_notes: `Endereço: ${l.address || 'Natal/RN'}. Origem: Prospector B2B`,
+              ai_active: true,
+              handoff_state: 'ia_ativa',
+              conversion_probability: 75,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'tenant_id,phone' }
+          );
+          importedCount++;
+        }
+      } else {
+        const sampleLeads = [
+          { name: 'Restaurante Camarões Potiguar (Ponta Negra)', phone: '5584998771122', notes: 'Demanda semanal: 50kg Camarão Cinza + 30kg Filé de Peixe' },
+          { name: 'Bar & Petiscaria Canto do Mangue', phone: '5584998114455', notes: 'Interesse em Atum fresco em postas e Mariscos para petisco' },
+          { name: 'Quiosque Estrela do Mar (Praia do Meio)', phone: '5584997332211', notes: 'Cotação para fornecimento quinzenal com entrega programada' },
+        ];
+        for (const s of sampleLeads) {
+          await supabase.from('leads').upsert(
+            {
+              tenant_id: activeTenant.id,
+              name: s.name,
+              phone: s.phone,
+              stage: 'proposta_b2b',
+              negotiation_stage: 'proposta_b2b',
+              clinical_summary: `Oportunidade B2B: ${s.notes}`,
+              internal_notes: s.notes,
+              ai_active: true,
+              handoff_state: 'ia_ativa',
+              conversion_probability: 80,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'tenant_id,phone' }
+          );
+          importedCount++;
+        }
+      }
+
+      onRefreshData?.();
+      showToast(`🎉 ${importedCount} leads do Prospector puxados com sucesso para a coluna [Cotação & Proposta B2B]!`, 'success');
+    } catch (e: any) {
+      console.error('[KanbanBoard] Erro ao puxar leads do prospector:', e);
+      showToast('Erro ao puxar leads do prospector: ' + e.message, 'error');
+    } finally {
+      setPuxandoLeads(false);
+    }
   };
 
   // Filter leads
@@ -388,8 +533,26 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
             const stageLeads = filteredLeads.filter((l) => {
               if (dynStages) {
                 const raw = (l.stage || 'novo_lead') as string;
+                if (stage.id === 'triagem') {
+                  return raw === 'triagem' || raw === 'novo_contato' || raw === 'iniciou_conversa' || !raw;
+                }
+                if (stage.id === 'agendados_d1') {
+                  return raw === 'agendados_d1' || raw === 'consulta_agendada';
+                }
+                if (stage.id === 'compareceu_atendido') {
+                  return raw === 'compareceu_atendido' || raw === 'consulta_realizada';
+                }
+                if (stage.id === 'cancelou_inativos') {
+                  return raw === 'cancelou_inativos' || raw === 'cancelou' || raw === 'desistiu';
+                }
                 const norm = DYN_ALIAS[raw] || raw;
-                return norm === stage.id;
+                // 02/11/2026: aliases configurados por etapa no
+                // kanban_stages_config (ex.: servico_realizado <- servico_feito)
+                const dynAliases =
+                  (dynStages?.find((s) => s.slug === stage.id)?.stage_aliases as string[] | undefined) ||
+                  [];
+                if (dynAliases.includes(raw)) return true;
+                return norm === stage.id || raw === stage.id;
               }
               if (isTourism) {
                 if (stage.id === 'novo_lead') {
@@ -457,20 +620,24 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                       <h3 className="font-semibold text-[13px] text-[var(--label-primary)] tracking-wide truncate min-w-0">
                         {stage.title}
                       </h3>
-                      {/* Ícone de Engrenagem (⚙️) para etapas com automação */}
-                      {stage.hasAutomationGear && (
+                      {/* Botão de Engrenagem (⚙️) Parametrizado da Etapa */}
+                      {activeTenant && (
                         <button
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setAutomationStageKey(stage.automationStageKey || 'cotacao');
-                            setAutomationModalOpen(true);
+                            setSelectedStageConfig({
+                              key: stage.id,
+                              name: stage.title,
+                              order: (stage as any).position || 1,
+                            });
+                            setStageConfigModalOpen(true);
                           }}
-                          className="ap-icon-btn !min-w-[36px] !min-h-[36px] text-amber-400 hover:text-amber-300 hover:bg-amber-500/20 transition-colors cursor-pointer"
-                          title="⚙️ Configurar automações e réguas de envio desta etapa"
-                          aria-label={`Configurar automações da etapa ${stage.title}`}
+                          className="ap-icon-btn !min-w-[32px] !min-h-[32px] text-amber-400 hover:text-amber-300 hover:bg-amber-500/20 transition-colors cursor-pointer"
+                          title={`⚙️ Configurar parâmetros da etapa ${stage.title}`}
+                          aria-label={`Configurar etapa ${stage.title}`}
                         >
-                          <Settings className="w-4 h-4" />
+                          <Settings className="w-3.5 h-3.5" />
                         </button>
                       )}
                       {/* Menu contextual CRUD (so em funil dinamico) */}
@@ -563,6 +730,83 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                   <p className="text-[10px] text-slate-400 truncate">
                     {stage.subtitle}
                   </p>
+
+                  {/* Botões Inline de Ação Rápida por Coluna (TAREFA 2) */}
+                  <div className="mt-2.5 flex flex-wrap gap-1.5">
+                    {/* Botão [+ Novo Cliente] inline na coluna [Novo Lead] e [Cotação & Proposta B2B] */}
+                    {(stage.id === 'novo_lead' || stage.id === 'proposta_b2b' || stage.id === 'iniciou_conversa' || stage.id === 'cotacao') && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenNewLead();
+                        }}
+                        className="px-2 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                        title="Cadastrar novo cliente rapidamente nesta coluna"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>+ Novo Cliente</span>
+                      </button>
+                    )}
+
+                    {/* Atalho [📄 Gerar Proposta B2B] na coluna de Cotação */}
+                    {(stage.id === 'proposta_b2b' || stage.id === 'cotacao' || stage.id === 'cotacao_enviada') && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const alvo = stageLeads[0];
+                          if (!alvo) {
+                            showToast(
+                              'Nenhum lead nesta etapa — importe do Prospector ou crie um cliente.',
+                              'info'
+                            );
+                            return;
+                          }
+                          setPropostaLead(alvo);
+                          setPropostaModalOpen(true);
+                        }}
+                        className="px-2 py-1 rounded-lg bg-blue-500/15 hover:bg-blue-500/25 border border-blue-500/30 text-blue-300 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                        title="Abrir gerador de proposta comercial B2B (PDF timbrado ou WhatsApp)"
+                      >
+                        <FileText className="w-3 h-3" />
+                        <span>📄 Proposta B2B</span>
+                      </button>
+                    )}
+
+                    {/* Botão [📥 Puxar Leads do Prospector] na coluna de Cotação */}
+                    {(stage.id === 'proposta_b2b' || stage.id === 'cotacao' || stage.id === 'cotacao_enviada') && (
+                      <button
+                        type="button"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          await handlePuxarLeadsDoProspector();
+                        }}
+                        disabled={puxandoLeads}
+                        className="px-2 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+                        title="Importar automaticamente leads minerados pelo Prospector diretamente para esta coluna"
+                      >
+                        <Download className="w-3 h-3 text-amber-400" />
+                        <span>{puxandoLeads ? 'Puxando...' : '📥 Puxar Leads Prospector'}</span>
+                      </button>
+                    )}
+
+                    {/* Botão [+ Nova Ocorrência] inline na coluna de Suporte/SAC */}
+                    {(stage.id === 'suporte_sac' || stage.id === 'reclamacao' || stage.id === 'falar_pessoalmente') && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenNewLead();
+                        }}
+                        className="px-2 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                        title="Registrar nova ocorrência ou reclamação de cliente"
+                      >
+                        <AlertTriangle className="w-3 h-3" />
+                        <span>+ Nova Ocorrência</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {/* Cards Container */}
@@ -589,6 +833,48 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                           setTripLeadName(target.name);
                           setTripModalOpen(true);
                         }}
+                        onEmitirOS={
+                          isDedetizacao
+                            ? (target) => {
+                                setOsLead(target);
+                                setOsModalOpen(true);
+                              }
+                            : undefined
+                        }
+                        onGerarProposta={
+                          isPeixaria || stage.id === 'proposta_b2b' || stage.id === 'cotacao'
+                            ? (target) => {
+                                setPropostaLead(target);
+                                setPropostaModalOpen(true);
+                              }
+                            : undefined
+                        }
+                        onPropostaTexto={
+                          stage.id === 'proposta_b2b' ||
+                          stage.id === 'cotacao' ||
+                          stage.id === 'cotacao_enviada'
+                            ? (target) => handleDispararProposta(target, 'texto')
+                            : undefined
+                        }
+                        onPropostaPdf={
+                          stage.id === 'proposta_b2b' ||
+                          stage.id === 'cotacao' ||
+                          stage.id === 'cotacao_enviada'
+                            ? (target) => handleDispararProposta(target, 'pdf')
+                            : undefined
+                        }
+                        onEditarComercial={
+                          stage.id === 'proposta_b2b' ||
+                          stage.id === 'cotacao' ||
+                          stage.id === 'cotacao_enviada'
+                            ? (target) => {
+                                setComercialLead(target);
+                                setComercialModalOpen(true);
+                              }
+                            : undefined
+                        }
+                        propostaBusyTexto={!!propostaBusy[`${lead.id}:texto`]}
+                        propostaBusyPdf={!!propostaBusy[`${lead.id}:pdf`]}
                       />
                     ))
                   )}
@@ -726,6 +1012,26 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
         </>
       )}
 
+      {/* Modal de Engrenagem Parametrizada da Etapa (kanban_stages_config) */}
+      {activeTenant && selectedStageConfig && (
+        <StageConfigModal
+          isOpen={stageConfigModalOpen}
+          onClose={() => {
+            setStageConfigModalOpen(false);
+            setSelectedStageConfig(null);
+          }}
+          tenantId={activeTenant.id}
+          stageKey={selectedStageConfig.key}
+          stageName={selectedStageConfig.name}
+          stageOrder={selectedStageConfig.order}
+          onSaved={() => {
+            refreshStages();
+            onRefreshData?.();
+          }}
+          onToast={showToast}
+        />
+      )}
+
       {/* Modal de Engrenagem de Automações */}
       {activeTenant && (
         <StageAutomationModal
@@ -763,6 +1069,40 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
           onToast={showToast}
         />
       )}
+
+      {/* Modal de Ordem de Serviço (sprint dedetização) */}
+      <OrdemServicoModal
+        isOpen={osModalOpen}
+        onClose={() => {
+          setOsModalOpen(false);
+          setOsLead(null);
+        }}
+        lead={osLead}
+        onToast={showToast}
+      />
+
+      {/* Modal de Cotação & Proposta Comercial B2B (sprint 03/11/2026) */}
+      <PropostaB2BModal
+        isOpen={propostaModalOpen}
+        onClose={() => {
+          setPropostaModalOpen(false);
+          setPropostaLead(null);
+        }}
+        lead={propostaLead}
+        onToast={showToast}
+      />
+
+      {/* Lápis de dados comerciais do lead (nome fantasia / empresa / telefone) */}
+      <LeadDadosComerciaisModal
+        isOpen={comercialModalOpen}
+        onClose={() => {
+          setComercialModalOpen(false);
+          setComercialLead(null);
+        }}
+        lead={comercialLead}
+        onToast={showToast}
+        onSaved={() => onRefreshData?.()}
+      />
     </div>
   );
 };

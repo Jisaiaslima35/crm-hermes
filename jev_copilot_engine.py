@@ -49,19 +49,43 @@ sb_instance = None
 
 
 def get_sb(client_override=None):
-    """Retorna cliente Supabase inicializado."""
+    """Retorna cliente Supabase do copiloto — SEMPRE service_role, nunca anon.
+
+    31/10/2026: o caminho do copiloto usava a chave anon (via `sb` do
+    webhook_server e via instancia em cache) e passou a falhar com 42501
+    depois da ativacao do RLS (27/10). O backend do copiloto le/escreve
+    leads e messages de pacientes: so a service_role ignora o RLS. A
+    resolucao acontece em tempo de chamada (o webhook_server carrega o
+    .env DEPOIS de importar este modulo), e uma instancia em cache
+    construida com outra chave e reconstruida. Se a service_role nao
+    estiver no ambiente, retorna None com erro alto — nunca cai para
+    anon em silencio.
+    """
     global sb_instance
     if client_override is not None:
         return client_override
-    if sb_instance is not None:
+    url = (
+        os.environ.get("VITE_SUPABASE_URL")
+        or os.environ.get("SUPABASE_URL", "")
+        or SUPABASE_URL
+    )
+    key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+    if not url or not key:
+        logger.error("[JEV_COPILOT] SUPABASE_SERVICE_ROLE_KEY ausente — copiloto sem cliente (anon NUNCA usado).")
+        return None
+    if sb_instance is not None and getattr(get_sb, "_key_used", None) == key:
         return sb_instance
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            from supabase import create_client
-            sb_instance = create_client(SUPABASE_URL, SUPABASE_KEY)
-            return sb_instance
-        except Exception as exc:
-            logger.error("[JEV_COPILOT] Erro ao instanciar cliente Supabase: %s", exc)
+    try:
+        from supabase import create_client
+        sb_instance = create_client(url, key)
+        get_sb._key_used = key
+        return sb_instance
+    except Exception as exc:
+        logger.error("[JEV_COPILOT] Erro ao instanciar cliente Supabase: %s", exc)
     return None
 
 
@@ -94,6 +118,17 @@ STAGES_VALIDOS_TURISMO = {
     "fechou",
     "fechou_vendido",
     "pos_viagem",
+}
+
+STAGES_VALIDOS_PEIXARIA = {
+    "novo_lead",
+    "proposta_b2b",
+    "separacao_pesagem",
+    "saiu_entrega",
+    "pos_venda",
+    "recompra_semanal",
+    "fidelidade_cupom",
+    "suporte_sac",
 }
 
 OBJECTION_VALIDAS = {
@@ -139,6 +174,89 @@ Analise o diálogo recente e devolva ESTRITAMENTE UM OBJETO JSON VÁLIDO com os 
 
 IMPORTANTE: Responda APENAS o JSON válido, sem texto antes ou depois, sem crases markdown."""
 
+SYSTEM_PROMPT_PEIXARIA = """Você é o Copiloto Preditivo de Vendas e Decisor Comercial JEV da Peixaria do William em Natal/RN.
+Seu objetivo é analisar as mensagens recentes trocadas entre o cliente/comprador e a equipe no WhatsApp e calcular métricas de conversão, classificação de estágio e orientação prática em tempo real para o William.
+
+CONTEXTO DO ESTABELECIMENTO:
+- Empresa: Peixaria do William (Pescados Frescos, Atacado & Varejo B2B em Natal/RN).
+- Especialista: William. Contato WhatsApp: (84) 99931-9831.
+- Produtos principais: Atum em Postas, Guaiuba Inteira ou Filé, Camarão Cinza Fresco (viveiros do RN), Sururu despescado (pct), Mariscos Diversos, Cioba, Cavala e Caixas de Atacado B2B.
+- Cortes & Serviços: Posta, Filé, Inteiro limpo (eviscerado e escamado), Com casca e Descascado.
+- Condições Comerciais: Varejo avulso e atacado B2B para restaurantes, quiosques, bares e buffets com faturamento a prazo (10, 15 ou 30 dias) e entregas diárias no gelo conservado.
+- PROIBIÇÃO ABSOLUTA: NUNCA use termos médicos/clínicos como "Dr. Matheus", "consulta", "receita", "paciente", "clínica", "sintomas", "convênio", "agendou", "compareceu", "triagem", nem termos de turismo ("voo", "hotel", "pacote"). Trate a pessoa como "cliente", "comprador" ou "restaurante".
+
+TAREFA:
+Analise o diálogo recente e devolva ESTRITAMENTE UM OBJETO JSON VÁLIDO com os 5 campos abaixo:
+1. "conversion_probability": Número inteiro de 0 a 100 representando a probabilidade de fechamento/compra.
+2. "negotiation_stage": Use EXATAMENTE um dos slugs do funil da peixaria:
+   - "novo_lead" (primeiro contato, pedido de catálogo/tabela ou compra avulsa de varejo)
+   - "proposta_b2b" (intenção de compra em volume, restaurantes, bares, atacado, cotação formal ou faturamento a prazo)
+   - "separacao_pesagem" (confirmação de pagamento, envio de comprovante Pix, pedido fechado para pesagem e separação)
+   - "saiu_entrega" (pedido despachado para entrega no gelo ou pronto para retirada)
+   - "pos_venda" (avaliação de qualidade do pescado após entrega, offset D+1)
+   - "recompra_semanal" (recompra recorrente de nova carga fresca, offset D+5)
+   - "fidelidade_cupom" (benefício de fidelidade a cada 5 pedidos)
+   - "suporte_sac" (reporte de problema, peso divergente, peixe não fresco, atraso ou insatisfação - SLA Prioritário)
+3. "current_objection": Uma das strings exatas: "inseguranca_preco", "horario_incompativel", "duvida_convenio", "falta_resposta", "nenhuma".
+4. "copilot_guidance": Orientação prática direta em 1 ou 2 frases curtas dizendo o que o William deve fazer agora para atender ou fechar o pedido.
+5. "suggested_reply": Mensagem pronta, simpática e profissional para enviar no WhatsApp com 1 clique em nome da Peixaria do William.
+
+IMPORTANTE: Responda APENAS o JSON válido, sem texto antes ou depois, sem crases markdown."""
+
+
+def _heuristic_copilot_analysis_peixaria(lead_name: str, conversa_text: str) -> dict[str, Any]:
+    """Heurística comercial para Peixaria do William (pescados e atacado B2B)."""
+    text_norm = unicodedata.normalize("NFKD", conversa_text).encode("ASCII", "ignore").decode("utf-8").lower()
+
+    # 1. Reclamação / Divergência de peso / Problema (SLA Prioritário)
+    if any(k in text_norm for k in ["reclam", "peso errado", "peso veio menor", "diverg", "veio estragado", "nao veio fresco", "cheiro ruim", "atraso", "nao entregou", "problema no peixe", "veio faltando"]):
+        return {
+            "conversion_probability": 30,
+            "negotiation_stage": "suporte_sac",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Atenção: Cliente relatou divergência ou problema no pedido. Priorize este atendimento imediatamente.",
+            "suggested_reply": f"Olá, {lead_name}! Pedimos sinceras desculpas pelo transtorno. O William já está verificando seu pedido agora mesmo para resolvermos isso já!",
+        }
+
+    # 2. Pagamento / Comprovante Pix / Pedido Fechado
+    if any(k in text_norm for k in ["comprovante", "pix enviado", "ja paguei", "fiz o pix", "segue o comprovante", "pode separar", "pedido confirmado", "transferencia feita", "paguei no pix"]):
+        return {
+            "conversion_probability": 95,
+            "negotiation_stage": "separacao_pesagem",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Pagamento recebido! Encaminhar os pescados para pesagem no gelo e corte selecionado.",
+            "suggested_reply": f"Perfeito, {lead_name}! Pagamento recebido com sucesso. Nosso time já está pesando e separando seus pescados no gelo conservado!",
+        }
+
+    # 3. Cotação de Atacado / Volume / B2B / Restaurantes
+    if any(k in text_norm for k in ["atacado", "restaurante", "barraca", "quiosque", "faturad", "a prazo", "10 dias", "15 dias", "30 dias", "caixa de", "10kg", "15kg", "20kg", "50kg", "tabela de atacado", "cotacao", "proposta"]):
+        return {
+            "conversion_probability": 80,
+            "negotiation_stage": "proposta_b2b",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Interesse B2B para restaurante/comércio. Abra o Gerador de Propostas para enviar a cotação timbrada ou texto com faturamento a prazo.",
+            "suggested_reply": f"Olá, {lead_name}! Temos condições especiais de atacado e faturamento a prazo para restaurantes e comércios. Vou te enviar nossa proposta detalhada!",
+        }
+
+    # 4. Intenção de compra avulsa / Catálogo
+    if any(k in text_norm for k in ["catalogo", "cardapio", "preco", "quanto ta", "quanto custa", "tem atum", "tem camarao", "tem guaiuba", "sururu", "marisco", "posta", "file", "peixe fresco", "peixes"]):
+        return {
+            "conversion_probability": 65,
+            "negotiation_stage": "novo_lead",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Cliente interessado no cardápio de pescados do dia. Envie o link da vitrine digital da Peixaria do William.",
+            "suggested_reply": f"Olá, {lead_name}! Tudo bem? Temos pescados frescos todos os dias aqui na Peixaria do William. Veja nosso catálogo completo: https://peixaria-william.automacaojs.us/loja/",
+        }
+
+    # Padrão
+    return {
+        "conversion_probability": 50,
+        "negotiation_stage": "novo_lead",
+        "current_objection": "nenhuma",
+        "copilot_guidance": "Novo contato. Dê boas-vindas e apresente as opções de pescados frescos e atacado da Peixaria do William.",
+        "suggested_reply": f"Olá, {lead_name}! Seja bem-vindo à Peixaria do William em Natal/RN. Como podemos te atender hoje? Procura peixes frescos pro dia a dia ou cotação para restaurante?",
+    }
+
 SYSTEM_PROMPT_TURISMO = """Você é o Copiloto Preditivo e Decisor Comercial JEV da agência de viagens ESVC Turismo.
 Seu objetivo é analisar as mensagens recentes trocadas entre o cliente/viajante e a equipe no WhatsApp e calcular métricas de conversão e orientação prática em tempo real para os consultores de viagens da agência.
 
@@ -172,6 +290,89 @@ Analise o diálogo recente e devolva ESTRITAMENTE UM OBJETO JSON VÁLIDO com os 
 5. "suggested_reply": Mensagem pronta, cordial e persuasiva em nome da equipe da ESVC Turismo para enviar no WhatsApp com 1 clique.
 
 IMPORTANTE: Responda APENAS o JSON válido, sem texto antes ou depois, sem crases markdown."""
+
+SYSTEM_PROMPT_PEIXARIA = """Você é o Copiloto Preditivo de Vendas e Decisor Comercial JEV da Peixaria do William em Natal/RN.
+Seu objetivo é analisar as mensagens recentes trocadas entre o cliente/comprador e a equipe no WhatsApp e calcular métricas de conversão, classificação de estágio e orientação prática em tempo real para o William.
+
+CONTEXTO DO ESTABELECIMENTO:
+- Empresa: Peixaria do William (Pescados Frescos, Atacado & Varejo B2B em Natal/RN).
+- Especialista: William. Contato WhatsApp: (84) 99931-9831.
+- Produtos principais: Atum em Postas, Guaiuba Inteira ou Filé, Camarão Cinza Fresco (viveiros do RN), Sururu despescado (pct), Mariscos Diversos, Cioba, Cavala e Caixas de Atacado B2B.
+- Cortes & Serviços: Posta, Filé, Inteiro limpo (eviscerado e escamado), Com casca e Descascado.
+- Condições Comerciais: Varejo avulso e atacado B2B para restaurantes, quiosques, bares e buffets com faturamento a prazo (10, 15 ou 30 dias) e entregas diárias no gelo conservado.
+- PROIBIÇÃO ABSOLUTA: NUNCA use termos médicos/clínicos como "Dr. Matheus", "consulta", "receita", "paciente", "clínica", "sintomas", "convênio", "agendou", "compareceu", "triagem", nem termos de turismo ("voo", "hotel", "pacote"). Trate a pessoa como "cliente", "comprador" ou "restaurante".
+
+TAREFA:
+Analise o diálogo recente e devolva ESTRITAMENTE UM OBJETO JSON VÁLIDO com os 5 campos abaixo:
+1. "conversion_probability": Número inteiro de 0 a 100 representando a probabilidade de fechamento/compra.
+2. "negotiation_stage": Use EXATAMENTE um dos slugs do funil da peixaria:
+   - "novo_lead" (primeiro contato, pedido de catálogo/tabela ou compra avulsa de varejo)
+   - "proposta_b2b" (intenção de compra em volume, restaurantes, bares, atacado, cotação formal ou faturamento a prazo)
+   - "separacao_pesagem" (confirmação de pagamento, envio de comprovante Pix, pedido fechado para pesagem e separação)
+   - "saiu_entrega" (pedido despachado para entrega no gelo ou pronto para retirada)
+   - "pos_venda" (avaliação de qualidade do pescado após entrega, offset D+1)
+   - "recompra_semanal" (recompra recorrente de nova carga fresca, offset D+5)
+   - "fidelidade_cupom" (benefício de fidelidade a cada 5 pedidos)
+   - "suporte_sac" (reporte de problema, peso divergente, peixe não fresco, atraso ou insatisfação - SLA Prioritário)
+3. "current_objection": Uma das strings exatas: "inseguranca_preco", "horario_incompativel", "duvida_convenio", "falta_resposta", "nenhuma".
+4. "copilot_guidance": Orientação prática direta em 1 ou 2 frases curtas dizendo o que o William deve fazer agora para atender ou fechar o pedido.
+5. "suggested_reply": Mensagem pronta, simpática e profissional para enviar no WhatsApp com 1 clique em nome da Peixaria do William.
+
+IMPORTANTE: Responda APENAS o JSON válido, sem texto antes ou depois, sem crases markdown."""
+
+
+def _heuristic_copilot_analysis_peixaria(lead_name: str, conversa_text: str) -> dict[str, Any]:
+    """Heurística comercial para Peixaria do William (pescados e atacado B2B)."""
+    text_norm = unicodedata.normalize("NFKD", conversa_text).encode("ASCII", "ignore").decode("utf-8").lower()
+
+    # 1. Reclamação / Divergência de peso / Problema (SLA Prioritário)
+    if any(k in text_norm for k in ["reclam", "peso errado", "peso veio menor", "diverg", "veio estragado", "nao veio fresco", "cheiro ruim", "atraso", "nao entregou", "problema no peixe", "veio faltando"]):
+        return {
+            "conversion_probability": 30,
+            "negotiation_stage": "suporte_sac",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Atenção: Cliente relatou divergência ou problema no pedido. Priorize este atendimento imediatamente.",
+            "suggested_reply": f"Olá, {lead_name}! Pedimos sinceras desculpas pelo transtorno. O William já está verificando seu pedido agora mesmo para resolvermos isso já!",
+        }
+
+    # 2. Pagamento / Comprovante Pix / Pedido Fechado
+    if any(k in text_norm for k in ["comprovante", "pix enviado", "ja paguei", "fiz o pix", "segue o comprovante", "pode separar", "pedido confirmado", "transferencia feita", "paguei no pix"]):
+        return {
+            "conversion_probability": 95,
+            "negotiation_stage": "separacao_pesagem",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Pagamento recebido! Encaminhar os pescados para pesagem no gelo e corte selecionado.",
+            "suggested_reply": f"Perfeito, {lead_name}! Pagamento recebido com sucesso. Nosso time já está pesando e separando seus pescados no gelo conservado!",
+        }
+
+    # 3. Cotação de Atacado / Volume / B2B / Restaurantes
+    if any(k in text_norm for k in ["atacado", "restaurante", "barraca", "quiosque", "faturad", "a prazo", "10 dias", "15 dias", "30 dias", "caixa de", "10kg", "15kg", "20kg", "50kg", "tabela de atacado", "cotacao", "proposta"]):
+        return {
+            "conversion_probability": 80,
+            "negotiation_stage": "proposta_b2b",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Interesse B2B para restaurante/comércio. Abra o Gerador de Propostas para enviar a cotação timbrada ou texto com faturamento a prazo.",
+            "suggested_reply": f"Olá, {lead_name}! Temos condições especiais de atacado e faturamento a prazo para restaurantes e comércios. Vou te enviar nossa proposta detalhada!",
+        }
+
+    # 4. Intenção de compra avulsa / Catálogo
+    if any(k in text_norm for k in ["catalogo", "cardapio", "preco", "quanto ta", "quanto custa", "tem atum", "tem camarao", "tem guaiuba", "sururu", "marisco", "posta", "file", "peixe fresco", "peixes"]):
+        return {
+            "conversion_probability": 65,
+            "negotiation_stage": "novo_lead",
+            "current_objection": "nenhuma",
+            "copilot_guidance": "Cliente interessado no cardápio de pescados do dia. Envie o link da vitrine digital da Peixaria do William.",
+            "suggested_reply": f"Olá, {lead_name}! Tudo bem? Temos pescados frescos todos os dias aqui na Peixaria do William. Veja nosso catálogo completo: https://peixaria-william.automacaojs.us/loja/",
+        }
+
+    # Padrão
+    return {
+        "conversion_probability": 50,
+        "negotiation_stage": "novo_lead",
+        "current_objection": "nenhuma",
+        "copilot_guidance": "Novo contato. Dê boas-vindas e apresente as opções de pescados frescos e atacado da Peixaria do William.",
+        "suggested_reply": f"Olá, {lead_name}! Seja bem-vindo à Peixaria do William em Natal/RN. Como podemos te atender hoje? Procura peixes frescos pro dia a dia ou cotação para restaurante?",
+    }
 
 
 def _heuristic_copilot_analysis_turismo(lead_name: str, conversa_text: str) -> dict[str, Any]:
@@ -318,6 +519,7 @@ async def _call_llm_json(
     lead_name: str = "Paciente",
     conversa_text: str = "",
     is_tourism: bool = False,
+    is_peixaria: bool = False,
 ) -> dict[str, Any]:
     """Chama a LLM no 9Router / LiteLLM ou degrada com segurança para heurística contextual."""
     endpoints_to_try = []
@@ -359,7 +561,13 @@ async def _call_llm_json(
         },
     })
 
-    chosen_system_prompt = SYSTEM_PROMPT_TURISMO if is_tourism else SYSTEM_PROMPT
+    if is_peixaria:
+        chosen_system_prompt = SYSTEM_PROMPT_PEIXARIA
+    elif is_tourism:
+        chosen_system_prompt = SYSTEM_PROMPT_TURISMO
+    else:
+        chosen_system_prompt = SYSTEM_PROMPT
+
     last_error = None
     for target in endpoints_to_try:
         try:
@@ -394,7 +602,9 @@ async def _call_llm_json(
             last_error = str(exc)
             logger.debug("[JEV_COPILOT] Tentativa com %s falhou: %s", target["model"], exc)
 
-    logger.info("[JEV_COPILOT] LLM fallback acionado (%s). Aplicando heurística contextual (turismo=%s).", last_error, is_tourism)
+    logger.info("[JEV_COPILOT] LLM fallback acionado (%s). Aplicando heurística contextual (turismo=%s, peixaria=%s).", last_error, is_tourism, is_peixaria)
+    if is_peixaria:
+        return _heuristic_copilot_analysis_peixaria(lead_name, conversa_text)
     if is_tourism:
         return _heuristic_copilot_analysis_turismo(lead_name, conversa_text)
     return _heuristic_copilot_analysis(lead_name, conversa_text)
@@ -417,8 +627,15 @@ _TOURISM_STAGE_ALIASES = {
 
 
 def _load_kanban_stages(sb: Any, tenant_id: str) -> list[dict[str, Any]]:
-    """Le as etapas oficiais do funil (kanban_stages) do tenant, cache de 60s.
-    Retorna [] quando o tenant nao tem funil dinamico (fallback estatico)."""
+    """Le as etapas oficiais do funil do tenant, cache de 60s.
+
+    31/10/2026 (split-brain): prioriza kanban_stages_config (fonte nova,
+    usada pelo painel e pela rota viva) e cai para kanban_stages legado
+    quando o tenant nao tem linhas no config (ex.: turismo, que segue
+    igual a antes). Hoje so a clinica tem linhas no config, entao so ela
+    muda de comportamento. Retorna [] quando o tenant nao tem funil
+    dinamico (fallback estatico).
+    """
     import time as _time
 
     tid = str(tenant_id)
@@ -428,20 +645,40 @@ def _load_kanban_stages(sb: Any, tenant_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
         res = (
-            sb.table("kanban_stages")
-            .select("slug, title, position, ai_keywords, ai_prompt_hint, trigger_keywords, semantic_description")
+            sb.table("kanban_stages_config")
+            .select("stage_key, stage_name, stage_order, system_prompt")
             .eq("tenant_id", tid)
-            .order("position")
+            .order("stage_order")
             .execute()
         )
-        rows = res.data or []
-        for _r in rows:
-            _tk = _r.get("trigger_keywords") or _r.get("ai_keywords") or []
-            _sd = _r.get("semantic_description") or _r.get("ai_prompt_hint") or ""
-            _r["keywords"] = _tk
-            _r["hint"] = _sd
+        for _r in (res.data or []):
+            rows.append({
+                "slug": _r.get("stage_key"),
+                "title": _r.get("stage_name"),
+                "position": _r.get("stage_order"),
+                "keywords": [],
+                "hint": _r.get("system_prompt") or "",
+            })
     except Exception as exc:
-        logger.warning(f"[JEV] kanban_stages indisponivel p/ tenant {tid}: {exc}")
+        logger.warning(f"[JEV] kanban_stages_config indisponivel p/ tenant {tid}: {exc}")
+        rows = []
+    if not rows:
+        try:
+            res = (
+                sb.table("kanban_stages")
+                .select("slug, title, position, ai_keywords, ai_prompt_hint, trigger_keywords, semantic_description")
+                .eq("tenant_id", tid)
+                .order("position")
+                .execute()
+            )
+            rows = res.data or []
+            for _r in rows:
+                _tk = _r.get("trigger_keywords") or _r.get("ai_keywords") or []
+                _sd = _r.get("semantic_description") or _r.get("ai_prompt_hint") or ""
+                _r["keywords"] = _tk
+                _r["hint"] = _sd
+        except Exception as exc:
+            logger.warning(f"[JEV] kanban_stages indisponivel p/ tenant {tid}: {exc}")
     _KANBAN_STAGES_CACHE[tid] = (_time.time(), rows)
     return rows
 
@@ -463,25 +700,36 @@ async def evaluate_lead_copilot(
         str(tenant_id) == "44444444-4444-4444-4444-444444444444"
         or "turismo" in str(tenant_id).lower()
     )
-    if not is_tourism and tenant_id:
+    is_peixaria = (
+        str(tenant_id) == "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
+        or "peixaria" in str(tenant_id).lower()
+    )
+    if not is_tourism and not is_peixaria and tenant_id:
         try:
-            t_row = sb.table("tenants").select("specialty, name").eq("id", tenant_id).limit(1).execute()
+            t_row = sb.table("tenants").select("specialty, name, slug, business_type").eq("id", tenant_id).limit(1).execute()
             if t_row.data:
                 sp = (t_row.data[0].get("specialty") or "").lower()
                 nm = (t_row.data[0].get("name") or "").lower()
-                if "turismo" in sp or "turismo" in nm or "esvc" in nm:
+                sl = (t_row.data[0].get("slug") or "").lower()
+                bt = (t_row.data[0].get("business_type") or "").lower()
+                if "peixaria" in sp or "peixaria" in nm or "peixaria" in sl or "pescado" in sp or bt == "peixaria" or "william" in nm:
+                    is_peixaria = True
+                elif "turismo" in sp or "turismo" in nm or "esvc" in nm:
                     is_tourism = True
         except Exception:
             pass
 
-    # Funil dinamico (kanban_stages): apenas para turismo e apenas se o
-    # tenant tiver etapas cadastradas. Clinica e demais tenants seguem no
-    # comportamento estatico de sempre.
+    # Funil dinamico: carrega para QUALQUER tenant com etapas cadastradas
+    # (config primeiro, legado como fallback). 31/10/2026: o gate antigo
+    # era so-turismo, o que deixava a clinica no estatico mesmo com 10
+    # etapas em kanban_stages_config. Tenant sem linhas segue estatico.
+    # Para a clinica, isso enriquece o prompt do copiloto com as diretrizes
+    # das etapas; a validacao de stage e o anti-regressao de turismo nao
+    # mudam (seguem gated por is_tourism abaixo).
     dyn_stages: list[dict[str, Any]] = []
     dyn_slugs: set[str] = set()
-    if is_tourism:
-        dyn_stages = _load_kanban_stages(sb, tenant_id)
-        dyn_slugs = {str(s.get("slug") or "") for s in dyn_stages if s.get("slug")}
+    dyn_stages = _load_kanban_stages(sb, tenant_id)
+    dyn_slugs = {str(s.get("slug") or "") for s in dyn_stages if s.get("slug")}
 
     # Se não passou histórico, busca as mensagens recentes do Supabase
     if history_msgs is None:
@@ -501,13 +749,13 @@ async def evaluate_lead_copilot(
             history_msgs = []
 
     # Recupera nome e contexto do lead
-    lead_name = "Cliente" if is_tourism else "Paciente"
+    lead_name = "Cliente" if (is_tourism or is_peixaria) else "Paciente"
     trip_dest_existing = None
     current_lead_stage = ""
     try:
         lead_row = sb.table("leads").select("name, phone, stage").eq("id", lead_id).limit(1).execute()
         if lead_row.data:
-            lead_name = lead_row.data[0].get("name") or ("Cliente" if is_tourism else "Paciente")
+            lead_name = lead_row.data[0].get("name") or ("Cliente" if (is_tourism or is_peixaria) else "Paciente")
             current_lead_stage = (lead_row.data[0].get("stage") or "").lower()
     except Exception:
         pass
@@ -516,7 +764,9 @@ async def evaluate_lead_copilot(
     conversa_lines = []
     for m in history_msgs:
         sender_raw = (m.get("sender") or "").lower()
-        if is_tourism:
+        if is_peixaria:
+            role = "Cliente/Restaurante" if sender_raw == "patient" else "William / Peixaria"
+        elif is_tourism:
             role = "Cliente/Viajante" if sender_raw == "patient" else "Consultor ESVC Turismo"
         else:
             role = "Paciente" if sender_raw == "patient" else "Beatriz / Clínica"
@@ -524,8 +774,10 @@ async def evaluate_lead_copilot(
         if content_txt:
             conversa_lines.append(f"{role}: {content_txt}")
 
-    conversa_text = "\n".join(conversa_lines) if conversa_lines else ("Cliente iniciou contato." if is_tourism else "Paciente acabou de entrar em contato.")
-    if is_tourism:
+    conversa_text = "\n".join(conversa_lines) if conversa_lines else ("Cliente iniciou contato." if (is_tourism or is_peixaria) else "Paciente acabou de entrar em contato.")
+    if is_peixaria:
+        prompt = f"CLIENTE/RESTAURANTE: {lead_name} (ID: {lead_id})\n\nÚLTIMAS MENSAGENS TROCADAS:\n{conversa_text}\n\nGere o JSON analítico do Copiloto JEV da Peixaria do William:"
+    elif is_tourism:
         prompt = f"VIAJANTE/CLIENTE: {lead_name} (ID: {lead_id})\n\nÚLTIMAS MENSAGENS TROCADAS:\n{conversa_text}\n\nGere o JSON analítico do Copiloto JEV de Turismo:"
     else:
         prompt = f"PACIENTE: {lead_name} (ID: {lead_id})\n\nÚLTIMAS MENSAGENS TROCADAS:\n{conversa_text}\n\nGere o JSON analítico do Copiloto JEV:"
@@ -538,12 +790,12 @@ async def evaluate_lead_copilot(
                 f'- "{_s.get("slug")}" ({_s.get("title")}): {_s.get("hint") or _s.get("ai_prompt_hint") or ""} [sinais: {_kw}]'
             )
         prompt += (
-            "\n\nETAPAS OFICIAIS DESTE FUNIL (tabela kanban_stages — use EXATAMENTE "
+            "\n\nETAPAS OFICIAIS DESTE FUNIL (funil oficial — use EXATAMENTE "
             "um destes slugs no campo negotiation_stage, substituindo qualquer lista anterior):\n"
             + "\n".join(_stage_lines)
         )
 
-    result = await _call_llm_json(prompt, lead_name=lead_name, conversa_text=conversa_text, is_tourism=is_tourism)
+    result = await _call_llm_json(prompt, lead_name=lead_name, conversa_text=conversa_text, is_tourism=is_tourism, is_peixaria=is_peixaria)
 
     # Sanitização e normalização estrita dos tipos
     try:
@@ -552,9 +804,29 @@ async def evaluate_lead_copilot(
     except (ValueError, TypeError):
         prob = 50
 
-    stage = str(result.get("negotiation_stage", "novo_lead" if is_tourism else "primeiro_contato")).lower().strip()
+    stage = str(result.get("negotiation_stage", "novo_lead" if (is_tourism or is_peixaria) else "primeiro_contato")).lower().strip()
 
-    if is_tourism:
+    if is_peixaria:
+        PEIXARIA_STAGE_MAP = {
+            "primeiro_contato": "novo_lead",
+            "qualificado": "novo_lead",
+            "duvida_valores": "novo_lead",
+            "cotacao": "proposta_b2b",
+            "cotacao_enviada": "proposta_b2b",
+            "negociacao": "proposta_b2b",
+            "em_atendimento": "proposta_b2b",
+            "agendado": "separacao_pesagem",
+            "fechou": "separacao_pesagem",
+            "vendido": "separacao_pesagem",
+            "pago": "separacao_pesagem",
+            "reclamacao": "suporte_sac",
+            "sac": "suporte_sac",
+            "suporte": "suporte_sac",
+        }
+        stage = PEIXARIA_STAGE_MAP.get(stage, stage)
+        if stage not in STAGES_VALIDOS_PEIXARIA:
+            stage = "novo_lead"
+    elif is_tourism:
         # Blindagem: NUNCA permitir fases médicas
         if dyn_slugs:
             if stage in {"agendado", "agendou", "consulta_agendada", "consulta_realizada", "compareceu", "triagem"}:
@@ -577,14 +849,18 @@ async def evaluate_lead_copilot(
 
     guidance = str(result.get("copilot_guidance") or "").strip()
     if not guidance:
-        if is_tourism:
+        if is_peixaria:
+            guidance = "Atendimento da Peixaria do William. Apresente os pescados frescos e opções de atacado B2B."
+        elif is_tourism:
             guidance = "Acolha o viajante e apresente as melhores opções de pacotes e passagens da ESVC Turismo."
         else:
             guidance = "Acolha o paciente e informe sobre os horários da semana do Dr. Matheus."
 
     suggested_reply = str(result.get("suggested_reply") or "").strip()
     if not suggested_reply:
-        if is_tourism:
+        if is_peixaria:
+            suggested_reply = f"Olá, {lead_name}! Aqui é da Peixaria do William em Natal. Como podemos te atender hoje com nossos pescados frescos?"
+        elif is_tourism:
             suggested_reply = f"Olá, {lead_name}! Tudo bem? Como a equipe da ESVC Turismo pode ajudar com sua viagem hoje?"
         else:
             suggested_reply = f"Olá, {lead_name}! Como o Dr. Matheus pode te ajudar hoje?"
@@ -625,6 +901,13 @@ async def evaluate_lead_copilot(
         "suggested_reply": suggested_reply,
         "last_copilot_eval_at": eval_time,
     }
+
+    # Para Peixaria, move o card no Kanban automaticamente pelo JEV
+    if is_peixaria:
+        update_payload["stage"] = stage
+        if stage == "separacao_pesagem":
+            prob = max(prob, 95)
+            update_payload["conversion_probability"] = prob
 
     # Se fechou pacote no turismo, sincroniza stage e lead_trips
     _sold_slugs = ("vendido",) if dyn_slugs else ("fechou", "fechou_vendido")

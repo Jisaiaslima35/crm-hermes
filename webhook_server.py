@@ -17,6 +17,8 @@ Boot:  uvicorn webhook_server:app --host 0.0.0.0 --port 3010
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
 import json
 import logging
 import os
@@ -27,7 +29,7 @@ import unicodedata
 import uuid
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 TZ_CLINICA = ZoneInfo("America/Fortaleza")
@@ -54,7 +56,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Carrega .env do projeto (URLs, ANON key) + cofre Hermes (chaves LLM/Evolution/Composio)
 load_dotenv(os.path.join(BASE_DIR, ".env"))
-for _secret in ("9router.env", "evolution.env", "composio.env"):
+for _secret in ("9router.env", "evolution.env", "composio.env", "crm-internal.env"):
     _p = os.path.join("/root/.hermes/secrets", _secret)
     if os.path.exists(_p):
         load_dotenv(_p, override=False)
@@ -84,7 +86,7 @@ NINEROUTER_DEFAULT_MODEL = "Hermes-fallbacks"
 # dr-matheus-dore em http://127.0.0.1:8642), o webhook roteia por ali
 # em vez de ir direto ao 9router/BYOK. O gateway expõe OpenAI-compat
 # em /v1/chat/completions com Bearer API_SERVER_KEY.
-HERMES_GATEWAY_API_KEY = os.environ.get("HERMES_GATEWAY_API_KEY", "hermes-isaias-2026")
+HERMES_GATEWAY_API_KEY = os.environ.get("HERMES_GATEWAY_API_KEY", "")
 HERMES_GATEWAY_MODEL = os.environ.get("HERMES_GATEWAY_MODEL", "hermes-agent")
 # Timeout mais curto: se o gateway cair, queremos fallback rápido pro 9router.
 HERMES_GATEWAY_TIMEOUT_S = float(os.environ.get("HERMES_GATEWAY_TIMEOUT_S", "8"))
@@ -93,7 +95,7 @@ HERMES_GATEWAY_TIMEOUT_S = float(os.environ.get("HERMES_GATEWAY_TIMEOUT_S", "8")
 EVOLUTION_API_KEY = (
     os.environ.get("EVOLUTION_API_KEY")
     or os.environ.get("VITE_EVOLUTION_GLOBAL_KEY")
-    or "2G3Rk8gZbV1ZYmhy1YUV3NwkLWYLHpH3"
+    or ""
 )
 EVOLUTION_BASE_URL = os.environ.get(
     "EVOLUTION_BASE_URL", "https://evo.automacaojs.us"
@@ -245,6 +247,102 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").stri
 sb_service: Client = create_client(
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
 )
+
+# API de métricas: rota rápida via KONG INTERNO (PostgREST sem Cloudflare/Tunnel).
+# O host público (supabase.automacaojs.us) custa ~110-180ms por chamada por causa do
+# TLS + CF; o Kong local (127.0.0.1:28000) responde em ~30-60ms com keep-alive.
+# Se o Kong interno falhar, o endpoint cai automaticamente para o PostgREST público.
+SUPABASE_INTERNAL_BASE = (
+    os.environ.get("SUPABASE_INTERNAL_URL", "").strip() or "http://127.0.0.1:28000"
+).rstrip("/")
+_METRICS_SERVICE_KEY = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+_metrics_http = httpx.Client(
+    timeout=20.0, limits=httpx.Limits(max_keepalive_connections=4, max_connections=8)
+)
+
+
+def _internal_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
+    """GET no PostgREST INTERNO (Kong local). Retorna None se falhar."""
+    try:
+        resp = _metrics_http.get(
+            f"{SUPABASE_INTERNAL_BASE}{path}",
+            params=params,
+            headers={
+                "apikey": _METRICS_SERVICE_KEY,
+                "Authorization": f"Bearer {_METRICS_SERVICE_KEY}",
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as exc:
+        logger.debug(f"_internal_get falhou em {path}: {type(exc).__name__}")
+    return None
+
+
+def _tenant_meta(tid: str) -> dict[str, Any]:
+    """Metadados do tenant (slug / business_type / niche) — 1 query interna.
+
+    02/11/2026 (sprint dedetização): o snapshot precisa dizer QUAL é o negócio
+    para o canvas trocar os rótulos das ações rápidas (consultas x serviços).
+    """
+    try:
+        rows = _internal_get(
+            "/rest/v1/tenants",
+            {"select": "id,name,slug,business_type,business_niche", "id": f"eq.{tid}"},
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.debug(f"_tenant_meta falhou para {tid}: {type(exc).__name__}")
+        return {}
+    if not rows:
+        return {}
+    try:
+        return dict(rows[0] or {})
+    except Exception:
+        return {}
+
+
+def _metrics_snapshot_rpc(tid: str, days: int) -> tuple[dict[str, Any], str]:
+    """Chama public.metrics_snapshot. Rota 1 = Kong interno; rota 2 = PostgREST público."""
+    body = {"p_tenant_id": tid, "p_days_back": days}
+    headers = {
+        "apikey": _METRICS_SERVICE_KEY,
+        "Authorization": f"Bearer {_METRICS_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = _metrics_http.post(
+            f"{SUPABASE_INTERNAL_BASE}/rest/v1/rpc/metrics_snapshot",
+            json=body,
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            cand = (
+                data
+                if isinstance(data, dict)
+                else (data[0] if isinstance(data, list) and data else data)
+            )
+            if isinstance(cand, dict):
+                return cand, "kong-interno"
+        logger.warning(
+            f"metrics_snapshot via kong-interno respondeu {resp.status_code}; "
+            "usando PostgREST publico"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"metrics_snapshot via kong-interno falhou ({type(exc).__name__}); "
+            "usando PostgREST publico"
+        )
+    res = sb_service.rpc("metrics_snapshot", body).execute()
+    data = res.data
+    cand = (
+        data
+        if isinstance(data, dict)
+        else (data[0] if isinstance(data, list) and data else data)
+    )
+    if not isinstance(cand, dict):
+        raise RuntimeError("metricas vazias")
+    return cand, "postgrest-publico"
 
 
 # ============================================================================
@@ -668,6 +766,9 @@ FALLBACK_PARTICULAR_VALUE = 300.0
 def _resolve_tenant_id(instance_name: str) -> Optional[str]:
     if not instance_name:
         return None
+    clean_inst = instance_name.strip().lower()
+    if clean_inst in {"peixaria_william", "peixaria-william", "peixaria", "william"}:
+        return "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
     now = time.monotonic()
     cached = _TENANT_BY_INSTANCE.get(instance_name)
     if cached is not None:
@@ -789,6 +890,55 @@ def _get_tenant_config(tenant_id: str) -> dict[str, Any]:
 def _invalidate_tenant_cache(tenant_id: str) -> None:
     """Dropa cache do tenant (uso no callback do toggle do front)."""
     _TENANT_CFG_CACHE.pop(tenant_id, None)
+
+
+# --- FASE KANBAN DINÂMICO PARAMETRIZADO — Configurações por Etapa ---
+_STAGE_CFG_CACHE: dict[str, tuple[dict[str, Any] | None, float]] = {}
+_STAGE_CFG_CACHE_TTL = 30.0
+
+def _get_kanban_stage_config(tenant_id: str, stage_key: str) -> dict[str, Any] | None:
+    """Busca configuração da etapa em kanban_stages_config suportando aliases e cache curto."""
+    if not tenant_id or not stage_key:
+        return None
+    cache_key = f"{tenant_id}:{stage_key}"
+    now = time.monotonic()
+    if cache_key in _STAGE_CFG_CACHE:
+        val, ts = _STAGE_CFG_CACHE[cache_key]
+        if (now - ts) < _STAGE_CFG_CACHE_TTL:
+            return val
+
+    aliases = [stage_key]
+    STAGE_MAP = {
+        "novo_contato": "triagem",
+        "iniciou_conversa": "triagem",
+        "consulta_agendada": "agendados_d1",
+        "agendou": "agendados_d1",
+        "consulta_realizada": "compareceu_atendido",
+        "compareceu": "compareceu_atendido",
+        "cancelou": "cancelou_inativos",
+        "desistiu": "cancelou_inativos",
+    }
+    alt = STAGE_MAP.get(stage_key)
+    if alt and alt not in aliases:
+        aliases.append(alt)
+
+    result = None
+    try:
+        res = (
+            sb_service.table("kanban_stages_config")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .in_("stage_key", aliases)
+            .limit(1)
+            .execute()
+        )
+        if res.data and len(res.data) > 0:
+            result = res.data[0]
+    except Exception as exc:
+        logger.debug("[kanban_stages_config] Erro ao consultar etapa %s: %s", stage_key, exc)
+
+    _STAGE_CFG_CACHE[cache_key] = (result, now)
+    return result
 
 
 # --- FASE 3 + BEATRIZ — Grade Horária Controlada & Limite de Vagas (Anti-Overbooking) ---
@@ -1705,7 +1855,7 @@ def _hermes_vps_fallback_target() -> dict[str, Any]:
         os.environ.get("NINEROUTER_API_KEY")
         or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
         or NINEROUTER_API_KEY
-        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+        or ""
     ).strip()
     return {
         "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
@@ -1891,7 +2041,7 @@ def _resolve_llm_target(tenant_cfg: dict[str, Any]) -> dict[str, Any]:
         os.environ.get("NINEROUTER_API_KEY")
         or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
         or NINEROUTER_API_KEY
-        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+        or ""
     ).strip()
     return {
         "baseUrl": NINEROUTER_BASE_URL.rstrip("/"),
@@ -2821,7 +2971,7 @@ async def _mine_silent_conversation(
 # Padrões por severidade (regex compilados em tempo de import)
 _ATRITO_CRITICA_RE = re.compile(
     r"\b("
-    r"ladr[ãa]o|estelionat[aá]rio|processo|processar|advogado|"
+    r"ladr[ãa]o|ladr[õo]es|estelionat[aá]ri[oa]s?|"
     r"absurdo|absurda|vergonha|escroto|escrota|"
     r"vai se foder|vai tomar no|cu[aã]o|caralho|merda|porra|"
     r"fdp|filho da puta|puta|vagabunda|vagabundo|"
@@ -2856,6 +3006,41 @@ _ATRITO_BAIXA_RE = re.compile(
 )
 
 
+# Guarda de contexto (31/10/2026): termos legais SO disparam risco quando ha
+# hostilidade clara ou acusacao direta contra a clinica/atendimento.
+# "Vou amanha no advogado", "o INSS negou meu beneficio" e "meu advogado
+# disse que preciso de um laudo" sao vida pessoal e passam no fluxo normal.
+_ATRITO_LEGAL_RE = re.compile(
+    r"\b(advogado|pol[ií]cia|justi[çc]a|inss|processo|processar|procon)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_ATRITO_AMEACA_EXPLICITA_RE = re.compile(
+    r"\b(vou|irei|vamos)\s+(processar|denunciar|chamar\s+a\s+pol[ií]cia|acionar\s+a\s+pol[ií]cia)\b"
+    r"|\bprocon\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_ATRITO_ALVO_DIRIGIDO_RE = re.compile(
+    r"\b(voc[eê]s?|vcs|cl[ií]nica|consult[óo]rio|doutor(?:a)?|atendimento|equipe)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_ATRITO_VERBO_AMEACA_RE = re.compile(
+    r"\b(processar|denunciar|chamar|acionar)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _is_acusacao_dirigida(text: str) -> bool:
+    """True quando o termo legal vem com ameaca explicita ('vou processar',
+    'vou no Procon', 'vou chamar a policia') ou com alvo dirigido a clinica
+    + verbo de ameaca ('meu advogado vai processar a clinica')."""
+    if _ATRITO_AMEACA_EXPLICITA_RE.search(text):
+        return True
+    return bool(
+        _ATRITO_ALVO_DIRIGIDO_RE.search(text)
+        and _ATRITO_VERBO_AMEACA_RE.search(text)
+    )
+
+
 def _classify_atrito(text: str) -> dict[str, Any] | None:
     """Classifica atrito no texto do paciente. Retorna dict {severity, reason, snippet}
     ou None se nada bater.
@@ -2872,6 +3057,14 @@ def _classify_atrito(text: str) -> dict[str, Any] | None:
         return None
     snippet = t[:240]  # máximo 240 chars pra gravar
     if _ATRITO_CRITICA_RE.search(t):
+        return {
+            "severity": "critica",
+            "reason": "ofensa_verbal",
+            "snippet": snippet,
+        }
+    # Termo legal sem hostilidade dirigida NAO dispara risco (passa adiante;
+    # pode ainda cair em media/baixa por outros sinais, ex. cancelamento).
+    if _ATRITO_LEGAL_RE.search(t) and _is_acusacao_dirigida(t):
         return {
             "severity": "critica",
             "reason": "ofensa_verbal",
@@ -2929,21 +3122,43 @@ async def _record_atrito(
         )
         return  # não aciona kill-switch se nem conseguiu registrar
 
-    # 2) Kill-switch: se severidade crítica → humano_assumiu + stage='falar_pessoalmente' (Coluna 3 do Kanban)
+    # 2) Atualiza histórico de atrito e segurança na tabela leads
+    try:
+        cur_count = int(lead.get("incident_count") or 0) + 1
+        lead_patch: dict[str, Any] = {
+            "has_incident_history": True,
+            "incident_count": cur_count,
+            "last_incident_notes": f"[{sev.upper()}] {reason}: {snippet[:200]}",
+            "last_interaction": _now_iso(),
+        }
+        if sev == "critica":
+            lead_patch["ai_auto_silence"] = True
+            lead_patch["stage"] = "risco_juridico"
+            lead_patch["handoff_state"] = "humano_assumiu"
+            lead_patch["ai_active"] = False
+
+        sb_service.table("leads").update(lead_patch).eq("id", lead["id"]).eq("tenant_id", tenant_id).execute()
+        logger.info("[%s] 🛡️ lead %s marcado com has_incident_history=True (count=%d)", instance, lead.get("id"), cur_count)
+    except Exception as exc:
+        logger.warning("[%s] falha ao registrar histórico de atrito no lead %s: %s", instance, lead.get("id"), exc)
+
+    # 3) Kill-switch legado: se severidade crítica → humano_assumiu
+    if sev == "critica":
+        logger.warning(
+            "[%s] 🛑 KILL-SWITCH atrito CRÍTICO lead=%s — stage=risco_juridico handoff_state=humano_assumiu",
+            instance, lead.get("id"),
+        )
+
+    # 4) Alerta imediato no Telegram (bot existente 'Clínica Dory', DM do Isaías).
+    # Best-effort: nunca derruba o webhook; só o tenant da clínica (o bot é dela).
     if sev == "critica":
         try:
-            sb_service.table("leads").update({
-                "stage": "falar_pessoalmente",
-                "handoff_state": "humano_assumiu",
-                "last_interaction": _now_iso(),
-            }).eq("id", lead["id"]).eq("tenant_id", tenant_id).execute()
+            from telegram_notify import send_atrito_alert
+
+            send_atrito_alert(tenant_id, lead, classification)
+        except Exception as exc:  # noqa: BLE001 - alerta não pode quebrar o atendimento
             logger.warning(
-                "[%s] 🛑 KILL-SWITCH atrito CRÍTICO lead=%s — stage=falar_pessoalmente handoff_state=humano_assumiu",
-                instance, lead.get("id"),
-            )
-        except Exception as exc:
-            logger.warning(
-                "[%s] falha ao acionar kill-switch atrito lead=%s: %s",
+                "[%s] falha ao enviar alerta Telegram lead=%s: %s",
                 instance, lead.get("id"), exc,
             )
 
@@ -3279,6 +3494,16 @@ async def _process_payment_proof_inbound(
                 "[%s] 💵 [COMPROVANTE] Nova entrada criada com status=%s (valor=R$%.2f) para lead %s",
                 instance, target_status, final_amount, lead_id
             )
+
+        # 🐟 Peixaria do William: move automaticamente para [Pedido & Pesagem / Separação]
+        if tenant_id == "ec8163e5-ed41-4db2-87dd-98e7720d09a9" or "peixaria" in instance.lower():
+            sb_service.table("leads").update({
+                "stage": "separacao_pesagem",
+                "negotiation_stage": "separacao_pesagem",
+                "conversion_probability": 95,
+                "updated_at": now_iso,
+            }).eq("id", lead_id).execute()
+            logger.info("[%s] 🐟 [PEIXARIA] Lead %s movido para 'separacao_pesagem' após confirmação de pagamento Pix.", instance, lead_id)
     except Exception as exc:
         logger.warning("[%s] [COMPROVANTE] Erro ao processar comprovante para lead %s: %s", instance, lead_id, exc)
 
@@ -3348,6 +3573,45 @@ async def _dispatch_ai(
             # Se crítico, JEV NÃO deve ser chamado — já aciona handoff
             if atrito["severity"] == "critica":
                 return
+
+        # ─────────────────────────────────────────────────────────────────
+        # ⚙️ Checagem de Etapa Parametrizada (kanban_stages_config) & Regras de Segurança
+        # ─────────────────────────────────────────────────────────────────
+        current_stage = lead.get("stage") or "triagem"
+        stage_cfg = _get_kanban_stage_config(tenant_id, current_stage)
+        
+        # 1) requires_human_only: se ativo na etapa, a IA é silenciada (ai_paused = True)
+        if stage_cfg and stage_cfg.get("requires_human_only"):
+            logger.info(
+                "[%s] 🚫 Etapa '%s' configurada com requires_human_only=True — IA silenciada para lead=%s",
+                instance, current_stage, lead.get("id"),
+            )
+            try:
+                sb_service.table("leads").update({
+                    "handoff_state": "humano_assumiu",
+                    "ai_active": False,
+                    "ai_auto_silence": True,
+                }).eq("id", lead["id"]).execute()
+            except Exception as upd_e:
+                logger.warning("[%s] Erro ao pausar IA para etapa requires_human_only: %s", instance, upd_e)
+            return
+
+        # 2) has_incident_history com hostilidade ativa ou ai_auto_silence: silencia a IA
+        has_incident = bool(lead.get("has_incident_history"))
+        auto_silence = bool(lead.get("ai_auto_silence"))
+        if has_incident and (auto_silence or atrito is not None):
+            logger.warning(
+                "[%s] ⚠️ Lead %s possui has_incident_history com hostilidade ativa — IA silenciada.",
+                instance, lead.get("id"),
+            )
+            try:
+                sb_service.table("leads").update({
+                    "handoff_state": "humano_assumiu",
+                    "ai_active": False,
+                }).eq("id", lead["id"]).execute()
+            except Exception as upd_e:
+                logger.warning("[%s] Erro ao silenciar lead com histórico de atrito: %s", instance, upd_e)
+            return
 
         # 0. Avaliação rápida de triagem via JEV (TypeSafe / System One)
         # Timeout estrito (3.5s) com fallback silencioso para não travar o WhatsApp
@@ -3432,6 +3696,13 @@ async def _dispatch_ai(
             system_prompt = prospector_prompt
         else:
             system_prompt = _build_system_prompt(tenant_cfg, lead)
+
+        # Injeção prioritária do system_prompt específico da etapa configurado em kanban_stages_config
+        if stage_cfg and stage_cfg.get("system_prompt"):
+            stage_sp = (stage_cfg.get("system_prompt") or "").strip()
+            if stage_sp:
+                stage_title = stage_cfg.get("stage_name") or current_stage
+                system_prompt = f"{system_prompt}\n\n[DIRETRIZ DA ETAPA ({stage_title})]:\n{stage_sp}"
 
         # Injeta diretriz contextual para a LLM. ATENÇÃO 01/10 (Isaías msg 5479):
         # antes deste fix, esse bloco tinha terminologia fixa de clínica
@@ -4234,11 +4505,53 @@ async def prospector_leads_list(tenant_id: str, limit: int = 200) -> dict[str, A
 
 @app.get("/api/kanban/stages")
 async def kanban_stages(tenant_id: str) -> dict[str, Any]:
-    """Colunas oficiais do funil do tenant (tabela kanban_stages, ordenadas)."""
+    """Colunas oficiais do funil do tenant (prioriza kanban_stages_config)."""
     try:
+        # Prioriza kanban_stages_config se existir para o tenant
+        cfg_res = (
+            sb_service.table("kanban_stages_config")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("stage_order")
+            .execute()
+        )
+        if cfg_res.data and len(cfg_res.data) > 0:
+            stages = []
+            palette = ["#38bdf8", "#10b981", "#f59e0b", "#14b8a6", "#6366f1", "#8b5cf6", "#ec4899", "#64748b", "#eab308", "#ef4444"]
+            for r in cfg_res.data:
+                stages.append({
+                    "id": r["id"],
+                    "slug": r["stage_key"],
+                    "title": r["stage_name"],
+                    "position": r["stage_order"],
+                    "is_active": r.get("is_active", True),
+                    "trigger_days": r.get("trigger_days", 0),
+                    "trigger_time": r.get("trigger_time", "10:00:00"),
+                    # 02/11/2026 (sprint dedetização): o ⚙️ de configuração tem
+                    # que aparecer em TODA etapa da esteira — inclusive nas de
+                    # badge fixo (requires_human_only + template vazio, ex.:
+                    # Contrato Recorrente), senão o operador não consegue
+                    # ajustar o prompt/âncora dela.
+                    "has_automation": bool(r.get("auto_message_template"))
+                    or bool(r.get("requires_human_only")),
+                    "is_system_protected": bool(r.get("requires_human_only")),
+                    "requires_human_only": bool(r.get("requires_human_only")),
+                    "ai_prompt_hint": r.get("system_prompt") or "",
+                    "semantic_description": r.get("system_prompt") or "",
+                    "auto_message_template": r.get("auto_message_template") or "",
+                    # 02/11/2026 (sprint dedetização): âncora do gatilho e
+                    # aliases configuráveis por etapa.
+                    "anchor_mode": r.get("anchor_mode") or "auto",
+                    "stage_aliases": list(r.get("stage_aliases") or []),
+                    "automation_stage_key": r.get("stage_key"),
+                    "color_accent": palette[(r["stage_order"] - 1) % len(palette)],
+                })
+            return {"ok": True, "stages": stages}
+
+        # Fallback para kanban_stages legado
         res = (
             sb_service.table("kanban_stages")
-            .select("id, slug, title, position, ai_keywords, ai_prompt_hint, has_automation, trigger_keywords, semantic_description, is_system_protected, color_accent")
+            .select("id, slug, title, position, ai_keywords, ai_prompt_hint, has_automation, trigger_keywords, semantic_description, is_system_protected, color_accent, automation_stage_key")
             .eq("tenant_id", tenant_id)
             .order("position")
             .execute()
@@ -4247,6 +4560,1190 @@ async def kanban_stages(tenant_id: str) -> dict[str, Any]:
     except Exception as exc:
         logger.error("[kanban/stages] %s", exc)
         return {"ok": False, "stages": [], "error": str(exc)}
+
+
+@app.get("/api/kanban/stages-config")
+async def kanban_stages_config_list(tenant_id: str) -> dict[str, Any]:
+    """Lista parâmetros de etapas de kanban_stages_config."""
+    try:
+        res = sb_service.table("kanban_stages_config").select("*").eq("tenant_id", tenant_id).order("stage_order").execute()
+        return {"ok": True, "stages_config": res.data or []}
+    except Exception as exc:
+        logger.error("[kanban/stages-config GET] %s", exc)
+        return {"ok": False, "stages_config": [], "error": str(exc)}
+
+
+@app.post("/api/kanban/stages-config")
+async def kanban_stages_config_upsert(payload: dict[str, Any]) -> dict[str, Any]:
+    """Salva/atualiza configuração da etapa em kanban_stages_config."""
+    tenant_id = str(payload.get("tenant_id") or "")
+    stage_key = str(payload.get("stage_key") or "")
+    if not tenant_id or not stage_key:
+        raise HTTPException(status_code=400, detail="tenant_id e stage_key são obrigatórios")
+    try:
+        # 02/11/2026 (sprint dedetização): trigger_days pode ser NULL (etapa
+        # sem gatilho temporal — acionamento manual) e a etapa ganhou âncora
+        # (auto/future/past) e aliases de busca de lead.
+        raw_days = payload.get("trigger_days", None)
+        if raw_days is None or (isinstance(raw_days, str) and not raw_days.strip()):
+            trigger_days = None
+        else:
+            try:
+                trigger_days = int(raw_days)
+            except (TypeError, ValueError):
+                trigger_days = None
+        raw_aliases = payload.get("stage_aliases", None)
+        if isinstance(raw_aliases, str):
+            raw_aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()]
+        elif isinstance(raw_aliases, list):
+            raw_aliases = [str(a).strip() for a in raw_aliases if str(a).strip()]
+        else:
+            raw_aliases = []
+        anchor_mode = str(payload.get("anchor_mode") or "auto").strip().lower()
+        if anchor_mode not in ("auto", "future", "past"):
+            anchor_mode = "auto"
+        data = {
+            "tenant_id": tenant_id,
+            "stage_key": stage_key,
+            "stage_name": str(payload.get("stage_name") or stage_key),
+            "stage_order": int(payload.get("stage_order") or 1),
+            "is_active": bool(payload.get("is_active", True)),
+            "trigger_days": trigger_days,
+            "trigger_time": str(payload.get("trigger_time") or "10:00:00"),
+            "system_prompt": str(payload.get("system_prompt") or ""),
+            "auto_message_template": str(payload.get("auto_message_template") or ""),
+            "requires_human_only": bool(payload.get("requires_human_only", False)),
+            "stage_aliases": raw_aliases,
+            "anchor_mode": anchor_mode,
+            "updated_at": _now_iso(),
+        }
+        res = sb_service.table("kanban_stages_config").upsert(data, on_conflict="tenant_id,stage_key").execute()
+        # Invalida cache de config de etapa
+        _STAGE_CFG_CACHE.pop(f"{tenant_id}:{stage_key}", None)
+        return {"ok": True, "stage_config": res.data[0] if res.data else data}
+    except Exception as exc:
+        logger.error("[kanban/stages-config POST] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ============================================================================
+# ORDEM DE SERVIÇO DE DEDETIZAÇÃO (02/11/2026 — sprint dedetização)
+# ----------------------------------------------------------------------------
+# Emissão da OS digital (o documento que sustenta a garantia):
+#   GET  /api/v1/ordem-servico/previa?lead_id=...  -> rascunho preenchido
+#   POST /api/v1/ordem-servico                     -> emite, grava e (opcionalmente)
+#                                                   envia no WhatsApp
+#   GET  /api/v1/ordem-servico?tenant_id=...       -> lista as OS do tenant
+#   GET  /api/v1/ordem-servico/html/{os_id}         -> versão imprimível A4
+# ============================================================================
+import os_dedetizacao  # noqa: E402  (módulo puro, sem dependências)
+
+
+def _os_tenant(tenant_id: str) -> Dict[str, Any]:
+    rows = _internal_get("/rest/v1/tenants", {"select": "*", "id": f"eq.{tenant_id}"})
+    if rows:
+        return rows[0]
+    res = sb_service.table("tenants").select("*").eq("id", tenant_id).limit(1).execute()
+    return (res.data or [{}])[0]
+
+
+def _os_lead(lead_id: str) -> Dict[str, Any]:
+    rows = _internal_get("/rest/v1/leads", {"select": "*", "id": f"eq.{lead_id}"})
+    if rows:
+        return rows[0]
+    res = sb_service.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    return (res.data or [{}])[0]
+
+
+def _os_appointment_do_servico(lead_id: str, tenant_id: str) -> Dict[str, Any]:
+    """Agendamento mais provável do serviço: futuro primeiro, senão o último passado."""
+    rows = _internal_get(
+        "/rest/v1/appointments",
+        {
+            "select": "*",
+            "lead_id": f"eq.{lead_id}",
+            "tenant_id": f"eq.{tenant_id}",
+            "order": "start_time.desc",
+            "limit": "10",
+        },
+    )
+    if not rows:
+        return {}
+    agora = datetime.now(timezone.utc)
+    futuras = []
+    passadas = []
+    for r in rows:
+        st = r.get("start_time")
+        if not st:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(st).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        (futuras if dt >= agora else passadas).append(r)
+    if futuras:
+        futuras.sort(key=lambda r: r.get("start_time") or "")
+        return futuras[0]
+    if passadas:
+        passadas.sort(key=lambda r: r.get("start_time") or "", reverse=True)
+        return passadas[0]
+    return {}
+
+
+def _os_proximo_numero(tenant_id: str) -> str:
+    """Sequência por tenant: OS-2026-0001, OS-2026-0002..."""
+    ano = datetime.now(os_dedetizacao._tz_br()).year
+    prefixo = f"OS-{ano}-"
+    seq = 0
+    try:
+        res = (
+            sb_service.table("service_orders")
+            .select("numero")
+            .eq("tenant_id", tenant_id)
+            .like("numero", f"{prefixo}%")
+            .execute()
+        )
+        for r in res.data or []:
+            try:
+                seq = max(seq, int(str(r.get("numero", "")).rsplit("-", 1)[-1]))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning("[os] não consegui ler a sequência: %s", exc)
+    return os_dedetizacao.numero_os(seq + 1, ano)
+
+
+@app.get("/api/v1/ordem-servico/previa")
+async def ordem_servico_previa(lead_id: str) -> dict[str, Any]:
+    """Rascunho da OS já preenchido com o que o CRM sabe do lead."""
+    try:
+        lead = _os_lead(lead_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        tenant_id = str(lead.get("tenant_id") or "")
+        tenant = _os_tenant(tenant_id)
+        appt = _os_appointment_do_servico(lead_id, tenant_id)
+        numero = _os_proximo_numero(tenant_id)
+        dados = os_dedetizacao.montar_os(tenant, lead, appt, numero=numero)
+        return {
+            "ok": True,
+            "os": dados,
+            "html": os_dedetizacao.render_html(dados),
+            "whatsapp": os_dedetizacao.render_whatsapp(dados),
+            "pendencias": os_dedetizacao.validar_os(dados),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[os/previa] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/v1/ordem-servico")
+async def ordem_servico_emitir(payload: dict[str, Any]) -> dict[str, Any]:
+    """Emite a OS: grava em service_orders e (opcionalmente) envia no WhatsApp."""
+    try:
+        lead_id = str(payload.get("lead_id") or "")
+        if not lead_id:
+            raise HTTPException(status_code=400, detail="lead_id é obrigatório")
+        lead = _os_lead(lead_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        tenant_id = str(lead.get("tenant_id") or "")
+        tenant = _os_tenant(tenant_id)
+        appt = _os_appointment_do_servico(lead_id, tenant_id)
+
+        dados_extra = payload.get("dados") or {}
+        numero = str(payload.get("numero") or _os_proximo_numero(tenant_id))
+        dados = os_dedetizacao.montar_os(
+            tenant, lead, appt, numero=numero, extra=dados_extra
+        )
+        pendencias = os_dedetizacao.validar_os(dados)
+
+        registro = {
+            "tenant_id": tenant_id,
+            "lead_id": lead_id,
+            "numero": numero,
+            "status": "emitida",
+            "dados": dados,
+            "updated_at": _now_iso(),
+        }
+        res = (
+            sb_service.table("service_orders")
+            .upsert(registro, on_conflict="tenant_id,numero")
+            .execute()
+        )
+        os_id = (res.data or [{}])[0].get("id") if res.data else None
+
+        enviada = None
+        if bool(payload.get("enviar")):
+            instance = tenant.get("evolution_instance")
+            telefone = lead.get("phone")
+            if not instance or not telefone:
+                enviada = {"ok": False, "reason": "tenant sem instância Evolution ou lead sem telefone"}
+            else:
+                texto = str(payload.get("texto") or os_dedetizacao.render_whatsapp(dados))
+                enviada = await _send_evolution_text(instance, telefone, texto)
+                if enviada.get("ok"):
+                    sb_service.table("service_orders").update(
+                        {"status": "enviada", "updated_at": _now_iso()}
+                    ).eq("id", os_id).execute()
+
+        return {
+            "ok": True,
+            "os_id": os_id,
+            "numero": numero,
+            "os": dados,
+            "html": os_dedetizacao.render_html(dados),
+            "whatsapp": os_dedetizacao.render_whatsapp(dados),
+            "pendencias": pendencias,
+            "enviada": enviada,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[os/emitir] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/v1/ordem-servico")
+async def ordem_servico_lista(tenant_id: str, limit: int = 50) -> dict[str, Any]:
+    """Lista as OS emitidas do tenant."""
+    try:
+        res = (
+            sb_service.table("service_orders")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(min(int(limit or 50), 200))
+            .execute()
+        )
+        return {"ok": True, "ordens_servico": res.data or []}
+    except Exception as exc:
+        logger.error("[os/lista] %s", exc)
+        return {"ok": False, "ordens_servico": [], "error": str(exc)}
+
+
+@app.get("/api/v1/ordem-servico/html/{os_id}")
+async def ordem_servico_html(os_id: str) -> dict[str, Any]:
+    """Versão imprimível (A4) de uma OS já emitida."""
+    try:
+        res = sb_service.table("service_orders").select("*").eq("id", os_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="OS não encontrada")
+        dados = res.data[0].get("dados") or {}
+        return {
+            "ok": True,
+            "numero": res.data[0].get("numero"),
+            "html": os_dedetizacao.render_html(dados),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[os/html] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ============================================================================
+# Proposta Comercial B2B em PDF (sprint 03/11/2026)
+# ----------------------------------------------------------------------------
+# Gera a proposta a partir dos dados REAIS do lead (nome + telefone + o que o
+# operador corrigir no lápis do card) e a envia no WhatsApp da instância do
+# tenant (Evolution API). Dois templates: Pescados/Atacado (Peixaria do
+# William) e Controle de Pragas/Laudo Sanitário (Adriano Dedetização).
+#
+#   GET  /api/v1/proposta-b2b/previa?lead_id=...   -> rascunho + HTML + texto
+#   POST /api/v1/proposta-b2b/gerar                 -> PDF (base64) + grava
+#   POST /api/v1/proposta-b2b/enviar               -> envia texto ou PDF no WhatsApp
+#   GET  /api/v1/proposta-b2b?tenant_id=...        -> lista as propostas do tenant
+#   GET  /api/v1/proposta-b2b/pdf/{proposta_id}    -> PDF base64 de uma proposta
+# ============================================================================
+import propostas_b2b  # noqa: E402  (módulo puro, sem dependências)
+
+
+def _pb_tenant(tenant_id: str) -> Dict[str, Any]:
+    rows = _internal_get("/rest/v1/tenants", {"select": "*", "id": f"eq.{tenant_id}"})
+    if rows:
+        return rows[0]
+    res = sb_service.table("tenants").select("*").eq("id", tenant_id).limit(1).execute()
+    return (res.data or [{}])[0]
+
+
+def _pb_lead(lead_id: str) -> Dict[str, Any]:
+    rows = _internal_get("/rest/v1/leads", {"select": "*", "id": f"eq.{lead_id}"})
+    if rows:
+        return rows[0]
+    res = sb_service.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    return (res.data or [{}])[0]
+
+
+def _pb_logo_data_uri(tenant: Dict[str, Any]) -> str:
+    """Baixa a logo do tenant e embute em base64 (o Chrome do servidor é
+    headless e nem sempre alcança a internet — melhor embutir)."""
+    url = str(tenant.get("logo_url") or "").strip()
+    if not url.startswith("http"):
+        return ""
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            r = client.get(url)
+            if r.status_code != 200 or not r.content:
+                return ""
+            mime = r.headers.get("content-type", "image/png").split(";")[0]
+            if not mime.startswith("image/"):
+                return ""
+            return f"data:{mime};base64," + base64.b64encode(r.content).decode("ascii")
+    except Exception as exc:
+        logger.warning("[proposta-b2b] não consegui baixar a logo: %s", exc)
+        return ""
+
+
+def _pb_proximo_numero(tenant_id: str) -> str:
+    """PROP-2026-0001, PROP-2026-0002..."""
+    ano = datetime.now(propostas_b2b._tz_br()).year
+    prefixo = f"PROP-{ano}-"
+    seq = 0
+    try:
+        res = (
+            sb_service.table("propostas_b2b")
+            .select("numero")
+            .eq("tenant_id", tenant_id)
+            .like("numero", f"{prefixo}%")
+            .execute()
+        )
+        for r in res.data or []:
+            try:
+                seq = max(seq, int(str(r.get("numero", "")).rsplit("-", 1)[-1]))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning("[proposta-b2b] não consegui ler a sequência: %s", exc)
+    return f"{prefixo}{seq + 1:04d}"
+
+
+def _pb_montar(
+    lead: Dict[str, Any],
+    tenant: Dict[str, Any],
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = payload or {}
+    tenant = dict(tenant or {})
+    tenant["logo_data_uri"] = _pb_logo_data_uri(tenant)
+    return propostas_b2b.montar_proposta(
+        tenant,
+        lead,
+        itens=payload.get("itens"),
+        cliente=payload.get("cliente"),
+        condicoes=payload.get("condicoes"),
+        numero=payload.get("numero") or _pb_proximo_numero(str(tenant.get("id") or "")),
+        template=payload.get("template"),
+    )
+
+
+def _pb_registrar(
+    proposta: Dict[str, Any],
+    tenant_id: str,
+    lead_id: str,
+    status: str = "gerada",
+) -> Optional[str]:
+    """Grava a proposta na tabela propostas_b2b (best-effort)."""
+    try:
+        registro = {
+            "tenant_id": tenant_id,
+            "lead_id": lead_id,
+            "numero": proposta.get("numero"),
+            "template": proposta.get("template"),
+            "status": status,
+            "cliente": proposta.get("cliente") or {},
+            "itens": proposta.get("itens") or [],
+            "condicoes": proposta.get("condicoes") or {},
+            "proposta": proposta,
+            "updated_at": _now_iso(),
+        }
+        res = (
+            sb_service.table("propostas_b2b")
+            .upsert(registro, on_conflict="tenant_id,numero")
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("id")
+    except Exception as exc:
+        logger.warning("[proposta-b2b] não consegui gravar a proposta: %s", exc)
+    return None
+
+
+async def _pb_enviar_documento(
+    instance: str, phone: str, pdf_bytes: bytes, filename: str, caption: str
+) -> Dict[str, Any]:
+    """POST Evolution /message/sendMedia/{instance} com application/pdf (base64)."""
+    if not EVOLUTION_API_KEY:
+        return {"ok": False, "reason": "no_api_key"}
+    import base64
+
+    payload = {
+        "number": phone,
+        "mediatype": "document",
+        "mimetype": "application/pdf",
+        "media": base64.b64encode(pdf_bytes).decode("ascii"),
+        "fileName": filename,
+        "caption": caption,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=150.0) as client:
+            r = await client.post(
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendMedia/{instance}",
+                json=payload,
+                headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+            )
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            ok = r.status_code in (200, 201)
+            if not ok:
+                logger.warning(
+                    "[proposta-b2b] sendMedia recusado (%s): %s", r.status_code, str(body)[:300]
+                )
+            return {"ok": ok, "status": r.status_code, "body": body}
+    except Exception as exc:
+        logger.error("[proposta-b2b] erro de rede no sendMedia: %s", exc)
+        return {"ok": False, "reason": str(exc) or exc.__class__.__name__}
+
+
+@app.get("/api/v1/proposta-b2b/previa")
+async def proposta_b2b_previa(lead_id: str, template: Optional[str] = None) -> dict[str, Any]:
+    """Rascunho da proposta já preenchido com os dados do lead (HTML + texto)."""
+    try:
+        lead = _pb_lead(lead_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        tenant = _pb_tenant(str(lead.get("tenant_id") or ""))
+        proposta = _pb_montar(lead, tenant, {"template": template})
+        return {
+            "ok": True,
+            "template": proposta["template"],
+            "proposta": proposta,
+            "html": propostas_b2b.render_html(proposta),
+            "whatsapp": propostas_b2b.render_whatsapp(proposta),
+            "pendencias": propostas_b2b.validar(proposta),
+            "catalogo": propostas_b2b.CATALOGO_PADRAO.get(proposta["template"], []),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[proposta-b2b/previa] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/v1/proposta-b2b/gerar")
+async def proposta_b2b_gerar(payload: dict[str, Any]) -> dict[str, Any]:
+    """Gera o PDF (base64) da proposta e grava o registro."""
+    try:
+        lead_id = str(payload.get("lead_id") or "")
+        if not lead_id:
+            raise HTTPException(status_code=400, detail="lead_id é obrigatório")
+        lead = _pb_lead(lead_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        tenant_id = str(lead.get("tenant_id") or "")
+        tenant = _pb_tenant(tenant_id)
+        proposta = _pb_montar(lead, tenant, payload)
+        html = propostas_b2b.render_html(proposta)
+        pdf_bytes = await asyncio.to_thread(propostas_b2b.gerar_pdf, html)
+        proposta_id = _pb_registrar(proposta, tenant_id, lead_id)
+        return {
+            "ok": True,
+            "proposta_id": proposta_id,
+            "numero": proposta.get("numero"),
+            "template": proposta.get("template"),
+            "filename": f"proposta-{proposta.get('numero')}.pdf",
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+            "pdf_size": len(pdf_bytes),
+            "html": html,
+            "whatsapp": propostas_b2b.render_whatsapp(proposta),
+            "proposta": proposta,
+            "pendencias": propostas_b2b.validar(proposta),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[proposta-b2b/gerar] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/v1/proposta-b2b/enviar")
+async def proposta_b2b_enviar(payload: dict[str, Any]) -> dict[str, Any]:
+    """Envia a proposta no WhatsApp: modo 'texto' (sendText) ou 'pdf' (sendMedia)."""
+    try:
+        lead_id = str(payload.get("lead_id") or "")
+        if not lead_id:
+            raise HTTPException(status_code=400, detail="lead_id é obrigatório")
+        lead = _pb_lead(lead_id)
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead não encontrado")
+        tenant_id = str(lead.get("tenant_id") or "")
+        tenant = _pb_tenant(tenant_id)
+
+        telefone = str(payload.get("telefone") or lead.get("phone") or "").strip()
+        instance = str(payload.get("instance") or tenant.get("evolution_instance") or "").strip()
+        modo = str(payload.get("modo") or "pdf").lower()
+
+        proposta = _pb_montar(lead, tenant, payload)
+        texto = str(payload.get("texto") or propostas_b2b.render_whatsapp(proposta))
+        proposta_id = _pb_registrar(proposta, tenant_id, lead_id, status="enviando")
+
+        if not instance:
+            return {
+                "ok": False,
+                "erro": "tenant sem instância Evolution configurada",
+                "proposta_id": proposta_id,
+                "proposta": proposta,
+                "whatsapp": texto,
+            }
+        if not telefone:
+            return {
+                "ok": False,
+                "erro": "lead sem telefone",
+                "proposta_id": proposta_id,
+                "proposta": proposta,
+                "whatsapp": texto,
+            }
+
+        enviada: Dict[str, Any]
+        if modo == "texto":
+            enviada = await _send_evolution_text(instance, telefone, texto)
+        else:
+            html = propostas_b2b.render_html(proposta)
+            pdf_bytes = await asyncio.to_thread(propostas_b2b.gerar_pdf, html)
+            filename = f"proposta-{proposta.get('numero')}.pdf"
+            caption = texto if len(texto) <= 1000 else texto[:1000]
+            enviada = await _pb_enviar_documento(
+                instance, telefone, pdf_bytes, filename, caption
+            )
+
+        try:
+            if proposta_id:
+                sb_service.table("propostas_b2b").update(
+                    {
+                        "status": "enviada" if enviada.get("ok") else "erro_envio",
+                        "whatsapp_enviado": bool(enviada.get("ok")),
+                        "whatsapp_erro": None if enviada.get("ok") else str(enviada)[:500],
+                        "updated_at": _now_iso(),
+                    }
+                ).eq("id", proposta_id).execute()
+        except Exception as exc:
+            logger.warning("[proposta-b2b/enviar] falha ao atualizar status: %s", exc)
+
+        return {
+            "ok": bool(enviada.get("ok")),
+            "enviada": enviada,
+            "proposta_id": proposta_id,
+            "numero": proposta.get("numero"),
+            "template": proposta.get("template"),
+            "instance": instance,
+            "telefone": telefone,
+            "modo": modo,
+            "whatsapp": texto,
+            "proposta": proposta,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[proposta-b2b/enviar] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/v1/proposta-b2b")
+async def proposta_b2b_lista(tenant_id: str, limit: int = 50) -> dict[str, Any]:
+    """Lista as propostas do tenant (mais recentes primeiro)."""
+    try:
+        res = (
+            sb_service.table("propostas_b2b")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(min(int(limit or 50), 200))
+            .execute()
+        )
+        return {"ok": True, "propostas": res.data or []}
+    except Exception as exc:
+        logger.error("[proposta-b2b/lista] %s", exc)
+        return {"ok": False, "propostas": [], "error": str(exc)}
+
+
+@app.get("/api/v1/proposta-b2b/pdf/{proposta_id}")
+async def proposta_b2b_pdf(proposta_id: str) -> dict[str, Any]:
+    """PDF (base64) de uma proposta já gravada."""
+    try:
+        res = sb_service.table("propostas_b2b").select("*").eq("id", proposta_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="proposta não encontrada")
+        proposta = res.data[0].get("proposta") or {}
+        html = propostas_b2b.render_html(proposta)
+        pdf_bytes = await asyncio.to_thread(propostas_b2b.gerar_pdf, html)
+        return {
+            "ok": True,
+            "numero": res.data[0].get("numero"),
+            "filename": f"proposta-{res.data[0].get('numero')}.pdf",
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+            "pdf_size": len(pdf_bytes),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[proposta-b2b/pdf] %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ============================================================================
+# Chave global de Automações temporais (31/10/2026)
+# ----------------------------------------------------------------------------
+# O worker cron_automations.py consulta a tabela `automation_control`
+# (linha id=1) no início de cada ciclo: se `enabled` for falso, aborta a
+# varredura sem disparar nenhuma régua (D-1, D+3, D+28, reativação etc.).
+# O atendimento em tempo real (webhook + Plantão IA) NÃO passa por aqui.
+# `is_running` = flag ligada E worker vivo (heartbeat < 3 min).
+# O toggle ON tenta subir o processo via PM2 (best-effort) quando o
+# worker está morto; o toggle OFF só desliga a flag (o processo fica
+# vivo mas ocioso, para religar instantaneamente).
+# ============================================================================
+
+def _automations_control_row() -> dict[str, Any] | None:
+    try:
+        res = sb_service.table("automation_control").select("enabled,last_heartbeat,updated_at").eq("id", 1).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception as exc:
+        logger.warning("[automations/status] Falha ao ler automation_control: %s", exc)
+        return None
+
+
+def _automations_status_payload() -> dict[str, Any]:
+    row = _automations_control_row()
+    enabled = bool(row.get("enabled")) if row else False
+    hb_raw = (row or {}).get("last_heartbeat")
+    alive = False
+    if hb_raw:
+        try:
+            from datetime import datetime, timezone
+            hb = datetime.fromisoformat(str(hb_raw).replace("Z", "+00:00"))
+            if hb.tzinfo is None:
+                hb = hb.replace(tzinfo=timezone.utc)
+            alive = (datetime.now(timezone.utc) - hb).total_seconds() < 180
+        except Exception:
+            alive = False
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "worker_alive": alive,
+        "is_running": enabled and alive,
+        "last_heartbeat": hb_raw,
+    }
+
+
+async def _ensure_automations_worker_running() -> bool:
+    """Tenta subir o worker via PM2 quando o heartbeat está velho.
+
+    Best-effort: falha de PM2 não derruba o toggle (a flag já foi salva
+    e o worker sobe no próximo deploy/reinício manual).
+    """
+    import asyncio
+    import shutil
+    import subprocess
+    try:
+        status = _automations_status_payload()
+        if status["worker_alive"]:
+            return False
+        pm2 = shutil.which("pm2") or "/root/.hermes/node/bin/pm2"
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [pm2, "start", "ecosystem.config.cjs", "--only", "crm-automations-worker"],
+            cwd="/root/apps/crm-hermes",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        ok = proc.returncode == 0
+        if not ok:
+            logger.warning("[automations/toggle] pm2 start falhou: %s", (proc.stderr or "")[:300])
+        return ok
+    except Exception as exc:
+        logger.warning("[automations/toggle] pm2 start erro: %s", exc)
+        return False
+
+
+
+# ============================================================================
+# MÉTRICAS EXECUTIVAS P/ CENTRO DE DECISÕES + SKILL AGENT ZERO (2026-10-31)
+# GET /api/decision/metrics?tenant_id=<uuid|apelido>&days_back=7
+# - tenant_id aceita UUID ou apelido (ex: dr-matheus-dore, adriano-dedetizacao):
+#   resolve por slug do nome do tenant (substring única).
+# - Usa sb_service (service_role). Rotas /api seguem o padrão da casa (sem
+#   auth por endpoint). Definições honestas em "notes" (ex: atendido =
+#   agendamento passado cujo lead está em etapa de comparecimento; faltoso =
+#   agendamento passado ainda "agendado").
+# ============================================================================
+_DECISION_STAGE_MAP = {
+    "novo_contato": "triagem",
+    "iniciou_conversa": "triagem",
+    "consulta_agendada": "agendados_d1",
+    "agendou": "agendados_d1",
+    "consulta_realizada": "compareceu_atendido",
+    "compareceu": "compareceu_atendido",
+    "cancelou": "cancelou_inativos",
+    "desistiu": "cancelou_inativos",
+}
+_DECISION_COMPARECEU = {"compareceu_atendido", "consulta_realizada"}
+
+
+def _decision_count(table, filters):
+    try:
+        q = sb_service.table(table).select("id", count="exact").limit(1)
+        for col, val in filters:
+            q = q.eq(col, val)
+        res = q.execute()
+        if res.count is not None:
+            return res.count
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def _decision_resolve_tenant(value):
+    """Resolve tenant_id (UUID) ou apelido -> (id, nome) ou None.
+
+    02/11/2026: rota interna (Kong local) primeiro — o PostgREST público via
+    Cloudflare custava ~150ms x 2 consultas por resolução.
+
+    02/11/2026 (sprint dedetização): a coluna `tenants.slug` passou a ser a
+    fonte canônica do apelido (ex.: 'adriano-dedetizacao'). O nome do tenant
+    alimenta o slugify da Sala de Decisões (decision-<slug>), e nomes com
+    acento/typo não casavam com o apelido digitado.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    rows = _internal_get("/rest/v1/tenants", {"select": "id,name,slug", "id": f"eq.{value}"})
+    if not rows:
+        rows = _internal_get("/rest/v1/tenants", {"select": "id,name,slug"})
+    if rows:
+        try:
+            if len(rows) == 1 and rows[0].get("id") == value:
+                return rows[0]["id"], rows[0]["name"]
+            want = _slugify(value)
+            # 1) casamento exato com a coluna slug (canônico)
+            slug_cands = [
+                r for r in rows
+                if want and want == _slugify(r.get("slug") or "")
+            ]
+            if len(slug_cands) == 1:
+                return slug_cands[0]["id"], slug_cands[0]["name"]
+            if len(slug_cands) > 1:
+                return None
+            # 2) fallback legado: slugify do nome
+            cands = []
+            for r in rows:
+                slug = _slugify(r.get("name") or "")
+                if want and (want == slug or want in slug):
+                    cands.append(r)
+            if len(cands) == 1:
+                return cands[0]["id"], cands[0]["name"]
+            if len(cands) > 1:
+                return None
+        except Exception:
+            pass
+    # fallback: PostgREST público
+    try:
+        res = (
+            sb_service.table("tenants")
+            .select("id,name,slug")
+            .eq("id", value)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["id"], res.data[0]["name"]
+    except Exception:
+        pass
+    try:
+        res = sb_service.table("tenants").select("id,name,slug").execute()
+        rows = res.data or []
+    except Exception:
+        return None
+    want = _slugify(value)
+    slug_cands = [r for r in rows if want and want == _slugify(r.get("slug") or "")]
+    if len(slug_cands) == 1:
+        return slug_cands[0]["id"], slug_cands[0]["name"]
+    cands = []
+    for r in rows:
+        slug = _slugify(r.get("name") or "")
+        if want and (want == slug or want in slug):
+            cands.append(r)
+    if len(cands) == 1:
+        return cands[0]["id"], cands[0]["name"]
+    return None
+
+
+@app.get("/api/decision/metrics")
+async def decision_metrics(tenant_id: str, days_back: int = 7) -> dict[str, Any]:
+    """Métricas executivas multi-tenant p/ Centro de Decisões e Agent Zero."""
+    from datetime import datetime, timedelta
+
+    days_back = max(1, min(90, int(days_back or 7)))
+    resolved = _decision_resolve_tenant(tenant_id)
+    if not resolved:
+        return {"ok": False, "error": "tenant nao encontrado (use o UUID ou o apelido, ex: dr-matheus-dore)"}
+    tid, tname = resolved
+
+    now = datetime.now().astimezone()
+    today = now.date()
+    since_dt = datetime.combine(today - timedelta(days=days_back), datetime.min.time()).astimezone()
+    until_dt = datetime.combine(today + timedelta(days=1), datetime.max.time()).astimezone()
+    day_start = datetime.combine(today, datetime.min.time()).astimezone()
+
+    def _parse_ts(v):
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone()
+        except Exception:
+            return None
+
+    # --- Kanban: contagens por etapa (nomes da kanban_stages_config) ---
+    kanban_stages: list[dict[str, Any]] = []
+    total_leads = 0
+    try:
+        cfg = (
+            sb_service.table("kanban_stages_config")
+            .select("stage_key,stage_name,stage_order,is_active")
+            .eq("tenant_id", tid)
+            .order("stage_order")
+            .execute()
+        ).data or []
+    except Exception:
+        cfg = []
+    cfg_by_key = {r["stage_key"]: r for r in cfg}
+    universe = set(cfg_by_key) | set(_DECISION_STAGE_MAP) | {
+        "em_atendimento", "falar_pessoalmente", "risco_juridico",
+        "triagem", "agendados_d1", "compareceu_atendido", "cancelou_inativos",
+    }
+    raw_counts: dict[str, int] = {}
+    for key in sorted(universe):
+        raw_counts[key] = _decision_count("leads", [("tenant_id", tid), ("stage", key)])
+    merged: dict[str, int] = {}
+    for key, cnt in raw_counts.items():
+        merged[_DECISION_STAGE_MAP.get(key, key)] = merged.get(_DECISION_STAGE_MAP.get(key, key), 0) + cnt
+    for key, cnt in sorted(merged.items()):
+        row = cfg_by_key.get(key) or {}
+        kanban_stages.append({
+            "stage": key,
+            "name": row.get("stage_name") or key,
+            "count": cnt,
+            "order": row.get("stage_order", 999),
+        })
+        total_leads += cnt
+    kanban_stages.sort(key=lambda r: (r["order"], r["name"]))
+
+    # --- Agenda: appointments na janela ---
+    try:
+        appts = (
+            sb_service.table("appointments")
+            .select("id,lead_id,start_time,status")
+            .eq("tenant_id", tid)
+            .gte("start_time", since_dt.isoformat())
+            .lte("start_time", until_dt.isoformat())
+            .execute()
+        ).data or []
+    except Exception:
+        appts = []
+    lead_ids = sorted({a.get("lead_id") for a in appts if a.get("lead_id")})
+    names: dict[str, str] = {}
+    stages: dict[str, str] = {}
+    if lead_ids:
+        try:
+            lres = sb_service.table("leads").select("id,name,stage").in_("id", lead_ids).execute()
+            for r in (lres.data or []):
+                names[r["id"]] = r.get("name") or "Paciente"
+                stages[r["id"]] = r.get("stage") or ""
+        except Exception:
+            pass
+
+    def _item(a):
+        st = _parse_ts(a.get("start_time"))
+        return {"time": st.strftime("%H:%M") if st else "", "name": names.get(a.get("lead_id"), "Paciente")}
+
+    today_items, future_items, noshow_items = [], [], []
+    attended = 0
+    for a in appts:
+        if a.get("status") != "agendado":
+            continue
+        st = _parse_ts(a.get("start_time"))
+        if not st:
+            continue
+        if st.date() == today and st >= now - timedelta(minutes=30):
+            today_items.append(a)
+        elif st.date() > today:
+            future_items.append(a)
+        elif st < day_start:
+            noshow_items.append(a)
+        if st < now and stages.get(a.get("lead_id")) in _DECISION_COMPARECEU:
+            attended += 1
+    today_items.sort(key=lambda a: a.get("start_time") or "")
+    future_items.sort(key=lambda a: a.get("start_time") or "")
+    noshow_items.sort(key=lambda a: a.get("start_time") or "")
+
+    # --- Financeiro: financial_entries ---
+    try:
+        fentries = (
+            sb_service.table("financial_entries")
+            .select("amount,payment_method,status,paid_at,created_at")
+            .eq("tenant_id", tid)
+            .execute()
+        ).data or []
+    except Exception:
+        fentries = []
+
+    def _method(m):
+        m = (m or "").strip().lower()
+        if "pix" in m:
+            return "pix"
+        if "dinheiro" in m or "cash" in m or "especie" in m:
+            return "dinheiro"
+        return "outros"
+
+    conf_win = [e for e in fentries if e.get("status") == "pago" and (
+        (_parse_ts(e.get("paid_at")) or _parse_ts(e.get("created_at")) or now) >= since_dt
+    )]
+    conf_total = [e for e in fentries if e.get("status") == "pago"]
+    pend = [e for e in fentries if e.get("status") == "pendente"]
+    by_method: dict[str, int] = {"pix": 0, "dinheiro": 0, "outros": 0}
+    for e in conf_win:
+        by_method[_method(e.get("payment_method"))] += 1
+    amounts = [float(e.get("amount") or 0) for e in conf_win]
+    avg_ticket = round(sum(amounts) / len(amounts), 2) if amounts else 0.0
+
+    # --- Risco: ouvidoria + IA pausada ---
+    crit_items = []
+    sev_counts = {}
+    for sev in ("critica", "media", "baixa"):
+        sev_counts[sev] = _decision_count(
+            "customer_complaints",
+            [("tenant_id", tid), ("status", "pendente"), ("severity", sev)],
+        )
+    try:
+        cres = (
+            sb_service.table("customer_complaints")
+            .select("client_name,reason,severity,snippet,created_at")
+            .eq("tenant_id", tid)
+            .eq("status", "pendente")
+            .eq("severity", "critica")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        ).data or []
+        crit_items = [{
+            "name": r.get("client_name") or "Paciente",
+            "reason": r.get("reason") or "",
+            "snippet": (r.get("snippet") or "")[:200],
+            "created_at": r.get("created_at") or "",
+        } for r in cres]
+    except Exception:
+        crit_items = []
+    handoff_count = _decision_count("leads", [("tenant_id", tid), ("handoff_state", "humano_assumiu")])
+    try:
+        hres = (
+            sb_service.table("leads")
+            .select("id,name,stage")
+            .eq("tenant_id", tid)
+            .eq("handoff_state", "humano_assumiu")
+            .limit(10)
+            .execute()
+        ).data or []
+        handoff_items = [{"name": r.get("name") or "Paciente", "stage": r.get("stage") or ""} for r in hres]
+    except Exception:
+        handoff_items = []
+    try:
+        inc_res = sb_service.table("leads").select("id", count="exact").eq("tenant_id", tid).gt("incident_count", 0).limit(1).execute()
+        inc_count = inc_res.count if inc_res.count is not None else 0
+    except Exception:
+        inc_count = 0
+
+    # --- JEV: últimos resumos do copiloto ---
+    jev_items = []
+    try:
+        jres = (
+            sb_service.table("leads")
+            .select("id,name,stage,copilot_guidance,last_copilot_eval_at")
+            .eq("tenant_id", tid)
+            .order("last_copilot_eval_at", desc=True)
+            .limit(50)
+            .execute()
+        ).data or []
+        for r in jres:
+            if r.get("copilot_guidance") and r.get("last_copilot_eval_at"):
+                jev_items.append({
+                    "name": r.get("name") or "Paciente",
+                    "stage": r.get("stage") or "",
+                    "guidance": str(r["copilot_guidance"])[:300],
+                    "evaluated_at": r.get("last_copilot_eval_at"),
+                })
+            if len(jev_items) >= 10:
+                break
+    except Exception:
+        jev_items = []
+
+    return {
+        "ok": True,
+        "tenant": {"id": tid, "name": tname},
+        "window": {
+            "days_back": days_back,
+            "since": since_dt.date().isoformat(),
+            "until": today.isoformat(),
+            "generated_at": now.isoformat(),
+        },
+        "kanban_summary": {"total_leads": total_leads, "stages": kanban_stages},
+        "agenda_summary": {
+            "today": {"count": len(today_items), "items": [_item(a) for a in today_items[:10]]},
+            "future": {"count": len(future_items), "items": [_item(a) for a in future_items[:10]]},
+            "attended": {"count": attended},
+            "no_shows": {"count": len(noshow_items), "items": [_item(a) for a in noshow_items[:10]]},
+        },
+        "financial_snapshot": {
+            "confirmed_window": {
+                "count": len(conf_win),
+                "total": round(sum(float(e.get("amount") or 0) for e in conf_win), 2),
+                "avg_ticket": avg_ticket,
+                "by_method": by_method,
+            },
+            "confirmed_total": len(conf_total),
+            "pending": {
+                "count": len(pend),
+                "total": round(sum(float(e.get("amount") or 0) for e in pend), 2),
+            },
+        },
+        "risk_alerts": {
+            "complaints_pending_by_severity": sev_counts,
+            "critical": crit_items,
+            "ai_paused": {
+                "handoff_count": handoff_count,
+                "handoff_items": handoff_items,
+                "auto_silence_count": _decision_count("leads", [("tenant_id", tid), ("ai_auto_silence", True)]),
+                "ai_inactive_count": _decision_count("leads", [("tenant_id", tid), ("ai_active", False)]),
+                "with_incident_history": inc_count,
+            },
+        },
+        "jev_insights": {"count": len(jev_items), "items": jev_items},
+        "notes": [
+            "atendido = agendamento passado cujo lead esta em etapa de comparecimento (compareceu_atendido/consulta_realizada).",
+            "faltoso = agendamento passado ainda com status agendado, dentro da janela.",
+            "pagamento confirmado = financial_entries com status pago; ticket medio sobre a janela.",
+            "kanban_summary agrega chaves legadas para a etapa configurada (ex: consulta_agendada -> agendados_d1).",
+        ],
+    }
+
+
+# ============================================================================
+# API UNIVERSAL DE MÉTRICAS MULTI-TENANT (fonte única da verdade)
+# ============================================================================
+# Token de serviço (server-to-server) no cofre /root/.hermes/secrets/
+# crm-internal.env — NUNCA versionar o valor.
+CRM_INTERNAL_TOKEN = os.environ.get("CRM_INTERNAL_TOKEN", "").strip()
+
+# Headers que provêm proxy/túnel: com eles o token passa a ser obrigatório
+# (senão o endpoint interno viraria público via domínio).
+_PROXY_HEADERS = (
+    "x-forwarded-for", "cf-connecting-ip", "x-real-ip",
+    "x-forwarded-proto", "forwarded", "x-forwarded-host",
+)
+
+
+def _metrics_internal_authorized(request: Request) -> bool:
+    """Libera chamada local direta (sem proxy) ou com X-Internal-Token correto.
+
+    Token enviado e errado -> NEGADO (não cai no fallback local).
+    Sem token -> só passa se for chamada local direta e sem headers de proxy.
+    """
+    token = (request.headers.get("x-internal-token") or "").strip()
+    if token:
+        return bool(CRM_INTERNAL_TOKEN and hmac.compare_digest(token, CRM_INTERNAL_TOKEN))
+    if any(request.headers.get(h) for h in _PROXY_HEADERS):
+        return False
+    client = request.client
+    return bool(client and client.host in ("127.0.0.1", "::1", "localhost"))
+
+
+@app.get("/api/v1/metrics/snapshot")
+async def metrics_snapshot(request: Request, tenant_id: str, days_back: int = 7) -> dict[str, Any]:
+    """Snapshot consolidado de métricas do tenant — fonte única da verdade.
+
+    GET /api/v1/metrics/snapshot?tenant_id={uuid|apelido}&days_back={N}
+    Auth interna: header X-Internal-Token (server-to-server) ou chamada
+    local direta (sem proxy). Resposta em < 300 ms (1 ida ao banco via RPC).
+    """
+    if not _metrics_internal_authorized(request):
+        raise HTTPException(status_code=401, detail="X-Internal-Token ausente ou invalido")
+    try:
+        days_back = max(1, min(90, int(days_back or 7)))
+    except (TypeError, ValueError):
+        days_back = 7
+    # UUID puro -> sem roundtrip extra de resolução (mantém a latência < 300ms)
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tenant_id.strip()):
+        tid, tname = tenant_id.strip(), ""
+    else:
+        resolved = _decision_resolve_tenant(tenant_id)
+        if not resolved:
+            raise HTTPException(
+                status_code=404,
+                detail="tenant nao encontrado (use o UUID ou o apelido, ex: dr-matheus-dore)",
+            )
+        tid, tname = resolved
+    t0 = time.perf_counter()
+    try:
+        payload, origem = _metrics_snapshot_rpc(tid, days_back)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"falha ao consultar metricas: {type(exc).__name__}",
+        )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="metricas vazias")
+    out = dict(payload)
+    out["tenant_nome"] = out.get("tenant_nome") or tname
+    # 02/11/2026 (sprint dedetização): identidade do negócio no snapshot.
+    # A Sala de Decisões (:8095) usa business_type para trocar os rótulos e os
+    # comandos das ações rápidas pelo perfil do tenant (clínica x dedetização).
+    meta = _tenant_meta(tid)
+    if meta:
+        out["tenant_slug"] = out.get("tenant_slug") or meta.get("slug") or ""
+        out["business_type"] = out.get("business_type") or meta.get("business_type") or ""
+        out["business_niche"] = out.get("business_niche") or meta.get("business_niche") or ""
+        if not out.get("tenant_nome"):
+            out["tenant_nome"] = meta.get("name") or ""
+    out["fonte"] = "crm-hermes /api/v1/metrics/snapshot"
+    out["origem_dados"] = origem
+    out["latencia_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    return out
+
+
+@app.get("/api/automations/status")
+async def automations_status() -> dict[str, Any]:
+    """Estado da chave global de automações + vida do worker."""
+    return _automations_status_payload()
+
+
+@app.post("/api/automations/toggle")
+async def automations_toggle(payload: dict[str, Any]) -> dict[str, Any]:
+    """Liga/desliga a chave global de automações temporais."""
+    enabled = bool(payload.get("enabled"))
+    try:
+        sb_service.table("automation_control").upsert(
+            {"id": 1, "enabled": enabled, "updated_at": _now_iso()}
+        ).execute()
+    except Exception as exc:
+        logger.error("[automations/toggle] Falha ao salvar flag: %s", exc)
+        raise HTTPException(status_code=500, detail="Falha ao salvar a chave de automações")
+    started = False
+    if enabled:
+        started = await _ensure_automations_worker_running()
+    out = _automations_status_payload()
+    out["worker_started"] = started
+    return out
 
 
 @app.get("/api/kanban/automations")
@@ -4799,7 +6296,7 @@ async def evolution_webhook(
         # Atualiza probabilidade, estágio da negociação, objeção ativa e gera a Dica de Ouro
         # em segundo plano sem travar a resposta nem o fluxo do WhatsApp.
         if ok and lead.get("id"):
-            background.add_task(evaluate_lead_copilot, lead["id"], tenant_id, None, sb)
+            background.add_task(evaluate_lead_copilot, lead["id"], tenant_id, None, sb_service)  # 31/10/2026: copiloto SEMPRE via service_role (anon dava 42501 pos-RLS)
 
     # Fan-out pro Mendes CRM
     background.add_task(_fanout, instance, payload)
@@ -7196,6 +8693,124 @@ async def import_leads_batch(
     except Exception as exc:
         logger.error("[IMPORT_LEADS] Erro ao importar contatos em lote: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/integrations/mercado-express/order")
+async def api_mercado_express_order(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Recebe pedido do checkout do Mercado Express e sincroniza lead + etapa no CRM Hermes."""
+    loja_slug = (payload.get("loja_slug") or "").strip().lower()
+    pedido_id = payload.get("pedido_id")
+    nome = (payload.get("cliente_nome") or "Cliente").strip()
+    raw_phone = str(payload.get("cliente_telefone") or "").strip()
+    endereco = payload.get("cliente_endereco") or ""
+    valor_total = float(payload.get("valor_total") or 0.0)
+    forma_pagamento = payload.get("forma_pagamento") or "pix"
+    itens = payload.get("itens") or ""
+
+    if not raw_phone:
+        raise HTTPException(status_code=400, detail="cliente_telefone é obrigatório")
+
+    clean_phone = _normalize_phone(raw_phone)
+
+    # Identifica o tenant pelo loja_slug
+    tenant_id = None
+    if loja_slug in {"peixaria-william", "peixaria"}:
+        tenant_id = "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
+    elif loja_slug in {"mercado-sao-jose", "mercadinho-sao-jose"}:
+        tenant_id = "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
+    else:
+        try:
+            t_res = sb_service.table("tenants").select("id").eq("slug", loja_slug).limit(1).execute()
+            if t_res.data:
+                tenant_id = t_res.data[0]["id"]
+            else:
+                tenant_id = "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
+        except Exception:
+            tenant_id = "ec8163e5-ed41-4db2-87dd-98e7720d09a9"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    existing = (
+        sb_service.table("leads")
+        .select("id, name, stage, total_orders_count, total_purchases, total_spent_value")
+        .eq("tenant_id", tenant_id)
+        .eq("phone", clean_phone)
+        .limit(1)
+        .execute()
+    )
+
+    lead_id = None
+    target_stage = "separacao_pesagem" if (tenant_id == "ec8163e5-ed41-4db2-87dd-98e7720d09a9") else "novo_lead"
+
+    if existing.data:
+        lead_row = existing.data[0]
+        lead_id = lead_row["id"]
+        old_orders = lead_row.get("total_orders_count") or 0
+        old_purchases = lead_row.get("total_purchases") or old_orders
+        new_purchases = old_purchases + 1
+        old_spent = float(lead_row.get("total_spent_value") or 0.0)
+        new_spent = round(old_spent + valor_total, 2)
+
+        if new_purchases % 5 == 0:
+            logger.info("[FIDELIDADE] Lead %s completou %d pedidos! Cupom liberado.", lead_id, new_purchases)
+
+        patch = {
+            "name": nome or lead_row.get("name"),
+            "stage": target_stage,
+            "negotiation_stage": target_stage,
+            "total_orders_count": new_purchases,
+            "total_purchases": new_purchases,
+            "total_spent_value": new_spent,
+            "internal_notes": f"Último pedido #{pedido_id}: {itens} (R$ {valor_total:.2f}). Endereço: {endereco}",
+            "last_interaction": now_iso,
+            "conversion_probability": 95,
+            "updated_at": now_iso,
+        }
+        sb_service.table("leads").update(patch).eq("id", lead_id).execute()
+        logger.info("[INTEGRATION] Lead %s atualizado com sucesso via pedido #%s", lead_id, pedido_id)
+    else:
+        new_lead = {
+            "tenant_id": tenant_id,
+            "phone": clean_phone,
+            "name": nome,
+            "stage": target_stage,
+            "negotiation_stage": target_stage,
+            "total_orders_count": 1,
+            "total_purchases": 1,
+            "total_spent_value": valor_total,
+            "internal_notes": f"Pedido inicial #{pedido_id}: {itens} (R$ {valor_total:.2f}). Endereço: {endereco}",
+            "ai_active": True,
+            "handoff_state": "ia_ativa",
+            "priority": "normal",
+            "conversion_probability": 95,
+            "created_at": now_iso,
+            "last_interaction": now_iso,
+        }
+        ins = sb_service.table("leads").insert(new_lead).execute()
+        if ins.data:
+            lead_id = ins.data[0]["id"]
+            logger.info("[INTEGRATION] Novo lead %s criado via pedido #%s", lead_id, pedido_id)
+
+    if lead_id:
+        try:
+            sb_service.table("messages").insert({
+                "tenant_id": tenant_id,
+                "lead_id": lead_id,
+                "sender": "system",
+                "content": f"🛒 Pedido #{pedido_id} realizado via Mercado Express! Total: R$ {valor_total:.2f} ({forma_pagamento.upper()})\nItens: {itens}\nEndereço: {endereco}",
+                "from_me": False,
+                "created_at": now_iso,
+            }).execute()
+        except Exception as msg_err:
+            logger.warning("[INTEGRATION] Falha ao registrar mensagem do pedido: %s", msg_err)
+
+    return {
+        "ok": True,
+        "lead_id": lead_id,
+        "tenant_id": tenant_id,
+        "stage": target_stage,
+        "pedido_id": pedido_id,
+    }
 
 
 

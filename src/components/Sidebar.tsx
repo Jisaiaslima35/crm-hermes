@@ -19,12 +19,14 @@ import {
   Rocket,
   X,
   Plane,
+  Target,
 } from 'lucide-react';
 import { Tenant, UserRole } from '../types';
 import { nicheOf, brandColorOf } from '../utils/niche';
 
 export type LiveView =
   | 'dashboard'
+  | 'decision'
   | 'kanban'
   | 'inbox'
   | 'leads'
@@ -134,15 +136,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 )}
                 <div>
                   <div className="flex items-center gap-1.5">
-                    <span className="font-extrabold text-base tracking-tight text-white">Deskcomm</span>
-                    {niche === 'clinica' && (
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30">
-                        CLINIC
-                      </span>
-                    )}
+                    <span className="font-extrabold text-base tracking-tight text-white">CRM Hermes</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30">
+                      COMERCIAL
+                    </span>
                   </div>
-                  <p className="text-[10px] text-slate-400 font-medium">
-                    {isSuperAdmin ? 'AI Sales OS for WhatsApp' : 'Atendimento Clínico Inteligente'}
+                  <p className="text-[10px] text-slate-400 font-medium truncate max-w-[150px]">
+                    {activeTenant?.name || 'Varejo & Atacado B2B'}
                   </p>
                 </div>
               </>
@@ -236,6 +236,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
 
+          <button
+            id="nav-decision"
+            onClick={() => setCurrentView('decision')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+              currentView === 'decision'
+                ? 'bg-violet-600/20 text-violet-300 border border-violet-500/30'
+                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <Target className="w-4 h-4" />
+              <span>Centro de Decisões</span>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30 font-bold">
+              IA
+            </span>
+          </button>
+
           {/* === VISÃO ENXUTA — visível pra TODOS os perfis === */}
           <div className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
             Operação WhatsApp
@@ -299,45 +317,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
             )}
           </button>
 
-          {(isSuperAdmin || isClinic) && (
-            <button
-              id="nav-campanhas"
-              onClick={() => setCurrentView('campanhas_reativacao')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-                currentView === 'campanhas_reativacao'
-                  ? 'bg-rose-600/20 text-rose-300 border border-rose-500/30'
-                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-              }`}
-            >
-              <div className="flex items-center gap-2.5">
-                <Rocket className="w-4 h-4 text-rose-400" />
-                <span>Campanhas & Reativação</span>
-              </div>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
-                ANTI-BAN
-              </span>
-            </button>
-          )}
-
-          {niche !== 'clinica' && (
-            <button
-              id="nav-prospeccao"
-              onClick={() => setCurrentView('prospeccao')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-                currentView === 'prospeccao'
-                  ? 'bg-rose-600/20 text-rose-300 border border-rose-500/30'
-                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-              }`}
-            >
-              <div className="flex items-center gap-2.5">
-                <span className="text-sm leading-none">🎯</span>
-                <span>Prospecção Ativa</span>
-              </div>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
-                OUTBOUND
-              </span>
-            </button>
-          )}
+          <button
+            id="nav-prospeccao"
+            onClick={() => setCurrentView('prospeccao')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+              currentView === 'prospeccao'
+                ? 'bg-rose-600/20 text-rose-300 border border-rose-500/30'
+                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <span className="text-sm leading-none">🎯</span>
+              <span>Prospector (Prospecção B2B)</span>
+            </div>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">
+              B2B
+            </span>
+          </button>
 
           <button
             id="nav-leads"
@@ -504,11 +500,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   : isTourism
                   ? 'Admin ESVC Turismo'
                   : userRole === 'clinic_admin' || userRole === 'admin'
-                  ? 'Admin da Clínica'
+                  ? 'Admin Comercial'
                   : 'Atendente / Operador'}
               </p>
               <p className="text-[10px] text-slate-500">
-                {isTourism ? 'Gestão Turismo' : isClinic ? 'Visão da clínica' : 'RBAC Ativo'}
+                {isTourism ? 'Gestão Turismo' : 'Gestão Comercial'}
               </p>
             </div>
           </div>

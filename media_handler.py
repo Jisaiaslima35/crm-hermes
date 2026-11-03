@@ -43,7 +43,7 @@ def _get_9router_api_key() -> str:
     return (
         os.environ.get("NINEROUTER_API_KEY")
         or os.environ.get("HERMES_CUSTOM_9ROUTER_AUTOMACAOJS_US_API_KEY")
-        or "sk-ee9be57a70a07560-etddrv-19a7661c"
+        or ""
     ).strip()
 
 

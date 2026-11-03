@@ -1,0 +1,90 @@
+--- cron_automations.py.bak-sprint-metrics-20261102	2026-11-02 14:16:28.610893447 -0300
++++ cron_automations.py	2026-11-02 14:20:23.476013168 -0300
+@@ -35,6 +35,12 @@
+ 
+ # Configurações do Supabase e Evolution API
+ SUPABASE_URL = os.environ.get("VITE_SUPABASE_URL", "https://supabase.automacaojs.us").rstrip("/")
++# 02/11/2026: rota INTERNA do PostgREST (Kong local na VPS). O host público via
++# Cloudflare custava ~150ms por chamada e occasionally resetava a conexão — o
++# worker lia a flag de automações com erro e tratava como "DESLIGADO".
++SUPABASE_INTERNAL_BASE = (
++    os.environ.get("SUPABASE_INTERNAL_URL", "").strip() or "http://127.0.0.1:28000"
++).rstrip("/")
+ SUPABASE_KEY = (
+     os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+     or os.environ.get("VITE_SUPABASE_SERVICE_ROLE_KEY")
+@@ -73,8 +79,11 @@
+ 
+ 
+ def _supabase_request(path: str, method: str = "GET", payload: Optional[Any] = None) -> Any:
+-    """Faz requisição REST ao PostgREST do Supabase."""
+-    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
++    """Faz requisição REST ao PostgREST do Supabase.
++
++    Ordem: rota interna (Kong 127.0.0.1:28000) -> host público (Cloudflare).
++    Erro 4xx volta na hora (é erro de dado/auth); rede ou 5xx tenta a outra rota.
++    """
+     headers = {
+         "apikey": SUPABASE_KEY,
+         "Authorization": f"Bearer {SUPABASE_KEY}",
+@@ -82,21 +91,26 @@
+         "Prefer": "return=representation",
+     }
+     data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+ 
+-    try:
+-        with urllib.request.urlopen(req, timeout=15) as resp:
+-            body = resp.read().decode("utf-8")
+-            if body:
+-                return json.loads(body)
+-            return None
+-    except urllib.error.HTTPError as he:
+-        err_msg = he.read().decode("utf-8", errors="ignore")
+-        logger.error("[SUPABASE HTTP %s] %s: %s", he.code, url, err_msg)
+-        return None
+-    except Exception as exc:
+-        logger.error("[SUPABASE ERR] %s: %s", url, exc)
+-        return None
++    for base in (SUPABASE_INTERNAL_BASE, SUPABASE_URL):
++        url = f"{base}/rest/v1/{path.lstrip('/')}"
++        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(req, timeout=15) as resp:
++                body = resp.read().decode("utf-8")
++                if body:
++                    return json.loads(body)
++                return None
++        except urllib.error.HTTPError as he:
++            err_msg = he.read().decode("utf-8", errors="ignore")
++            logger.error("[SUPABASE HTTP %s] %s: %s", he.code, url, err_msg)
++            if he.code < 500:
++                return None
++            continue
++        except Exception as exc:
++            logger.error("[SUPABASE ERR] %s: %s", url, exc)
++            continue
++    return None
+ 
+ 
+ def _get_appointment_anchor(tenant_id: str, lead_id: str, prefer: str = "future") -> str | None:
+@@ -684,8 +698,18 @@
+                     aliases.extend(["cancelou", "desistiu"])
+ 
+                 stage_filter = ",".join(aliases)
++                # 02/11/2026 (sprint de métricas): a etapa de TRIAGEM buscava TODOS
++                # os leads em novo_contato (2018 linhas só na clínica) e o ciclo
++                # levava ~50min. Triagem é ação de primeira resposta, não de
++                # arquivo histórico -> filtra pela última movimentação (48h).
++                extra_filter = ""
++                if stage_key == "triagem":
++                    desde_48h = datetime.now(timezone.utc) - timedelta(hours=48)
++                    extra_filter = (
++                        f"&updated_at=gte.{_urlquote(desde_48h.isoformat())}"
++                    )
+                 leads = _supabase_request(
+-                    f"leads?tenant_id=eq.{tenant_id}&stage=in.({stage_filter})&opt_out_reactivation=eq.false&select=id,name,phone,stage,appointment_schedule,last_interaction,created_at,updated_at,has_incident_history,ai_auto_silence,handoff_state"
++                    f"leads?tenant_id=eq.{tenant_id}&stage=in.({stage_filter})&opt_out_reactivation=eq.false{extra_filter}&select=id,name,phone,stage,appointment_schedule,last_interaction,created_at,updated_at,has_incident_history,ai_auto_silence,handoff_state"
+                 )
+                 if not leads:
+                     continue
