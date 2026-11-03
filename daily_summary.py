@@ -53,6 +53,14 @@ TAG_IMAGEM_RECEBIDA = "[IMAGEM_RECEBIDA]"
 TAG_CONTEUDO_IMAGEM = "[CONTEÚDO DA IMAGEM:"
 TAG_CONTEUDO_DOCUMENTO = "[CONTEÚDO DO DOCUMENTO:"
 
+# Resposta automática genérica do bot (pipeline anterior): NÃO descreve a imagem,
+# então não pode ser apresentada como "conteúdo do exame".
+_RE_BOILERPLATE_IMAGEM = re.compile(
+    r"agrade[çc]o por compartilhar|analisando o que voc[êe] me envi|"
+    r"sua imagem foi recebida|recebi sua imagem|enviei uma imagem",
+    re.IGNORECASE,
+)
+
 # --------------------------------------------------------------------------
 # Privacidade: redator de PII (LGPD) — aplicado a TODO texto livre do relatório
 # --------------------------------------------------------------------------
@@ -139,6 +147,11 @@ def _sem_nome(descricao: str, nome: str) -> str:
             descricao = re.sub(re.escape(nome), "[paciente]", descricao, flags=re.IGNORECASE)
         except Exception:
             pass
+    # nome já mascarado pelo pipeline legado ("[REMOVIDO] da Silva Freire")
+    # → descarta o resto do fragmento de nome
+    descricao = re.sub(
+        r"\[REMOVIDO\][^,.;:\n]{0,40}", "[nome removido]", descricao, flags=re.IGNORECASE
+    )
     return descricao
 
 
@@ -336,7 +349,7 @@ def montar_relatorio(sb, shift: str) -> str:
             resumo = re.sub(r"^\[[^\]]{0,40}:\s*", "", resumo) if ":" in resumo[:60] else resumo
         linhas = [f"• {nome(lid)} — {len(lista)} mensagem(ns) via {', '.join(canais) or 'texto'}"]
         if resumo:
-            linhas.append(f"   Último: {redigir(resumo)}")
+            linhas.append(f"   Última msg (paciente): {redigir(resumo)}")
         contatos.append("\n".join(linhas))
 
     # ---------- 2) AGENDAMENTOS EFETIVADOS (fechados por humano) ----------
@@ -428,7 +441,21 @@ def montar_relatorio(sb, shift: str) -> str:
         else:
             # pipeline antigo: "[Imagem enviada pelo contato]: ..." — registra o que havia
             desc = conteudo.replace("[Imagem enviada pelo contato]:", "").strip()
-            docs.append(f"• {nome(m.get('lead_id'))} — imagem recebida (sem extração estruturada): {redigir(_resumir(desc, 110))}")
+            nome_pac = nome(m.get("lead_id"))
+            desc_curto = _resumir(desc, 110)
+            if not desc_curto:
+                docs.append(f"• {nome_pac} — imagem recebida (sem conteúdo extraído)")
+            elif _RE_BOILERPLATE_IMAGEM.search(desc):
+                # resposta automática do bot: não descreve a imagem — não fingir conteúdo
+                docs.append(
+                    f"• {nome_pac} — imagem recebida (sem conteúdo extraído: "
+                    "a resposta automática do bot não descreve a imagem)"
+                )
+            else:
+                docs.append(
+                    f"• {nome_pac} — imagem recebida (descrição do pipeline anterior): "
+                    f"{redigir(_sem_nome(desc_curto, nome_pac))}"
+                )
 
     # ---------- Montagem ----------
     titulo = "MANHÃ (00h–12h)" if shift == "manha" else ("TARDE (12h–18h)" if shift == "tarde" else "DIA")
