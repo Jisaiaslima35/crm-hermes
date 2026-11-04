@@ -2338,6 +2338,105 @@ async def _send_evolution_text(
 
 
 # ============================================================================
+# TRAVA DE ENVIO AUTOMÁTICO (04/11/2026 — sprint Triagem + Handoff)
+# ----------------------------------------------------------------------------
+# Regra pedida pelo Dr. Matheus Doré: com a trava global ligada, NENHUMA
+# mensagem AUTOMÁTICA pode sair da clínica — nem a saudação da etapa
+# Triagem ("Olá, {nome}! Seja muito bem-vindo(a)…"), nem follow-up, nem
+# resposta da IA, nem opt-out.
+#
+# O envio HUMANO (Beatriz respondendo no CRM) NÃO passa por aqui: o front
+# manda direto pra Evolution. O Copiloto FDE continua minerando e auditando
+# em silêncio — só o ENVIO é barrado.
+#
+# Fail-closed: sem `automation_control` legível => nada automático sai.
+# ============================================================================
+
+_AUTO_ENVIO_CACHE: dict[str, tuple[float, bool]] = {}
+_AUTO_ENVIO_CACHE_TTL_SECONDS = 15.0
+
+
+def _auto_envio_permitido(tenant_id: str) -> bool:
+    """Diz se o tenant pode receber mensagem AUTOMÁTICA agora (fail-closed)."""
+    now = time.monotonic()
+    cached = _AUTO_ENVIO_CACHE.get(tenant_id)
+    if cached is not None and (now - cached[0]) < _AUTO_ENVIO_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    permitted = False
+    try:
+        # (1) switch do próprio tenant (Plantão IA). Na clínica (1111) é False.
+        cfg = _get_tenant_config(tenant_id)
+        tenant_ok = bool(cfg.get("ai_auto_reply_enabled", True))
+        # (2) trava global — a mesma linha (id=1) que segura o cron_automations
+        #     e o followup_worker.
+        row = _automations_control_row()
+        global_ok = bool(row.get("enabled")) if row else False
+        permitted = bool(tenant_ok and global_ok)
+    except Exception as exc:
+        logger.warning("[trava-envio] falha ao avaliar permissão automática: %s", exc)
+        permitted = False
+
+    _AUTO_ENVIO_CACHE[tenant_id] = (now, permitted)
+    return permitted
+
+
+async def _auto_send_evolution_text(
+    tenant_id: str, instance: str, phone: str, text: str
+) -> dict[str, Any]:
+    """Envia texto AUTOMÁTICO só se a trava permitir. Travado => não envia."""
+    if not _auto_envio_permitido(tenant_id):
+        logger.warning(
+            "[trava-envio] 🛑 ENVIO AUTOMÁTICO BLOQUEADO tenant=%s instance=%s phone=%s "
+            "(plantão IA off ou trava global desligada) — lead segue em silêncio",
+            tenant_id, instance, phone,
+        )
+        return {"ok": False, "reason": "automacoes_desativadas"}
+    # Registra ANTES de enviar: a Evolution pode disparar o webhook de eco
+    # antes de o POST de envio retornar (corrida real).
+    _registrar_envio_automatico(tenant_id, phone, text)
+    return await _send_evolution_text(instance, phone, text)
+
+
+# Registro em memória do que o CRM ENVIOU pela Evolution (pra distinguir
+# "eco da nossa própria mensagem" de "humano entrou na conversa").
+# A Evolution devolve tudo que sai do número como fromMe=true — inclusive
+# as respostas automáticas. Sem isso, o kill-switch dispararia a cada
+# resposta da IA (a barra amarela ficaria sempre ligada).
+_AUTO_ENVIOS_RECENTES: dict[str, list[tuple[float, str]]] = {}
+_AUTO_ENVIOS_JANELA_SEGUNDOS = 300.0
+
+
+def _tel_chave(phone: str) -> str:
+    """Chave estável de telefone (só dígitos) pra casar envio x eco."""
+    return "".join(ch for ch in (phone or "") if ch.isdigit())
+
+
+def _registrar_envio_automatico(tenant_id: str, phone: str, text: str) -> None:
+    """Guarda o texto que acabou de sair automaticamente (para detecção de eco)."""
+    chave = f"{tenant_id}:{_tel_chave(phone)}"
+    agora = time.monotonic()
+    lista = _AUTO_ENVIOS_RECENTES.setdefault(chave, [])
+    lista.append((agora, (text or "").strip()))
+    # janela deslizante: só interessa o eco recente
+    _AUTO_ENVIOS_RECENTES[chave] = [
+        (ts, txt) for ts, txt in lista
+        if (agora - ts) <= _AUTO_ENVIOS_JANELA_SEGUNDOS
+    ]
+
+
+def _foi_envio_automatico(tenant_id: str, phone: str, text: str) -> bool:
+    """True se esse texto acabou de sair pelo CRM (eco => NÃO é entrada humana)."""
+    chave = f"{tenant_id}:{_tel_chave(phone)}"
+    lista = _AUTO_ENVIOS_RECENTES.get(chave) or []
+    alvo = (text or "").strip()
+    if not alvo:
+        return False
+    agora = time.monotonic()
+    return any(txt == alvo and (agora - ts) <= _AUTO_ENVIOS_JANELA_SEGUNDOS for ts, txt in lista)
+
+
+# ============================================================================
 # Extração Assíncrona de Sintomas e Queixas Clínicas (Customer 360 / Deskcomm)
 # ============================================================================
 
@@ -3789,7 +3888,7 @@ async def _dispatch_ai(
         )
         try:
             wait_msg = "Tô finalizando sua resposta aqui, já te mando em segundos! 🙂"
-            await _send_evolution_text(instance, lead["phone"], wait_msg)
+            await _auto_send_evolution_text(tenant_id, instance, lead["phone"], wait_msg)
             sb_service.table("messages").insert({
                 "tenant_id": tenant_id,
                 "lead_id": lead["id"],
@@ -3900,7 +3999,7 @@ async def _dispatch_ai(
                 logger.warning("[%s] Erro ao persistir stage cancelou do lead %s: %s", instance, lead["id"], can_exc)
 
             cancel_reply = "Compreendo perfeitamente. Registrei o cancelamento da sua consulta. Se desejar reagendar para outro dia ou horário no futuro, é só nos avisar por aqui. Estamos à disposição!"
-            await _send_evolution_text(instance, lead.get("phone", ""), cancel_reply)
+            await _auto_send_evolution_text(tenant_id, instance, lead.get("phone", ""), cancel_reply)
             try:
                 sb_service.table("messages").insert({
                     "tenant_id": tenant_id,
@@ -3934,7 +4033,7 @@ async def _dispatch_ai(
                 "Entendido perfeitamente! Seu contato foi desvinculado dos nossos avisos automáticos "
                 "e não voltaremos a enviar mensagens. Se precisar de algo no futuro, estamos à disposição. Um abraço!"
             )
-            await _send_evolution_text(instance, lead.get("phone", ""), farewell_msg)
+            await _auto_send_evolution_text(tenant_id, instance, lead.get("phone", ""), farewell_msg)
             try:
                 sb_service.table("messages").insert({
                     "tenant_id": tenant_id,
@@ -4031,7 +4130,7 @@ async def _dispatch_ai(
                 logger.warning("[%s] Erro ao atualizar lead com handoff humano: %s", instance, hs_err)
 
         # 2. Envia WhatsApp IMEDIATAMENTE (sem latência de extrações pesadas)
-        send_result = await _send_evolution_text(instance, lead["phone"], ai_reply)
+        send_result = await _auto_send_evolution_text(tenant_id, instance, lead["phone"], ai_reply)
         logger.info(
             "[%s] IA sendText ok=%s status=%s",
             instance,
@@ -4794,6 +4893,14 @@ async def kanban_stages(tenant_id: str) -> dict[str, Any]:
                     # ajustar o prompt/âncora dela.
                     "has_automation": bool(r.get("auto_message_template"))
                     or bool(r.get("requires_human_only")),
+                    # 04/11/2026 (sprint triagem): a etapa NUNCA some do kanban.
+                    # O que o front precisa saber é se existe DISPARO AUTOMÁTICO
+                    # ativo nela (o cron pula requires_human_only e etapa
+                    # inativa). Quando não existe, a coluna continua visível
+                    # com o badge discreto "[Automático Desativado]".
+                    "automation_active": bool(r.get("is_active", True))
+                    and bool(r.get("auto_message_template"))
+                    and not bool(r.get("requires_human_only")),
                     "is_system_protected": bool(r.get("requires_human_only")),
                     "requires_human_only": bool(r.get("requires_human_only")),
                     "ai_prompt_hint": r.get("system_prompt") or "",
@@ -6055,6 +6162,101 @@ async def kanban_automations(tenant_id: str) -> dict[str, Any]:
         return {"ok": False, "automations": [], "error": str(exc)}
 
 
+# ============================================================================
+# HANDOFF HUMANO — barra amarela em QUALQUER etapa (04/11/2026)
+# ----------------------------------------------------------------------------
+# Regra do Dr. Matheus Doré: "toda vez que o humano entrar na conversa, no
+# caso a Beatriz, naquele usuário, naquele paciente, já apareça a barra
+# amarela do handoff humano — independente da etapa que esteja (triagem,
+# agendados, em atendimento...)".
+#
+# A Evolution devolve como fromMe=true TUDO que sai do número da clínica:
+#   - digitado no celular da equipe (source='android') => ENTRADA HUMANA
+#   - eco da mensagem que o CRM mandou pela API        => AUTOMÁTICO
+# _foi_envio_automatico + a checagem no banco separaram os dois casos.
+# Sem essa distinção, CADA resposta da IA ligaria o kill-switch e a barra
+# amarela ficaria sempre acesa — exatamente o defeito relatado.
+# ============================================================================
+
+_SENDERS_AUTOMATICOS = ("ai", "bot", "assistant", "system")
+
+
+def _eco_de_mensagem_do_crm(
+    tenant_id: str, lead_id: str, phone: str, texto: str
+) -> bool:
+    """True se o texto recebido (fromMe) é o eco de algo que O CRM já enviou."""
+    if _foi_envio_automatico(tenant_id, phone, texto):
+        return True
+    alvo = (texto or "").strip()
+    if not alvo:
+        return False
+    try:
+        res = (
+            sb_service.table("messages")
+            .select("id,sender,content,created_at")
+            .eq("lead_id", lead_id)
+            .in_("sender", list(_SENDERS_AUTOMATICOS))
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("[handoff] falha ao checar eco no banco: %s", exc)
+        return False
+    agora = datetime.now(timezone.utc)
+    for row in res.data or []:
+        if (row.get("content") or "").strip() != alvo:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(row.get("created_at") or "").replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (agora - ts).total_seconds() <= _AUTO_ENVIOS_JANELA_SEGUNDOS:
+            return True
+    return False
+
+
+def _marcar_handoff_humano(
+    tenant_id: str, lead: dict[str, Any], extracted: dict[str, Any]
+) -> bool:
+    """Humano falou com o lead => handoff humano (barra amarela), em qualquer etapa."""
+    if not extracted.get("from_me"):
+        return False
+    if _eco_de_mensagem_do_crm(
+        tenant_id,
+        str(lead.get("id")),
+        str(extracted.get("phone") or ""),
+        str(extracted.get("content") or ""),
+    ):
+        logger.info(
+            "[handoff] fromMe é eco de mensagem do CRM (lead=%s) — handoff não alterado",
+            lead.get("id"),
+        )
+        return False
+    ja_assumido = str(lead.get("handoff_state") or "") == "humano_assumiu"
+    ia_ja_desligada = lead.get("ai_active") is False
+    if ja_assumido and ia_ja_desligada:
+        return False
+    try:
+        sb_service.table("leads").update({
+            "handoff_state": "humano_assumiu",
+            "ai_active": False,
+            "last_interaction": _now_iso(),
+        }).eq("id", lead["id"]).execute()
+    except Exception as exc:
+        logger.warning("[handoff] falha ao gravar handoff do lead %s: %s", lead.get("id"), exc)
+        return False
+    lead["handoff_state"] = "humano_assumiu"
+    lead["ai_active"] = False
+    logger.info(
+        "[handoff] 🟡 HUMANO ASSUMIU lead=%s stage=%s (barra amarela ligada, IA pausada)",
+        lead.get("id"), lead.get("stage"),
+    )
+    return True
+
+
 @app.post("/webhook/evolution")
 @app.post("/webhook/evolution/{instance}")
 @app.post("/webhook/evolution/{instance}/{event_subpath}")
@@ -6292,6 +6494,24 @@ async def evolution_webhook(
             except Exception as _terr:
                 logger.warning("[%s] [TURISMO] falha ao mover p/ em_atendimento: %s", instance, _terr)
 
+        # 04/11/2026: a Evolution devolve como fromMe=true tudo que SAI do
+        # número da clínica. Se a mensagem for o ECO de algo que o CRM já
+        # mandou (resposta da IA, saudação, follow-up), ela NÃO entra de
+        # novo no inbox como "humano" — e não liga o kill-switch.
+        _eco_crm = False
+        if from_me:
+            _eco_crm = _eco_de_mensagem_do_crm(
+                tenant_id,
+                str(lead["id"]),
+                str(extracted.get("phone") or ""),
+                str(extracted.get("content") or ""),
+            )
+            if _eco_crm:
+                logger.info(
+                    "[%s] eco de mensagem do CRM ignorado no inbox (lead=%s)",
+                    instance, lead["id"],
+                )
+
         # Grava mensagem do paciente/humano
         insert_payload = {
             "tenant_id": tenant_id,
@@ -6302,8 +6522,11 @@ async def evolution_webhook(
             "media_type": extracted.get("media_type", "text"),
             "media_url": extracted.get("media_url"),
         }
-        res = sb_service.table("messages").insert(insert_payload).execute()
-        ok = bool(res.data)
+        if _eco_crm:
+            ok = False
+        else:
+            res = sb_service.table("messages").insert(insert_payload).execute()
+            ok = bool(res.data)
         if ok:
             stored_count += 1
             last_msg_id = res.data[0]["id"]
@@ -6327,6 +6550,12 @@ async def evolution_webhook(
             )
             continue
 
+        # 04/11/2026: humano entrou na conversa => barra amarela do handoff,
+        # INDEPENDENTE da etapa (triagem, agendados, em atendimento...). O
+        # eco das nossas próprias mensagens automáticas é ignorado.
+        if ok:
+            _marcar_handoff_humano(tenant_id, lead, extracted)
+
         # BOAS-VINDAS IMEDIATAS (Turismo): primeiro contato de um numero novo
         if ok and not extracted["from_me"] and _is_tourism_hook:
             try:
@@ -6349,7 +6578,7 @@ async def evolution_webhook(
                                 )
                     except Exception:
                         pass
-                    _sent = await _send_evolution_text(instance, extracted["phone"], _welcome) if _w_enabled else False
+                    _sent = await _auto_send_evolution_text(tenant_id, instance, extracted["phone"], _welcome) if _w_enabled else False
                     _sent_ok = _sent.get("ok") if isinstance(_sent, dict) else bool(_sent)
                     logger.info("[%s] [BOAS-VINDAS] lead=%s phone=%s enviado=%s", instance, lead["id"], extracted["phone"], _sent_ok)
                     if _sent_ok:
@@ -6400,7 +6629,7 @@ async def evolution_webhook(
                     "Entendido perfeitamente! Seu contato foi desvinculado dos nossos avisos automáticos "
                     "e não voltaremos a enviar mensagens. Se precisar de algo no futuro, estamos à disposição. Um abraço!"
                 )
-                await _send_evolution_text(instance, extracted["phone"], farewell_msg)
+                await _auto_send_evolution_text(tenant_id, instance, extracted["phone"], farewell_msg)
 
                 try:
                     sb_service.table("messages").insert({
@@ -7614,7 +7843,10 @@ async def _maybe_create_calendar_event(
             f"🗓️ Adicione à sua agenda no Google Calendar:\n{public_calendar_link}\n\n"
             f"Qualquer dúvida, estamos à disposição por aqui."
         )
-        send_ok = await _send_evolution_text(instance, lead.get("phone", ""), followup)
+        send_ok = await _auto_send_evolution_text(
+            str(lead.get("tenant_id") or tenant_cfg.get("tenant_id") or ""),
+            instance, lead.get("phone", ""), followup,
+        )
         logger.info(
             "[%s] [CALENDAR] follow-up enviado ok=%s event_id=%s public_link=%s",
             instance, send_ok.get("ok"), event_id, public_calendar_link[:80],

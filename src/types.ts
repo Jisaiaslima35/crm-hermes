@@ -35,7 +35,12 @@ export type PipelineStage =
   | 'atendido_concluido'
   | 'desistiu'
   | 'sem_resposta'
-  | 'falar_pessoalmente';
+  | 'falar_pessoalmente'
+  // 04/11/2026: o kanban é dinâmico (kanban_stages_config por tenant), então
+  // a chave da coluna pode ser qualquer string ('triagem', 'agendados_d1',
+  // 'proposta_b2b', ...). O (string & {}) mantém o autocomplete das chaves
+  // conhecidas sem quebrar a comparação com chave dinâmica.
+  | (string & {});
 
 export type HandoffState = 'ia_ativa' | 'humano_assumiu';
 
@@ -278,6 +283,9 @@ export interface StageColumnInfo {
   isProtected?: boolean;
   keywords?: string[];
   description?: string;
+  /** 04/11/2026: a etapa existe no kanban, mas não tem disparo automático. */
+  isActive?: boolean;
+  automationActive?: boolean;
 }
 
 export interface StageAutomation {

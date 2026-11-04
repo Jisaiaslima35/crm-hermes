@@ -877,6 +877,8 @@ export interface KanbanStageRow {
   trigger_time?: string;
   auto_message_template?: string;
   color_accent?: string;
+  /** 04/11/2026: existe disparo automático ativo nesta etapa? */
+  automation_active?: boolean;
 }
 
 export async function fetchKanbanStages(tenantId: string): Promise<KanbanStageRow[] | null> {

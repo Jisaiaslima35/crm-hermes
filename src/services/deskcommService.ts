@@ -369,26 +369,30 @@ class DeskcommService {
       const sessionName = tenant?.whatsappInstance?.sessionName;
       const phone = (lead.phone || '').replace(/\D/g, '');
 
+      // 04/11/2026 (sprint triagem/handoff): o kill-switch de IA SEMPRE
+      // acontece quando o humano entra na conversa — independente de a
+      // etapa, de o tenant ter sessão Evolution ou de o lead ter telefone.
+      // Antes ele ficava preso dentro do `else`, então a barra amarela do
+      // handoff não aparecia justamente nos casos que mais importam.
+      if (lead.handoffState !== 'humano_assumiu') {
+        remote
+          .toggleHandoff(leadId, 'humano_assumiu')
+          .then(() => {
+            liveStore.updateLead(leadId, {
+              handoffState: 'humano_assumiu',
+              lastInteractionAt: new Date().toISOString(),
+            });
+          })
+          .catch((e) =>
+            console.warn('[deskcommService] toggleHandoff (kill-switch) falhou:', e)
+          );
+      }
+
       if (!sessionName) {
         console.warn('[deskcommService] sendWhatsAppMessage: tenant sem sessão Evolution');
       } else if (!phone) {
         console.warn('[deskcommService] sendWhatsAppMessage: lead sem telefone');
       } else {
-        // Kill-switch no banco: garante que a IA pare de responder.
-        if (lead.handoffState !== 'humano_assumiu') {
-          remote
-            .toggleHandoff(leadId, 'humano_assumiu')
-            .then(() => {
-              liveStore.updateLead(leadId, {
-                handoffState: 'humano_assumiu',
-                lastInteractionAt: new Date().toISOString(),
-              });
-            })
-            .catch((e) =>
-              console.warn('[deskcommService] toggleHandoff (kill-switch) falhou:', e)
-            );
-        }
-
         // Envia o texto pro WhatsApp com delay 1.2s (sensação humana).
         remote
           .sendWhatsApp(sessionName, phone, content, { delayMs: 1200 })

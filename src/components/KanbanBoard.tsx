@@ -153,9 +153,12 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
         description: (s as any).semantic_description || s.ai_prompt_hint || '',
         position: (s as any).position || i + 1,
         isActive: (s as any).is_active !== false,
+        // 04/11/2026: a coluna NUNCA some do kanban. Etapa sem automação
+        // continua visível (com badge) pra novos leads terem onde cair.
+        automationActive: (s as any).automation_active !== false,
       }))
     : currentStages
-  ).filter((s: any) => s.isActive !== false);
+  );
 
   // Enriquece cada lead com info do tenant ativo
   const enrichedLeads: Lead[] = activeTenant
@@ -608,7 +611,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                   isHovered
                     ? 'shadow-[0_10px_34px_rgba(0,0,0,0.55),0_0_0_2px_rgba(10,132,255,0.45)]'
                     : 'shadow-[var(--shadow-card)]'
-                }`}
+                } ${stage.automationActive === false ? 'opacity-90' : ''}`}
               >
                 {/* Column Header */}
                 <div className="p-4 border-b border-[var(--separator-soft)]">
@@ -620,6 +623,20 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                       <h3 className="font-semibold text-[13px] text-[var(--label-primary)] tracking-wide truncate min-w-0">
                         {stage.title}
                       </h3>
+                      {/* 04/11/2026: etapa visível SEM disparo automático.
+                          A coluna continua existindo (lead novo tem que cair
+                          nela), só o badge avisa que nada sai sozinho. Só
+                          entra em etapas que TEM automação configurada (ou
+                          estão desativadas) — etapa passiva não gera ruído. */}
+                      {stage.automationActive === false &&
+                        (stage.hasAutomationGear || stage.isActive === false) && (
+                          <span
+                            className="shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-amber-300/90"
+                            title="Etapa visível, mas sem disparo automático configurado."
+                          >
+                            [Automático Desativado]
+                          </span>
+                        )}
                       {/* Botão de Engrenagem (⚙️) Parametrizado da Etapa */}
                       {activeTenant && (
                         <button
